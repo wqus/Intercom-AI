@@ -64,10 +64,8 @@ dmypy.json
 docker-compose.override.yml
 
 # Project specific
-data/
 *.tmp
 *.temp
-123  # если это тестовый файл
 
 # Logs
 logs/
