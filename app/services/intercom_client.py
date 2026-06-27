@@ -143,40 +143,22 @@ class IntercomClient:
     # ASSIGN TO ADMIN
     # -------------------------
     async def assign_to_admin(
-        self,
-        conversation_id: str,
-        admin_id: Optional[str] = None,
+            self,
+            conversation_id: str,
+            admin_id: Optional[str] = None,
     ) -> bool:
-        """Назначить на конкретного админа"""
+        """Назначить разговор на оператора"""
+        admin_id = admin_id or settings.INTERCOM_ADMIN_ID
+
+        if not admin_id:
+            logger.error("INTERCOM_ADMIN_ID не настроен")
+            return False
+
         return await self._add_conversation_part(
             conversation_id,
             message_type="assignment",
             admin_id=admin_id,
         )
-
-    # -------------------------
-    # ASSIGN TO TEAM (новое)
-    # -------------------------
-    async def assign_to_team(
-        self,
-        conversation_id: str,
-        team_id: Optional[str] = None,
-    ) -> bool:
-        """Назначить разговор на команду (рекомендуется)"""
-        if not team_id:
-            team_id = getattr(settings, 'INTERCOM_TEAM_ID', None)
-
-        if not team_id:
-            logger.warning("INTERCOM_TEAM_ID не настроен, используем assign_to_admin как fallback")
-            return await self.assign_to_admin(conversation_id)
-
-        return await self._add_conversation_part(
-            conversation_id,
-            message_type="assignment",
-            admin_id=settings.INTERCOM_ADMIN_ID,   # кто выполняет назначение
-            **{"assignee_id": team_id}             # ключ для назначения на команду
-        )
-
     # -------------------------
     # CLOSE
     # -------------------------

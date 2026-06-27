@@ -56,8 +56,8 @@ async def handle_new_ticket(
         )
 
         logger.info(
-            "LLM result | can_answer=%s | model=%s",
-            llm_result.can_answer
+            "LLM result | can_answer=%s",
+            llm_result.can_answer,
         )
 
         # ШАГ 4: Действие по результату LLM
@@ -83,6 +83,4 @@ async def handle_new_ticket(
             logger.error("Failed to escalate ticket %s after error", conversation_id)
 
     finally:
-        # Опционально: закрываем клиент, если создали внутри функции
-        if intercom_client is not None and 'intercom_client' not in locals():  # если сами создали
-            await intercom_client.close()
+        await intercom_client.close()

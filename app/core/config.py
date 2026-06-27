@@ -8,7 +8,7 @@ class Settings(BaseSettings):
 
     INTERCOM_TOKEN: str = ""
     INTERCOM_CLIENT_SECRET: str = ""
-    SUPPORT_TEAM_ID: str = ""
+    INTERCOM_ADMIN_ID: str = ""
 
     DRY_RUN: bool = True
 
