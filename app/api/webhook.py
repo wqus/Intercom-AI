@@ -59,7 +59,7 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
         return None
 
 
-@router.post("/webhook/intercom")
+@router.post("/webhook/intercom", response_model=None)
 async def intercom_webhook(
     request: Request,
     llm_client: YandexLLMClient,
