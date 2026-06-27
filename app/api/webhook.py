@@ -5,8 +5,10 @@ import logging
 import re
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.params import Depends
 
 from app.core.config import settings
+from app.main import get_llm_client, get_knowledge_base
 from app.services.knowledge_base import KnowledgeBase
 from app.services.llm_client import YandexLLMClient
 from app.services.ticket_handler import handle_new_ticket
@@ -62,8 +64,8 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
 @router.post("/webhook/intercom", response_model=None)
 async def intercom_webhook(
     request: Request,
-    llm_client: YandexLLMClient,
-    knowledge_base: KnowledgeBase,
+    llm_client: YandexLLMClient = Depends(get_llm_client),
+    knowledge_base: KnowledgeBase = Depends(get_knowledge_base),
 )  -> dict:
     body_bytes = await request.body()
     payload = await request.json()
