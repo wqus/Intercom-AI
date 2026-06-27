@@ -64,7 +64,7 @@ async def intercom_webhook(
     request: Request,
     llm_client: YandexLLMClient,
     knowledge_base: KnowledgeBase,
-):
+)  -> dict:
     body_bytes = await request.body()
     payload = await request.json()
 
