@@ -6,6 +6,7 @@ import re
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.params import Depends
+from httpx import Response
 
 from app.core.config import settings
 from app.core.dependencies import get_llm_client, get_knowledge_base
@@ -61,12 +62,16 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
         return None
 
 
-@router.post("/webhook/intercom", response_model=None)
+@router.api_route("/webhook/intercom", methods=["POST", "HEAD"], response_model=None)
 async def intercom_webhook(
     request: Request,
     llm_client: YandexLLMClient = Depends(get_llm_client),
     knowledge_base: KnowledgeBase = Depends(get_knowledge_base),
-)  -> dict:
+) -> dict|Response:
+    # HEAD запрос — Intercom проверяет доступность endpoint
+    if request.method == "HEAD":
+        return Response(status_code=200)
+
     body_bytes = await request.body()
     payload = await request.json()
 
