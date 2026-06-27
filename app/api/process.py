@@ -5,6 +5,7 @@ from pydantic import BaseModel, field_validator
 
 from app.services.knowledge_base import KnowledgeBase, MatchMode
 from app.services.llm_client import YandexLLMClient
+from app.core.dependencies import get_llm_client, get_knowledge_base
 
 logger = logging.getLogger("process")
 
@@ -36,12 +37,8 @@ class ProcessResponse(BaseModel):
 @router.post("/process", response_model=ProcessResponse)
 async def process_question(
     body: ProcessRequest,
-    llm: YandexLLMClient = Depends(
-        lambda: __import__("app.main", fromlist=["get_llm_client"]).get_llm_client()
-    ),
-    kb: KnowledgeBase = Depends(
-        lambda: __import__("app.main", fromlist=["get_knowledge_base"]).get_knowledge_base()
-    ),
+    llm: YandexLLMClient = Depends(get_llm_client),
+    kb: KnowledgeBase = Depends(get_knowledge_base),
 ):
     question = body.question
     logger.info("Processing question: %s", question[:80])
