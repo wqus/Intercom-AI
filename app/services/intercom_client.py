@@ -1,4 +1,5 @@
 import logging
+from typing import Optional, Literal
 
 import httpx
 
@@ -9,102 +10,201 @@ logger = logging.getLogger("intercom_client")
 INTERCOM_API_BASE = "https://api.intercom.io"
 
 
-def _headers() -> dict:
-    return {
-        "Authorization": f"Bearer {settings.INTERCOM_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        # Intercom рекомендует указывать версию API явно
-        "Intercom-Version": "2.11",
-    }
-
-
-async def send_reply(conversation_id: str, text: str) -> bool:
-    if settings.DRY_RUN:
-        logger.info(
-            "[DRY RUN] Would send reply to conversation %s: %s",
-            conversation_id,
-            text[:100],
+class IntercomClient:
+    def __init__(self) -> None:
+        self._client = httpx.AsyncClient(
+            timeout=15.0,
+            headers=self._headers(),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
         )
-        return True
 
-    if not settings.INTERCOM_TOKEN:
-        logger.error("INTERCOM_TOKEN not set — cannot send reply")
-        return False
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {settings.INTERCOM_TOKEN}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Intercom-Version": "2.15",
+        }
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    # ====================== УНИФИЦИРОВАННЫЙ МЕТОД ======================
+    async def _add_conversation_part(
+        self,
+        conversation_id: str,
+        message_type: str,
+        body: Optional[str] = None,
+        admin_id: Optional[str] = None,
+        **extra: dict,
+    ) -> bool:
+        """Внутренний унифицированный метод"""
+        if settings.DRY_RUN:
+            logger.info("[DRY RUN] %s conv=%s", message_type, conversation_id)
+            return True
+
+        admin_id = admin_id or settings.INTERCOM_ADMIN_ID
+        if not admin_id:
+            logger.error("INTERCOM_ADMIN_ID не настроен")
+            return False
+        if not settings.INTERCOM_TOKEN:
+            logger.error("Missing INTERCOM_TOKEN")
+            return False
+
+        payload = {
+            "message_type": message_type,
+            "type": "admin",
+            "admin_id": admin_id,
+            **extra,
+        }
+        if body is not None:
+            payload["body"] = body
+
+        try:
+            resp = await self._client.post(
+                f"{INTERCOM_API_BASE}/conversations/{conversation_id}/parts",
+                json=payload,
+            )
+            resp.raise_for_status()
+
+            logger.info("%s успешно выполнен для conv=%s", message_type.upper(), conversation_id)
+            return True
+
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                "%s error %s: %s",
+                message_type.upper(),
+                e.response.status_code,
+                e.response.text[:300],
+            )
+            return False
+        except httpx.RequestError as e:
+            logger.error("Network error %s conv=%s: %s", message_type.upper(), conversation_id, e)
+            return False
+
+    # -------------------------
+    # REPLY (публичный ответ пользователю)
+    # -------------------------
+    async def send_reply(
+        self,
+        conversation_id: str,
+        text: str,
+        admin_id: Optional[str] = None,
+    ) -> bool:
+        """Отправить видимый ответ пользователю"""
+        if settings.DRY_RUN:
+            logger.info("[DRY RUN] reply conv=%s", conversation_id)
+            return True
+
+        admin_id = admin_id or settings.INTERCOM_ADMIN_ID
+        if not settings.INTERCOM_TOKEN:
+            logger.error("Missing INTERCOM_TOKEN")
+            return False
+
+        try:
+            resp = await self._client.post(
                 f"{INTERCOM_API_BASE}/conversations/{conversation_id}/reply",
-                headers=_headers(),
                 json={
-                    "type": "admin",
                     "message_type": "comment",
+                    "type": "admin",
+                    "admin_id": admin_id,
                     "body": text,
                 },
             )
-            response.raise_for_status()
-            logger.info("Reply sent to conversation %s", conversation_id)
+            resp.raise_for_status()
+            logger.info("Reply sent to conv=%s", conversation_id)
             return True
 
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "Intercom reply error %s for conversation %s: %s",
-            e.response.status_code,
+        except httpx.HTTPStatusError as e:
+            logger.error("Reply error %s: %s", e.response.status_code, e.response.text[:250])
+            return False
+        except httpx.RequestError as e:
+            logger.error("Network error reply conv=%s: %s", conversation_id, e)
+            return False
+
+    # -------------------------
+    # NOTE (внутренняя заметка)
+    # -------------------------
+    async def send_note(
+        self,
+        conversation_id: str,
+        text: str,
+        admin_id: Optional[str] = None,
+    ) -> bool:
+        """Добавить внутреннюю заметку"""
+        return await self._add_conversation_part(
             conversation_id,
-            e.response.text[:200],
+            message_type="note",
+            body=text,
+            admin_id=admin_id,
         )
-        return False
-    except httpx.RequestError as e:
-        logger.error("Intercom request error for conversation %s: %s", conversation_id, e)
-        return False
 
-
-async def assign_to_team(conversation_id: str) -> bool:
-    if settings.DRY_RUN:
-        logger.info(
-            "[DRY RUN] Would assign conversation %s to team %s",
+    # -------------------------
+    # ASSIGN TO ADMIN
+    # -------------------------
+    async def assign_to_admin(
+        self,
+        conversation_id: str,
+        admin_id: Optional[str] = None,
+    ) -> bool:
+        """Назначить на конкретного админа"""
+        return await self._add_conversation_part(
             conversation_id,
-            settings.SUPPORT_TEAM_ID,
+            message_type="assignment",
+            admin_id=admin_id,
         )
-        return True
 
-    if not settings.INTERCOM_TOKEN:
-        logger.error("INTERCOM_TOKEN not set — cannot assign conversation")
-        return False
+    # -------------------------
+    # ASSIGN TO TEAM (новое)
+    # -------------------------
+    async def assign_to_team(
+        self,
+        conversation_id: str,
+        team_id: Optional[str] = None,
+    ) -> bool:
+        """Назначить разговор на команду (рекомендуется)"""
+        if not team_id:
+            team_id = getattr(settings, 'INTERCOM_TEAM_ID', None)
 
-    if not settings.SUPPORT_TEAM_ID:
-        logger.error("SUPPORT_TEAM_ID not set — cannot assign conversation")
-        return False
+        if not team_id:
+            logger.warning("INTERCOM_TEAM_ID не настроен, используем assign_to_admin как fallback")
+            return await self.assign_to_admin(conversation_id)
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.put(
-                f"{INTERCOM_API_BASE}/conversations/{conversation_id}",
-                headers=_headers(),
-                json={
-                    "assignment": {
-                        "type": "team",
-                        "admin_id": settings.SUPPORT_TEAM_ID,
-                    }
-                },
-            )
-            response.raise_for_status()
-            logger.info(
-                "Conversation %s assigned to team %s",
-                conversation_id,
-                settings.SUPPORT_TEAM_ID,
-            )
-            return True
-
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "Intercom assign error %s for conversation %s: %s",
-            e.response.status_code,
+        return await self._add_conversation_part(
             conversation_id,
-            e.response.text[:200],
+            message_type="assignment",
+            admin_id=settings.INTERCOM_ADMIN_ID,   # кто выполняет назначение
+            **{"assignee_id": team_id}             # ключ для назначения на команду
         )
-        return False
-    except httpx.RequestError as e:
-        logger.error("Intercom request error for conversation %s: %s", conversation_id, e)
-        return False
+
+    # -------------------------
+    # CLOSE
+    # -------------------------
+    async def close_conversation(
+        self,
+        conversation_id: str,
+        admin_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """Закрыть разговор"""
+        return await self._add_conversation_part(
+            conversation_id,
+            message_type="close",
+            body=reason or "Closed automatically",
+            admin_id=admin_id,
+        )
+
+    # -------------------------
+    # OPEN
+    # -------------------------
+    async def open_conversation(
+        self,
+        conversation_id: str,
+        admin_id: Optional[str] = None,
+    ) -> bool:
+        """Переоткрыть разговор"""
+        return await self._add_conversation_part(
+            conversation_id,
+            message_type="open",
+            admin_id=admin_id,
+        )
