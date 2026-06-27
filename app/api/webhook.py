@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.params import Depends
 
 from app.core.config import settings
-from app.main import get_llm_client, get_knowledge_base
+from app.core.dependencies import get_llm_client, get_knowledge_base
 from app.services.knowledge_base import KnowledgeBase
 from app.services.llm_client import YandexLLMClient
 from app.services.ticket_handler import handle_new_ticket

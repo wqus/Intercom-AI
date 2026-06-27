@@ -8,6 +8,7 @@ from app.services.llm_client import YandexLLMClient
 from app.services.knowledge_base import KnowledgeBase
 from app.api.webhook import router as webhook_router
 from app.api.process import router as process_router
+from app.core.dependencies import init_llm_client, init_knowledge_base
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -16,14 +17,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("main")
 
-llm_client: YandexLLMClient | None = None
-knowledge_base: KnowledgeBase | None = None
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global llm_client, knowledge_base
-
     logger.info("Starting up...")
     logger.info("DRY_RUN=%s", settings.DRY_RUN)
 
@@ -34,6 +30,10 @@ async def lifespan(app: FastAPI):
     )
 
     knowledge_base = KnowledgeBase(path="data/knowledge_base.json")
+
+    # Инициализируем глобальные переменные через dependencies
+    init_llm_client(llm_client)
+    init_knowledge_base(knowledge_base)
 
     logger.info("LLM client and knowledge base initialized")
 
@@ -49,11 +49,3 @@ app = FastAPI(
 
 app.include_router(webhook_router)
 app.include_router(process_router)
-
-
-def get_llm_client() -> YandexLLMClient:
-    return llm_client
-
-
-def get_knowledge_base() -> KnowledgeBase:
-    return knowledge_base
