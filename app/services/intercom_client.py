@@ -158,6 +158,7 @@ class IntercomClient:
             conversation_id,
             message_type="assignment",
             admin_id=admin_id,
+            assignee_id=admin_id,
         )
     # -------------------------
     # CLOSE
