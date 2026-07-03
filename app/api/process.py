@@ -43,10 +43,8 @@ async def process_question(
     question = body.question
     logger.info("Processing question: %s", question[:80])
 
-    # ШАГ 1: Fuzzy match
     match = kb.match(question)
 
-    # ШАГ 2а: Шаблонный ответ
     if match.mode == MatchMode.TEMPLATE:
         return ProcessResponse(
             question=question,
@@ -57,7 +55,6 @@ async def process_question(
             escalation_reason=None,
         )
 
-    # ШАГ 2б: Нет совпадения — сразу эскалация
     if match.mode == MatchMode.NO_MATCH or not match.relevant_entries:
         return ProcessResponse(
             question=question,
@@ -68,13 +65,11 @@ async def process_question(
             escalation_reason="no_kb_match",
         )
 
-    # ШАГ 3: LLM
     llm_result = await llm.classify(
         question=question,
         relevant_entries=match.relevant_entries,
     )
 
-    # ШАГ 4: Результат
     if llm_result.can_answer and llm_result.answer:
         return ProcessResponse(
             question=question,

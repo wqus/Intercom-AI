@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import logging
 import re
@@ -12,13 +10,10 @@ from rapidfuzz import fuzz
 
 logger = logging.getLogger("knowledge_base")
 
-
-
 NO_MATCH_THRESHOLD = 30
-DIRECT_THRESHOLD = 90
-GAP_THRESHOLD = 25
+DIRECT_THRESHOLD = 95
+GAP_THRESHOLD = 30
 TOP_N = 5
-
 
 STOP_WORDS = {
     "не",
@@ -51,7 +46,6 @@ STOP_WORDS = {
 }
 
 
-
 class MatchMode(str, Enum):
     NO_MATCH = "no_match"
     TEMPLATE = "template"
@@ -73,16 +67,7 @@ class MatchResult:
     relevant_entries: list[dict]
 
 
-# TEXT UTILS
 def normalize(text: str) -> str:
-    """
-    Нормализация текста:
-    - lowercase
-    - удаление пунктуации
-    - удаление стоп-слов
-    - удаление коротких токенов
-    """
-
     text = text.lower()
 
     text = re.sub(r"[^\w\s]", " ", text)
@@ -97,10 +82,9 @@ def normalize(text: str) -> str:
 
 
 def calculate_phrase_score(
-    question_norm: str,
-    phrase_norm: str,
+        question_norm: str,
+        phrase_norm: str,
 ) -> float:
-
     return max(
         fuzz.token_set_ratio(question_norm, phrase_norm),
         fuzz.partial_ratio(question_norm, phrase_norm),
@@ -108,10 +92,9 @@ def calculate_phrase_score(
 
 
 def best_score(
-    question_norm: str,
-    phrases: list[str],
+        question_norm: str,
+        phrases: list[str],
 ) -> float:
-
     if not phrases:
         return 0.0
 
@@ -135,12 +118,11 @@ def best_score(
     return best
 
 
-# KNOWLEDGE BASE
 class KnowledgeBase:
 
     def __init__(
-        self,
-        path: str = "data/knowledge_base.json",
+            self,
+            path: str = "data/knowledge_base.json",
     ) -> None:
 
         self.entries: list[dict] = []
@@ -152,10 +134,9 @@ class KnowledgeBase:
 
         self._load(path)
 
-
     def _load(
-        self,
-        path: str,
+            self,
+            path: str,
     ) -> None:
 
         kb_path = Path(path)
@@ -168,8 +149,8 @@ class KnowledgeBase:
             return
 
         with open(
-            kb_path,
-            encoding="utf-8",
+                kb_path,
+                encoding="utf-8",
         ) as f:
             data = json.load(f)
 
@@ -186,10 +167,9 @@ class KnowledgeBase:
             len(self.entries),
         )
 
-
     def get_scored_entries(
-        self,
-        question: str,
+            self,
+            question: str,
     ) -> list[tuple[float, dict]]:
 
         question_norm = normalize(question)
@@ -197,7 +177,6 @@ class KnowledgeBase:
         scored = []
 
         for entry in self.entries:
-
             score = best_score(
                 question_norm,
                 entry.get("match_phrases", []),
@@ -212,14 +191,12 @@ class KnowledgeBase:
 
         return scored
 
-
     def match(
-        self,
-        question: str,
+            self,
+            question: str,
     ) -> MatchResult:
 
         if not self.entries:
-
             return MatchResult(
                 mode=MatchMode.NO_MATCH,
                 score=0,
@@ -249,10 +226,7 @@ class KnowledgeBase:
             top_entry.get("category"),
         )
 
-        # NO MATCH
-
         if top_score < NO_MATCH_THRESHOLD:
-
             return MatchResult(
                 mode=MatchMode.NO_MATCH,
                 score=top_score,
@@ -262,12 +236,10 @@ class KnowledgeBase:
                 relevant_entries=[],
             )
 
-        # TEMPLATE
         if (
-            top_score >= DIRECT_THRESHOLD
-            and gap >= GAP_THRESHOLD
+                top_score >= DIRECT_THRESHOLD
+                and gap >= GAP_THRESHOLD
         ):
-
             return MatchResult(
                 mode=MatchMode.TEMPLATE,
                 score=top_score,
@@ -276,8 +248,6 @@ class KnowledgeBase:
                 kb_id=top_entry["id"],
                 relevant_entries=[top_entry],
             )
-
-        # LLM
 
         relevant_entries = [
             entry
@@ -294,11 +264,10 @@ class KnowledgeBase:
             relevant_entries=relevant_entries,
         )
 
-
     def get_relevant_entries(
-        self,
-        question: str,
-        top_n: int = TOP_N,
+            self,
+            question: str,
+            top_n: int = TOP_N,
     ) -> list[dict]:
 
         scored = self.get_scored_entries(question)

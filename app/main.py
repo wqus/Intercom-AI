@@ -31,13 +31,12 @@ async def lifespan(app: FastAPI):
 
     knowledge_base = KnowledgeBase(path="data/knowledge_base.json")
 
-    # Инициализируем глобальные переменные через dependencies
     init_llm_client(llm_client)
     init_knowledge_base(knowledge_base)
 
     logger.info("LLM client and knowledge base initialized")
 
-    yield  # приложение работает
+    yield
 
     logger.info("Shutting down...")
 

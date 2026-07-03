@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Literal
+from typing import Optional
 
 import httpx
 
@@ -29,7 +29,6 @@ class IntercomClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    # ====================== УНИФИЦИРОВАННЫЙ МЕТОД ======================
     async def _add_conversation_part(
         self,
         conversation_id: str,
@@ -38,7 +37,6 @@ class IntercomClient:
         admin_id: Optional[str] = None,
         **extra: dict,
     ) -> bool:
-        """Внутренний унифицированный метод"""
         if settings.DRY_RUN:
             logger.info("[DRY RUN] %s conv=%s", message_type, conversation_id)
             return True
@@ -82,16 +80,12 @@ class IntercomClient:
             logger.error("Network error %s conv=%s: %s", message_type.upper(), conversation_id, e)
             return False
 
-    # -------------------------
-    # REPLY (публичный ответ пользователю)
-    # -------------------------
     async def send_reply(
         self,
         conversation_id: str,
         text: str,
         admin_id: Optional[str] = None,
     ) -> bool:
-        """Отправить видимый ответ пользователю"""
         if settings.DRY_RUN:
             logger.info("[DRY RUN] reply conv=%s", conversation_id)
             return True
@@ -122,16 +116,12 @@ class IntercomClient:
             logger.error("Network error reply conv=%s: %s", conversation_id, e)
             return False
 
-    # -------------------------
-    # NOTE (внутренняя заметка)
-    # -------------------------
     async def send_note(
         self,
         conversation_id: str,
         text: str,
         admin_id: Optional[str] = None,
     ) -> bool:
-        """Добавить внутреннюю заметку"""
         return await self._add_conversation_part(
             conversation_id,
             message_type="note",
@@ -139,15 +129,11 @@ class IntercomClient:
             admin_id=admin_id,
         )
 
-    # -------------------------
-    # ASSIGN TO ADMIN
-    # -------------------------
     async def assign_to_admin(
             self,
             conversation_id: str,
             admin_id: Optional[str] = None,
     ) -> bool:
-        """Назначить разговор на оператора"""
         admin_id = admin_id or settings.INTERCOM_ADMIN_ID
 
         if not admin_id:
@@ -160,16 +146,13 @@ class IntercomClient:
             admin_id=admin_id,
             assignee_id=admin_id,
         )
-    # -------------------------
     # CLOSE
-    # -------------------------
     async def close_conversation(
         self,
         conversation_id: str,
         admin_id: Optional[str] = None,
         reason: Optional[str] = None,
     ) -> bool:
-        """Закрыть разговор"""
         return await self._add_conversation_part(
             conversation_id,
             message_type="close",
@@ -177,15 +160,12 @@ class IntercomClient:
             admin_id=admin_id,
         )
 
-    # -------------------------
     # OPEN
-    # -------------------------
     async def open_conversation(
         self,
         conversation_id: str,
         admin_id: Optional[str] = None,
     ) -> bool:
-        """Переоткрыть разговор"""
         return await self._add_conversation_part(
             conversation_id,
             message_type="open",
