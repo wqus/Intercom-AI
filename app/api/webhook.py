@@ -68,6 +68,9 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
         conversation_id = str(item["id"])
         topic = payload.get("topic", "")
 
+
+        logger.info("DEBUG raw conversation payload: %s", payload)  # ← временно добавь
+
         body = ""
 
         if topic == "conversation.user.replied":
