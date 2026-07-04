@@ -66,8 +66,19 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
     try:
         item = payload["data"]["item"]
         conversation_id = str(item["id"])
+        topic = payload.get("topic", "")
 
-        body = item.get("source", {}).get("body", "")
+        body = ""
+
+        if topic == "conversation.user.replied":
+            parts = item.get("conversation_parts", {}).get("conversation_parts", [])
+            for part in reversed(parts):
+                if part.get("author", {}).get("type") == "user":
+                    body = part.get("body", "")
+                    break
+
+        if not body:
+            body = item.get("source", {}).get("body", "")
 
         if not body:
             parts = item.get("conversation_parts", {}).get("conversation_parts", [])
@@ -85,7 +96,6 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
     except Exception as e:
         logger.warning("Failed to extract conversation data: %s", e)
         return None
-
 
 def extract_ticket_data(payload: dict) -> tuple[str, str] | None:
     try:
@@ -106,6 +116,7 @@ def extract_ticket_data(payload: dict) -> tuple[str, str] | None:
 
     except Exception as e:
         logger.warning("Failed to extract ticket data: %s", e)
+        logger.warning("Raw payload: %s", payload)  # временно добавь эту строку
         return None
 
 
