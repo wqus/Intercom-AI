@@ -44,7 +44,7 @@ def verify_intercom_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def has_attachments(payload: dict) -> bool:
+def has_conversation_attachments(payload: dict) -> bool:
     try:
         item = payload["data"]["item"]
 
@@ -52,6 +52,26 @@ def has_attachments(payload: dict) -> bool:
             return True
 
         parts = item.get("conversation_parts", {}).get("conversation_parts", [])
+        for part in parts:
+            if part.get("attachments"):
+                return True
+
+        return False
+
+    except Exception:
+        return False
+
+
+def has_ticket_attachments(payload: dict) -> bool:
+    try:
+        item = payload["data"]["item"]
+
+        ticket_part = item.get("ticket_part", {})
+        if ticket_part.get("attachments"):
+            return True
+
+        ticket = item.get("ticket", {})
+        parts = ticket.get("ticket_parts", {}).get("ticket_parts", [])
         for part in parts:
             if part.get("attachments"):
                 return True
@@ -176,7 +196,18 @@ async def intercom_webhook(
             processed_events.clear()
 
     if topic in TICKET_TOPICS:
-        result = extract_ticket_data(payload)
+        result = None
+        if topic in TICKET_TOPICS:
+            if has_ticket_attachments(payload):
+                logger.info("Ticket %s contains attachments. Escalating immediately.", item_id)
+                intercom_client = IntercomClient()
+                try:
+                    await intercom_client.assign_to_admin(item_id)
+                finally:
+                    await intercom_client.close()
+                return {"status": "escalated", "reason": "attachments"}
+
+            result = extract_ticket_data(payload)
 
         if not result:
             logger.warning("Could not extract ticket data")
@@ -220,7 +251,7 @@ async def intercom_webhook(
         )
         return {"status": "skipped", "reason": "linked_to_ticket"}
 
-    if has_attachments(payload):
+    if has_conversation_attachments(payload):
         logger.info(
             "Item %s contains attachments. Escalating immediately.",
             item_id,
