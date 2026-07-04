@@ -100,23 +100,30 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
 def extract_ticket_data(payload: dict) -> tuple[str, str] | None:
     try:
         item = payload["data"]["item"]
+        topic = payload.get("topic", "")
+
+        if topic == "ticket.contact.replied":
+            ticket_id = str(item["ticket"]["id"])
+            body = item.get("ticket_part", {}).get("body", "")
+
+            if not body:
+                return None
+
+            question = re.sub(r"<[^>]+>", "", body).strip()
+            return ticket_id, question
 
         ticket_id = str(item["id"])
-
         attrs = item.get("ticket_attributes", {})
-
         question = attrs.get("_default_description_", "")
 
         if not question:
             return None
 
         question = re.sub(r"<[^>]+>", "", question).strip()
-
         return ticket_id, question
 
     except Exception as e:
         logger.warning("Failed to extract ticket data: %s", e)
-        logger.warning("Raw payload: %s", payload)  # временно добавь эту строку
         return None
 
 
@@ -192,6 +199,7 @@ async def intercom_webhook(
                 question=question,
                 llm_client=llm_client,
                 knowledge_base=knowledge_base,
+                is_ticket=True,
             )
         )
 

@@ -80,7 +80,7 @@ class IntercomClient:
             logger.error("Network error %s conv=%s: %s", message_type.upper(), conversation_id, e)
             return False
 
-    async def send_reply(
+    async def send_conversations_reply(
             self,
             conversation_id: str,
             text: str,
@@ -114,6 +114,42 @@ class IntercomClient:
             return False
         except httpx.RequestError as e:
             logger.error("Network error reply conv=%s: %s", conversation_id, e)
+            return False
+
+    async def send_ticket_reply(
+            self,
+            ticket_id: str,
+            text: str,
+            admin_id: Optional[str] = None,
+    ) -> bool:
+        if settings.DRY_RUN:
+            logger.info("[DRY RUN] ticket reply id=%s", ticket_id)
+            return True
+
+        admin_id = admin_id or settings.INTERCOM_ADMIN_ID
+        if not settings.INTERCOM_TOKEN:
+            logger.error("Missing INTERCOM_TOKEN")
+            return False
+
+        try:
+            resp = await self._client.post(
+                f"{INTERCOM_API_BASE}/tickets/{ticket_id}/reply",
+                json={
+                    "message_type": "comment",
+                    "type": "admin",
+                    "admin_id": admin_id,
+                    "body": text,
+                },
+            )
+            resp.raise_for_status()
+            logger.info("Ticket reply sent id=%s", ticket_id)
+            return True
+
+        except httpx.HTTPStatusError as e:
+            logger.error("Ticket reply error %s: %s", e.response.status_code, e.response.text[:250])
+            return False
+        except httpx.RequestError as e:
+            logger.error("Network error ticket reply id=%s: %s", ticket_id, e)
             return False
 
     async def send_note(

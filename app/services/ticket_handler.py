@@ -12,6 +12,7 @@ async def handle_new_ticket(
         question: str,
         llm_client: YandexLLMClient,
         knowledge_base: KnowledgeBase,
+        is_ticket: bool = False,
         intercom_client: IntercomClient | None = None,
 ) -> None:
     if intercom_client is None:
@@ -20,7 +21,7 @@ async def handle_new_ticket(
     logger.info("Processing ticket | id=%s | question=%s", conversation_id, question[:80])
 
     try:
-        #Fuzzy match
+        # Fuzzy match
         match = knowledge_base.match(question)
 
         logger.info(
@@ -32,12 +33,15 @@ async def handle_new_ticket(
 
         if match.mode == MatchMode.TEMPLATE:
             logger.info("Sending template answer for category: %s", match.category)
-            await intercom_client.send_reply(conversation_id, match.template_answer)
+            if is_ticket:
+                await intercom_client.send_ticket_reply(conversation_id, match.template_answer)
+            else:
+                await intercom_client.send_conversations_reply(conversation_id, match.template_answer)
             return
 
         if match.mode == MatchMode.NO_MATCH or not match.relevant_entries:
             logger.info("No KB match — escalating to team")
-            await intercom_client.assign_to_admin(conversation_id)  # или assign_to_team, если добавишь
+            await intercom_client.assign_to_admin(conversation_id)
             return
 
         # классификация
@@ -58,7 +62,10 @@ async def handle_new_ticket(
         )
 
         if llm_result.can_answer and llm_result.answer:
-            await intercom_client.send_reply(conversation_id, llm_result.answer)
+            if is_ticket:
+                await intercom_client.send_ticket_reply(conversation_id, llm_result.answer)
+            else:
+                await intercom_client.send_conversations_reply(conversation_id, llm_result.answer)
         else:
             logger.info(
                 "LLM cannot answer | reason=%s — escalating",
