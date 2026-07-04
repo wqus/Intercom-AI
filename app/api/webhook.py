@@ -3,7 +3,6 @@ import hashlib
 import hmac
 import logging
 import re
-import json
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.params import Depends
 from httpx import Response
@@ -31,6 +30,7 @@ TICKET_TOPICS = {
     "ticket.contact.replied",
 }
 
+
 def verify_intercom_signature(body: bytes, signature: str) -> bool:
     if not settings.INTERCOM_CLIENT_SECRET or not signature:
         return False
@@ -42,6 +42,7 @@ def verify_intercom_signature(body: bytes, signature: str) -> bool:
     ).hexdigest()
 
     return hmac.compare_digest(expected, signature)
+
 
 def has_attachments(payload: dict) -> bool:
     try:
@@ -59,6 +60,7 @@ def has_attachments(payload: dict) -> bool:
 
     except Exception:
         return False
+
 
 def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
     try:
@@ -85,13 +87,34 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
         return None
 
 
+def extract_ticket_data(payload: dict) -> tuple[str, str] | None:
+    try:
+        item = payload["data"]["item"]
+
+        ticket_id = str(item["id"])
+
+        attrs = item.get("ticket_attributes", {})
+
+        question = attrs.get("_default_description_", "")
+
+        if not question:
+            return None
+
+        question = re.sub(r"<[^>]+>", "", question).strip()
+
+        return ticket_id, question
+
+    except Exception as e:
+        logger.warning("Failed to extract ticket data: %s", e)
+        return None
+
+
 @router.api_route("/webhook/intercom", methods=["POST", "HEAD"], response_model=None)
 async def intercom_webhook(
-    request: Request,
-    llm_client: YandexLLMClient = Depends(get_llm_client),
-    knowledge_base: KnowledgeBase = Depends(get_knowledge_base),
+        request: Request,
+        llm_client: YandexLLMClient = Depends(get_llm_client),
+        knowledge_base: KnowledgeBase = Depends(get_knowledge_base),
 ) -> dict | Response:
-
     if request.method == "HEAD":
         return Response(status_code=200)
 
@@ -112,44 +135,17 @@ async def intercom_webhook(
 
     topic = payload.get("topic", "")
 
-    conversation_topics = {
-        "conversation.user.created",
-        "conversation.user.replied",
-    }
-
-    ticket_topics = {
-        "ticket.created",
-        "ticket.contact.replied",
-    }
-
-    if topic in ticket_topics:
-        logger.info(
-            "\n========== INTERCOM TICKET ==========\n%s\n=====================================",
-            json.dumps(payload, indent=2, ensure_ascii=False),
-        )
-
-        return {
-            "status": "ticket_logged",
-            "topic": topic,
-        }
-
-    if topic not in conversation_topics:
-        return {
-            "status": "ignored",
-            "topic": topic,
-        }
-
     # Защита от дублей
     event_id = payload.get("id")
-    conversation_id = str(payload.get("data", {}).get("item", {}).get("id", ""))
+    item_id = str(payload.get("data", {}).get("item", {}).get("id", ""))
 
-    if event_id and conversation_id:
-        event_key = f"{conversation_id}:{event_id}"
+    if event_id and item_id:
+        event_key = f"{item_id}:{event_id}"
 
         if event_key in processed_events:
             logger.info(
-                "Duplicate webhook skipped | conv=%s",
-                conversation_id,
+                "Duplicate webhook skipped | id=%s",
+                item_id,
             )
             return {
                 "status": "duplicate",
@@ -160,17 +156,55 @@ async def intercom_webhook(
         if len(processed_events) > 2000:
             processed_events.clear()
 
+    if topic in TICKET_TOPICS:
+        result = extract_ticket_data(payload)
+
+        if not result:
+            logger.warning("Could not extract ticket data")
+
+            return {
+                "status": "skipped",
+                "reason": "no_question",
+            }
+
+        ticket_id, question = result
+
+        logger.info(
+            "Ticket accepted | id=%s | question=%s",
+            ticket_id,
+            question[:120],
+        )
+
+        asyncio.create_task(
+            handle_new_ticket(
+                conversation_id=ticket_id,
+                question=question,
+                llm_client=llm_client,
+                knowledge_base=knowledge_base,
+            )
+        )
+
+        return {
+            "status": "accepted",
+        }
+
+    if topic not in CONVERSATION_TOPICS:
+        return {
+            "status": "ignored",
+            "topic": topic,
+        }
+
     # Вложения сразу оператору
     if has_attachments(payload):
         logger.info(
-            "Conversation %s contains attachments. Escalating immediately.",
-            conversation_id,
+            "Item %s contains attachments. Escalating immediately.",
+            item_id,
         )
 
         intercom_client = IntercomClient()
 
         try:
-            await intercom_client.assign_to_admin(conversation_id)
+            await intercom_client.assign_to_admin(item_id)
         finally:
             await intercom_client.close()
 
@@ -209,6 +243,7 @@ async def intercom_webhook(
     return {
         "status": "accepted",
     }
+
 
 @router.get("/health")
 async def health():

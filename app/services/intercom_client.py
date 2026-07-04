@@ -30,12 +30,12 @@ class IntercomClient:
         await self._client.aclose()
 
     async def _add_conversation_part(
-        self,
-        conversation_id: str,
-        message_type: str,
-        body: Optional[str] = None,
-        admin_id: Optional[str] = None,
-        **extra: dict,
+            self,
+            conversation_id: str,
+            message_type: str,
+            body: Optional[str] = None,
+            admin_id: Optional[str] = None,
+            **extra: dict,
     ) -> bool:
         if settings.DRY_RUN:
             logger.info("[DRY RUN] %s conv=%s", message_type, conversation_id)
@@ -81,10 +81,10 @@ class IntercomClient:
             return False
 
     async def send_reply(
-        self,
-        conversation_id: str,
-        text: str,
-        admin_id: Optional[str] = None,
+            self,
+            conversation_id: str,
+            text: str,
+            admin_id: Optional[str] = None,
     ) -> bool:
         if settings.DRY_RUN:
             logger.info("[DRY RUN] reply conv=%s", conversation_id)
@@ -117,10 +117,10 @@ class IntercomClient:
             return False
 
     async def send_note(
-        self,
-        conversation_id: str,
-        text: str,
-        admin_id: Optional[str] = None,
+            self,
+            conversation_id: str,
+            text: str,
+            admin_id: Optional[str] = None,
     ) -> bool:
         return await self._add_conversation_part(
             conversation_id,
@@ -146,12 +146,12 @@ class IntercomClient:
             admin_id=admin_id,
             assignee_id=admin_id,
         )
-    # CLOSE
+
     async def close_conversation(
-        self,
-        conversation_id: str,
-        admin_id: Optional[str] = None,
-        reason: Optional[str] = None,
+            self,
+            conversation_id: str,
+            admin_id: Optional[str] = None,
+            reason: Optional[str] = None,
     ) -> bool:
         return await self._add_conversation_part(
             conversation_id,
@@ -160,11 +160,10 @@ class IntercomClient:
             admin_id=admin_id,
         )
 
-    # OPEN
     async def open_conversation(
-        self,
-        conversation_id: str,
-        admin_id: Optional[str] = None,
+            self,
+            conversation_id: str,
+            admin_id: Optional[str] = None,
     ) -> bool:
         return await self._add_conversation_part(
             conversation_id,

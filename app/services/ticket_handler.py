@@ -30,13 +30,11 @@ async def handle_new_ticket(
             match.category,
         )
 
-        # Шаблонный ответ
         if match.mode == MatchMode.TEMPLATE:
             logger.info("Sending template answer for category: %s", match.category)
             await intercom_client.send_reply(conversation_id, match.template_answer)
             return
 
-        # Нет совпадения - эскалация
         if match.mode == MatchMode.NO_MATCH or not match.relevant_entries:
             logger.info("No KB match — escalating to team")
             await intercom_client.assign_to_admin(conversation_id)  # или assign_to_team, если добавишь
@@ -59,7 +57,6 @@ async def handle_new_ticket(
             llm_result.can_answer,
         )
 
-        # Действие по результату LLM
         if llm_result.can_answer and llm_result.answer:
             await intercom_client.send_reply(conversation_id, llm_result.answer)
         else:
