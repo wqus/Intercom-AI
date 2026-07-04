@@ -68,9 +68,6 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
         conversation_id = str(item["id"])
         topic = payload.get("topic", "")
 
-
-        logger.info("DEBUG raw conversation payload: %s", payload)  # ← временно добавь
-
         body = ""
 
         if topic == "conversation.user.replied":
@@ -99,6 +96,7 @@ def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
     except Exception as e:
         logger.warning("Failed to extract conversation data: %s", e)
         return None
+
 
 def extract_ticket_data(payload: dict) -> tuple[str, str] | None:
     try:
@@ -211,12 +209,17 @@ async def intercom_webhook(
         }
 
     if topic not in CONVERSATION_TOPICS:
-        return {
-            "status": "ignored",
-            "topic": topic,
-        }
+        return {"status": "ignored", "topic": topic}
 
-    # Вложения сразу оператору
+    item = payload.get("data", {}).get("item", {})
+
+    if item.get("ticket") is not None:
+        logger.info(
+            "Conversation %s is linked to a ticket — skipping, handled via ticket topic",
+            item.get("id")
+        )
+        return {"status": "skipped", "reason": "linked_to_ticket"}
+
     if has_attachments(payload):
         logger.info(
             "Item %s contains attachments. Escalating immediately.",
