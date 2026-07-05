@@ -183,6 +183,44 @@ class IntercomClient:
             assignee_id=admin_id,
         )
 
+    async def assign_ticket_to_admin(
+            self,
+            ticket_id: str,
+            admin_id: str | None = None,
+    ) -> bool:
+        admin_id = admin_id or settings.INTERCOM_ADMIN_ID
+
+        if settings.DRY_RUN:
+            logger.info("[DRY RUN] assign ticket=%s", ticket_id)
+            return True
+
+        try:
+            resp = await self._client.put(
+                f"{INTERCOM_API_BASE}/tickets/{ticket_id}",
+                json={
+                    "admin_id": admin_id,
+                    "assignee_id": admin_id,
+                },
+            )
+
+            resp.raise_for_status()
+
+            logger.info(
+                "Ticket %s assigned to admin %s",
+                ticket_id,
+                admin_id,
+            )
+
+            return True
+
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                "Ticket assignment error %s: %s",
+                e.response.status_code,
+                e.response.text,
+            )
+            return False
+
     async def close_conversation(
             self,
             conversation_id: str,

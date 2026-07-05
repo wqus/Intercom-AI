@@ -147,6 +147,27 @@ def extract_ticket_data(payload: dict) -> tuple[str, str] | None:
         logger.warning("Failed to extract ticket data: %s", e)
         return None
 
+def get_item_id(payload: dict) -> str | None:
+    try:
+        data = payload.get("data", {})
+        item = data.get("item", {})
+
+        if item_id := item.get("id"):
+            return str(item_id)
+
+        if ticket := item.get("ticket"):
+            if ticket_id := ticket.get("id") or ticket.get("ticket_id"):
+                return str(ticket_id)
+
+        if ticket_part := item.get("ticket_part"):
+            if ticket := ticket_part.get("ticket"):
+                if ticket_id := ticket.get("id") or ticket.get("ticket_id"):
+                    return str(ticket_id)
+
+        return None
+    except Exception as e:
+        logger.warning("Failed to get item_id: %s", e)
+        return None
 
 @router.api_route("/webhook/intercom", methods=["POST", "HEAD"], response_model=None)
 async def intercom_webhook(
@@ -175,8 +196,8 @@ async def intercom_webhook(
     topic = payload.get("topic", "")
 
     # Защита от дублей
+    item_id = get_item_id(payload)
     event_id = payload.get("id")
-    item_id = str(payload.get("data", {}).get("item", {}).get("id", ""))
 
     if event_id and item_id:
         event_key = f"{item_id}:{event_id}"
@@ -202,7 +223,7 @@ async def intercom_webhook(
                 logger.info("Ticket %s contains attachments. Escalating immediately.", item_id)
                 intercom_client = IntercomClient()
                 try:
-                    await intercom_client.assign_to_admin(item_id)
+                    await intercom_client.assign_ticket_to_admin(item_id)
                 finally:
                     await intercom_client.close()
                 return {"status": "escalated", "reason": "attachments"}
