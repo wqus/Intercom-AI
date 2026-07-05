@@ -40,8 +40,12 @@ async def handle_new_ticket(
             return
 
         if match.mode == MatchMode.NO_MATCH or not match.relevant_entries:
-            logger.info("No KB match — escalating to team")
-            await intercom_client.assign_to_admin(conversation_id)
+            logger.info("No KB match — sending human attention message")
+            message = "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
+            if is_ticket:
+                await intercom_client.send_ticket_reply(conversation_id, message)
+            else:
+                await intercom_client.send_conversations_reply(conversation_id, message)
             return
 
         # классификация
@@ -68,10 +72,14 @@ async def handle_new_ticket(
                 await intercom_client.send_conversations_reply(conversation_id, llm_result.answer)
         else:
             logger.info(
-                "LLM cannot answer | reason=%s — escalating",
+                "LLM cannot answer | reason=%s — sending human attention message",
                 llm_result.reason,
             )
-            await intercom_client.assign_to_admin(conversation_id)
+            message = "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
+            if is_ticket:
+                await intercom_client.send_ticket_reply(conversation_id, message)
+            else:
+                await intercom_client.send_conversations_reply(conversation_id, message)
 
     except Exception as e:
         logger.error(
@@ -81,7 +89,11 @@ async def handle_new_ticket(
             exc_info=True,
         )
         try:
-            await intercom_client.assign_to_admin(conversation_id)
+            message = "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
+            if is_ticket:
+                await intercom_client.send_ticket_reply(conversation_id, message)
+            else:
+                await intercom_client.send_conversations_reply(conversation_id, message)
         except Exception:
             logger.error("Failed to escalate ticket %s after error", conversation_id)
 
