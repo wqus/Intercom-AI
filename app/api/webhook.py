@@ -64,10 +64,13 @@ def has_conversation_attachments(payload: dict) -> bool:
 
 def has_ticket_attachments(payload: dict) -> bool:
     try:
+        logger.info(f"FULL PAYLOAD: {json.dumps(payload, indent=2, default=str)}")
+
         item = payload["data"]["item"]
         ticket_part = item.get("ticket_part", {})
         return bool(ticket_part.get("attachments"))
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error: {e}")
         return False
 
 
