@@ -65,19 +65,8 @@ def has_conversation_attachments(payload: dict) -> bool:
 def has_ticket_attachments(payload: dict) -> bool:
     try:
         item = payload["data"]["item"]
-
         ticket_part = item.get("ticket_part", {})
-        if ticket_part.get("attachments"):
-            return True
-
-        ticket = item.get("ticket", {})
-        parts = ticket.get("ticket_parts", {}).get("ticket_parts", [])
-        for part in parts:
-            if part.get("attachments"):
-                return True
-
-        return False
-
+        return bool(ticket_part.get("attachments"))
     except Exception:
         return False
 
@@ -223,7 +212,8 @@ async def intercom_webhook(
                 logger.info("Ticket %s contains attachments. Escalating immediately.", item_id)
                 intercom_client = IntercomClient()
                 try:
-                    await intercom_client.assign_ticket_to_admin(item_id)
+                    message = "Ваше сообщение принято. Мы обработаем его в ближайшее время и свяжемся с вами."
+                    await intercom_client.send_ticket_reply(item_id, message)
                 finally:
                     await intercom_client.close()
                 return {"status": "escalated", "reason": "attachments"}
@@ -281,7 +271,8 @@ async def intercom_webhook(
         intercom_client = IntercomClient()
 
         try:
-            await intercom_client.assign_to_admin(item_id)
+            message = "Ваше сообщение принято. Мы обработаем его в ближайшее время и свяжемся с вами."
+            await intercom_client.send_conversations_reply(item_id, message)
         finally:
             await intercom_client.close()
 
