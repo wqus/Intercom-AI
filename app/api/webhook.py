@@ -65,15 +65,28 @@ def has_conversation_attachments(payload: dict) -> bool:
 
 def has_ticket_attachments(payload: dict) -> bool:
     try:
-        logger.info(f"FULL PAYLOAD: {json.dumps(payload, indent=2, default=str)}")
-
         item = payload["data"]["item"]
+
         ticket_part = item.get("ticket_part", {})
-        return bool(ticket_part.get("attachments"))
+        if ticket_part.get("attachments"):
+            return True
+
+        ticket = item.get("ticket", {})
+        parts = ticket.get("ticket_parts", {}).get("ticket_parts", [])
+
+        for part in reversed(parts):
+            author_type = part.get("author", {}).get("type")
+
+            if author_type == "user":
+                if part.get("attachments"):
+                    return True
+                return False
+
+        return False
+
     except Exception as e:
         logger.error(f"Error: {e}")
         return False
-
 
 def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
     try:
