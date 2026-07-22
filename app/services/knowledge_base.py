@@ -261,7 +261,7 @@ class KnowledgeBase:
                 mode=MatchMode.TEMPLATE,
                 score=top_score,
                 category=top_entry["category"],
-                template_answer=top_entry["template_answer"],
+                template_answer=top_entry["template_answer"] + OPERATOR_HINT,
                 kb_id=top_entry["id"],
                 relevant_entries=[top_entry],
             )
@@ -276,7 +276,7 @@ class KnowledgeBase:
             mode=MatchMode.LLM,
             score=top_score,
             category=top_entry["category"],
-            template_answer=top_entry["template_answer"] + OPERATOR_HINT,
+            template_answer=None,
             kb_id=top_entry["id"],
             relevant_entries=relevant_entries,
         )
