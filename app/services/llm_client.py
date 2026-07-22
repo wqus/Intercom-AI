@@ -2,7 +2,7 @@ import json
 import logging
 
 from dataclasses import dataclass
-
+from app.services.knowledge_base import OPERATOR_HINT
 from openai import AsyncOpenAI
 
 
@@ -36,7 +36,6 @@ class YandexLLMClient:
             api_key=api_key,
             base_url="https://ai.api.cloud.yandex.net/v1",
             default_headers={
-                # folder_id передаётся через project согласно документации
                 "OpenAI-Project": folder_id,
             }
         )
@@ -71,7 +70,7 @@ class YandexLLMClient:
 
             return LLMResult(
                 can_answer=can_answer,
-                answer=data.get("answer") if can_answer else None,
+                answer=(data.get("answer") + OPERATOR_HINT if can_answer else None),
                 reason=data.get("reason") if not can_answer else None,
             )
 

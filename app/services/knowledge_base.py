@@ -45,6 +45,12 @@ STOP_WORDS = {
     "подскажите",
 }
 
+OPERATOR_HINT = (
+    "\n\n---\n"
+    "Если этот ответ не помог решить ваш вопрос, просто напишите «оператор». "
+    "Мы повторно рассмотрим ваше обращение и ответим вам в этом чате."
+)
+
 
 class MatchMode(str, Enum):
     NO_MATCH = "no_match"
@@ -205,6 +211,17 @@ class KnowledgeBase:
                 kb_id=None,
                 relevant_entries=[],
             )
+        question_norm = normalize(question)
+
+        if "оператор" in question_norm:
+            return MatchResult(
+                mode=MatchMode.NO_MATCH,
+                score=100,
+                category=None,
+                template_answer=None,
+                kb_id=None,
+                relevant_entries=[],
+            )
 
         scored = self.get_scored_entries(question)
 
@@ -259,7 +276,7 @@ class KnowledgeBase:
             mode=MatchMode.LLM,
             score=top_score,
             category=top_entry["category"],
-            template_answer=None,
+            template_answer=top_entry["template_answer"] + OPERATOR_HINT,
             kb_id=top_entry["id"],
             relevant_entries=relevant_entries,
         )
