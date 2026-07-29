@@ -11,8 +11,8 @@ from rapidfuzz import fuzz
 logger = logging.getLogger("knowledge_base")
 
 NO_MATCH_THRESHOLD = 30
-DIRECT_THRESHOLD = 95
-GAP_THRESHOLD = 30
+DIRECT_THRESHOLD = 90
+GAP_THRESHOLD = 25
 TOP_N = 5
 
 STOP_WORDS = {

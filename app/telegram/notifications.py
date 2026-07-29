@@ -35,11 +35,11 @@ async def notify_operator(
     if updated_at:
         try:
             dt = datetime.fromtimestamp(int(updated_at))
-            lines.append(f"<b>Обновлено:</b> {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"<b>Время последнего сообщения:</b> {dt.strftime('%Y-%m-%d %H:%M:%S')}")
         except:
-            lines.append(f"<b>Обновлено:</b> {updated_at}")
+            lines.append(f"<b>Время последнего сообщения:</b> {updated_at}")
     else:
-        lines.append(f"<b>Обновлено:</b> —")
+        lines.append(f"<b>Время последнего сообщения:</b> —")
 
     lines.append("")
     lines.append(f"<b>Текст обращения:</b>")
