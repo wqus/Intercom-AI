@@ -56,17 +56,22 @@ def has_conversation_attachments(payload: dict) -> tuple[bool, str | None]:
         if result:
             _, question = result
 
-        if item.get("source", {}).get("attachments"):
+        # Проверяем вложения в source
+        source_attachments = item.get("source", {}).get("attachments")
+        if source_attachments and len(source_attachments) > 0:
             return True, question
 
+        # Проверяем вложения в conversation_parts
         parts = item.get("conversation_parts", {}).get("conversation_parts", [])
         for part in parts:
-            if part.get("attachments"):
+            attachments = part.get("attachments")
+            if attachments and len(attachments) > 0:
                 return True, question
 
         return False, question
 
-    except Exception:
+    except Exception as e:
+        logger.error("Error checking conversation attachments: %s", e)
         return False, None
 
 
@@ -79,10 +84,13 @@ def has_ticket_attachments(payload: dict) -> tuple[bool, str | None]:
         if result:
             _, question = result
 
+        # Проверяем вложения в ticket_part
         ticket_part = item.get("ticket_part", {})
-        if ticket_part.get("attachments"):
+        attachments = ticket_part.get("attachments")
+        if attachments and len(attachments) > 0:
             return True, question
 
+        # Проверяем вложения в ticket_parts
         ticket = item.get("ticket", {})
         parts = ticket.get("ticket_parts", {}).get("ticket_parts", [])
 
@@ -90,7 +98,8 @@ def has_ticket_attachments(payload: dict) -> tuple[bool, str | None]:
             if part.get("author", {}).get("type") != "user":
                 continue
 
-            if part.get("attachments"):
+            attachments = part.get("attachments")
+            if attachments and len(attachments) > 0:
                 return True, question
 
             return False, question
@@ -328,17 +337,22 @@ async def intercom_webhook(
         )
         return {"status": "skipped", "reason": "linked_to_ticket"}
 
-    if has_conversation_attachments(payload):
-        logger.info(
-            "Item %s contains attachments. Escalating immediately.",
-            item_id,
-        )
+    has_attachments, question = has_conversation_attachments(payload)
+
+    if has_attachments:
+        logger.info("Item %s contains attachments. Escalating immediately.", item_id)
 
         intercom_client = IntercomClient()
 
         try:
-            message = "Ваше сообщение принято. Мы обработаем его в ближайшее время и свяжемся с вами."
-            await intercom_client.send_conversations_reply(item_id, message)
+            # Эскалируем оператору
+            await escalate_to_operator(
+                conversation_id=item_id,
+                question=question or "Не удалось извлечь текст обращения",
+                reason="Обращение содержит вложения",
+                is_ticket=False,
+                intercom_client=intercom_client,
+            )
         finally:
             await intercom_client.close()
 
