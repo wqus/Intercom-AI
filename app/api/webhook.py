@@ -18,6 +18,7 @@ from app.services.knowledge_base import KnowledgeBase
 from app.services.llm_client import YandexLLMClient
 from app.services.ticket_handler import handle_new_ticket
 from app.database.session import SessionLocal
+from app.models.request import EscalationReason
 
 logger = logging.getLogger("webhook")
 
@@ -361,9 +362,12 @@ async def intercom_webhook(
                 await escalate_to_operator(
                     conversation_id=item_id,
                     question=question or "Не удалось извлечь текст обращения",
-                    reason="Обращение содержит вложения",
+                    reason=EscalationReason.ATTACHMENTS.value,
                     is_ticket=True,
                     intercom_client=intercom_client,
+                    user_name=user_name,
+                    user_email=user_email,
+                    updated_at=updated_at,
                 )
             finally:
                 await intercom_client.close()
@@ -432,9 +436,12 @@ async def intercom_webhook(
             await escalate_to_operator(
                 conversation_id=item_id,
                 question=question or "Не удалось извлечь текст обращения",
-                reason="Обращение содержит вложения",
+                reason=EscalationReason.ATTACHMENTS.value,
                 is_ticket=False,
                 intercom_client=intercom_client,
+                user_name=user_name,
+                user_email=user_email,
+                updated_at=updated_at,
             )
         finally:
             await intercom_client.close()

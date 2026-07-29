@@ -96,7 +96,7 @@ async def handle_new_ticket(
             await escalate_to_operator(
                 conversation_id=conversation_id,
                 question=question,
-                reason=EscalationReason.USER_REQUESTED_OPERATOR,
+                reason=EscalationReason.USER_REQUESTED_OPERATOR.value,
                 is_ticket=is_ticket,
                 intercom_client=intercom_client,
                 user_name=user_name,
@@ -122,7 +122,7 @@ async def handle_new_ticket(
             await escalate_to_operator(
                 conversation_id=conversation_id,
                 question=question,
-                reason=EscalationReason.NO_CATEGORY,
+                reason=EscalationReason.NO_CATEGORY.value,
                 is_ticket=is_ticket,
                 intercom_client=intercom_client,
                 user_name=user_name,
@@ -193,7 +193,7 @@ async def handle_new_ticket(
         await escalate_to_operator(
             conversation_id=conversation_id,
             question=question,
-            reason=EscalationReason.LLM_CANNOT_ANSWER,
+            reason=EscalationReason.LLM_CANNOT_ANSWER.value,
             is_ticket=is_ticket,
             intercom_client=intercom_client,
             user_name=user_name,
@@ -220,7 +220,7 @@ async def handle_new_ticket(
             await escalate_to_operator(
                 conversation_id=conversation_id,
                 question=question,
-                reason=EscalationReason.INTERNAL_ERROR,
+                reason=EscalationReason.INTERNAL_ERROR.value,
                 is_ticket=is_ticket,
                 intercom_client=intercom_client,
                 user_name=user_name,
