@@ -24,7 +24,11 @@ async def handle_new_ticket(
     session: AsyncSession,
     is_ticket: bool = False,
     intercom_client: IntercomClient | None = None,
+    user_name: str = "",
+    user_email: str = "",
+    updated_at: str = ""
 ) -> None:
+
     if intercom_client is None:
         intercom_client = IntercomClient()
 
@@ -95,6 +99,9 @@ async def handle_new_ticket(
                 reason=EscalationReason.USER_REQUESTED_OPERATOR,
                 is_ticket=is_ticket,
                 intercom_client=intercom_client,
+                user_name=user_name,
+                user_email=user_email,
+                updated_at=updated_at
             )
 
             await repository.create(
@@ -118,6 +125,9 @@ async def handle_new_ticket(
                 reason=EscalationReason.NO_CATEGORY,
                 is_ticket=is_ticket,
                 intercom_client=intercom_client,
+                user_name=user_name,
+                user_email=user_email,
+                updated_at=updated_at
             )
 
             await repository.create(
@@ -186,6 +196,9 @@ async def handle_new_ticket(
             reason=EscalationReason.LLM_CANNOT_ANSWER,
             is_ticket=is_ticket,
             intercom_client=intercom_client,
+            user_name=user_name,
+            user_email=user_email,
+            updated_at=updated_at
         )
 
         await repository.create(
@@ -210,6 +223,9 @@ async def handle_new_ticket(
                 reason=EscalationReason.INTERNAL_ERROR,
                 is_ticket=is_ticket,
                 intercom_client=intercom_client,
+                user_name=user_name,
+                user_email=user_email,
+                updated_at=updated_at,
             )
 
             await repository.create(

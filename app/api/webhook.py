@@ -270,6 +270,9 @@ async def process_ticket(
     llm_client: YandexLLMClient,
     knowledge_base: KnowledgeBase,
     is_ticket: bool = False,
+    user_name: str = "",
+    user_email: str = "",
+    updated_at: str = ""
 ):
     async with SessionLocal() as session:
         await handle_new_ticket(
@@ -279,6 +282,9 @@ async def process_ticket(
             knowledge_base=knowledge_base,
             session=session,
             is_ticket=is_ticket,
+            user_name=user_name,
+            user_email=user_email,
+            updated_at=updated_at,
         )
 
 
@@ -392,6 +398,9 @@ async def intercom_webhook(
                 llm_client=llm_client,
                 knowledge_base=knowledge_base,
                 is_ticket=True,
+                user_name=user_name,
+                user_email=user_email,
+                updated_at=updated_at
             )
         )
 
@@ -459,6 +468,9 @@ async def intercom_webhook(
             question=question,
             llm_client=llm_client,
             knowledge_base=knowledge_base,
+            user_name=user_name,
+            user_email=user_email,
+            updated_at=updated_at
         )
     )
 
