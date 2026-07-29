@@ -9,8 +9,8 @@ from app.services.knowledge_base import KnowledgeBase
 from app.api.webhook import router as webhook_router
 from app.api.process import router as process_router
 from app.core.dependencies import init_llm_client, init_knowledge_base
-from database.base import Base
-from database.engine import engine
+from app.database.base import Base
+from app.database.engine import engine
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
