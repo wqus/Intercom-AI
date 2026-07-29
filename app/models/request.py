@@ -19,11 +19,11 @@ class RequestResult(str, Enum):
 
 
 class EscalationReason(str, Enum):
-    USER_REQUESTED_OPERATOR = "user_requested_operator"
-    NO_CATEGORY = "no_category"
-    ATTACHMENTS = "attachments"
-    LLM_CANNOT_ANSWER = "llm_cannot_answer"
-    INTERNAL_ERROR = "internal_error"
+    USER_REQUESTED_OPERATOR = "Пользователь запросил оператора"
+    NO_CATEGORY = "Не удалось определить категорию"
+    ATTACHMENTS = "Обращение содержит вложения"
+    LLM_CANNOT_ANSWER = "LLM не смогла ответить"
+    INTERNAL_ERROR = "Внутренняя ошибка"
 
 
 class Request(Base):

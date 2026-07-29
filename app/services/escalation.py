@@ -8,10 +8,11 @@ async def escalate_to_operator(
     reason: str,
     is_ticket: bool,
     intercom_client: IntercomClient,
+    user_name: str = "",
+    user_email: str = "",
+    updated_at: str = "",
 ):
-    message = (
-        "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
-    )
+    message = "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
 
     if is_ticket:
         await intercom_client.send_ticket_reply(conversation_id, message)
@@ -22,5 +23,8 @@ async def escalate_to_operator(
         conversation_id=conversation_id,
         reason=reason,
         text=question,
+        user_name=user_name,
+        user_email=user_email,
+        updated_at=updated_at,
         is_ticket=is_ticket,
     )

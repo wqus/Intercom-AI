@@ -4,6 +4,8 @@ import hmac
 import json
 import logging
 import re
+from typing import Optional, Tuple
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.params import Depends
 from httpx import Response
@@ -175,6 +177,71 @@ def extract_ticket_data(payload: dict) -> tuple[str, str] | None:
         logger.warning("Failed to extract ticket data: %s", e)
         return None
 
+def extract_user_and_message(payload: dict) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Извлекает из вебхука Intercom:
+      - updated_at (временная метка Unix)
+      - user_name (имя пользователя)
+      - user_email (email пользователя)
+      - last_message (текст последнего сообщения пользователя)
+    Возвращает кортеж (updated_at, user_name, user_email, last_message) или None.
+    Для ticket.created имя и email будут пустыми строками.
+    """
+    try:
+        data = payload.get("data", {})
+        item = data.get("item", {})
+        topic = payload.get("topic", "")
+
+        updated_at = str(item.get("updated_at", ""))
+
+        user_name = ""
+        user_email = ""
+        last_message = ""
+
+        # Conversation
+        if topic in ("conversation.user.created", "conversation.user.replied"):
+            source = item.get("source", {})
+            author = source.get("author", {})
+            user_name = author.get("name", "")
+            user_email = author.get("email", "")
+
+            parts = item.get("conversation_parts", {}).get("conversation_parts", [])
+            user_parts = [p for p in parts if p.get("author", {}).get("type") == "user"]
+            if user_parts:
+                last_part = user_parts[-1]
+                last_message = last_part.get("body", "")
+            else:
+                last_message = source.get("body", "")
+
+        #  Ticket created
+        elif topic == "ticket.created":
+            attrs = item.get("ticket_attributes", {})
+            last_message = attrs.get("_default_description_", "")
+
+        # Ticket contact replied
+        elif topic == "ticket.contact.replied":
+            ticket_part = item.get("ticket_part", {})
+            author = ticket_part.get("author", {})
+            user_name = author.get("name", "")
+            user_email = author.get("email", "")
+            last_message = ticket_part.get("body", "")
+
+        else:
+            return None
+
+        if last_message:
+            last_message = re.sub(r"<[^>]+>", "", last_message).strip()
+
+        if not last_message:
+            return None
+
+        return updated_at, user_name, user_email, last_message
+
+    except Exception as e:
+        logger.error("Failed to extract user and message: %s", e)
+        return None
+
+
 def get_item_id(payload: dict) -> str | None:
     try:
         data = payload.get("data", {})
@@ -213,6 +280,7 @@ async def process_ticket(
             session=session,
             is_ticket=is_ticket,
         )
+
 
 @router.api_route("/webhook/intercom", methods=["POST", "HEAD"], response_model=None)
 async def intercom_webhook(
@@ -265,6 +333,12 @@ async def intercom_webhook(
 
         if len(processed_events) > 2000:
             processed_events.clear()
+
+    user_info = extract_user_and_message(payload)
+    if user_info:
+        updated_at, user_name, user_email, _ = user_info
+    else:
+        updated_at = user_name = user_email = ""
 
     if topic in TICKET_TOPICS:
         has_attachments, question = has_ticket_attachments(payload)
