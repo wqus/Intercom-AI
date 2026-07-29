@@ -9,6 +9,8 @@ from app.services.knowledge_base import KnowledgeBase
 from app.api.webhook import router as webhook_router
 from app.api.process import router as process_router
 from app.core.dependencies import init_llm_client, init_knowledge_base
+from database.base import Base
+from database.engine import engine
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -22,6 +24,11 @@ logger = logging.getLogger("main")
 async def lifespan(app: FastAPI):
     logger.info("Starting up...")
     logger.info("DRY_RUN=%s", settings.DRY_RUN)
+
+    logger.info("Creating database tables...")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database tables created/verified")
 
     llm_client = YandexLLMClient(
         api_key=settings.YANDEX_API_KEY,

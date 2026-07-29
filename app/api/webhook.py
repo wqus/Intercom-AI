@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import re
 from fastapi import APIRouter, HTTPException, Request
@@ -215,6 +216,11 @@ async def intercom_webhook(
 
     body_bytes = await request.body()
     payload = await request.json()
+
+    logger.info("=" * 80)
+    logger.info("RAW WEBHOOK RECEIVED:")
+    logger.info(json.dumps(payload, indent=2, ensure_ascii=False))
+    logger.info("=" * 80)
 
     # Проверка подписи
     signature = request.headers.get("X-Hub-Signature", "")
