@@ -1,19 +1,20 @@
 import asyncio
 import hashlib
 import hmac
-import json
 import logging
 import re
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.params import Depends
 from httpx import Response
-from app.services.intercom_client import IntercomClient
 
+from app.services.intercom_client import IntercomClient
+from app.services.escalation import escalate_to_operator
 from app.core.config import settings
 from app.core.dependencies import get_llm_client, get_knowledge_base
 from app.services.knowledge_base import KnowledgeBase
 from app.services.llm_client import YandexLLMClient
 from app.services.ticket_handler import handle_new_ticket
+from app.database.session import SessionLocal
 
 logger = logging.getLogger("webhook")
 
@@ -45,48 +46,59 @@ def verify_intercom_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def has_conversation_attachments(payload: dict) -> bool:
+def has_conversation_attachments(payload: dict) -> tuple[bool, str | None]:
     try:
         item = payload["data"]["item"]
 
+        question = None
+        result = extract_conversation_data(payload)
+        if result:
+            _, question = result
+
         if item.get("source", {}).get("attachments"):
-            return True
+            return True, question
 
         parts = item.get("conversation_parts", {}).get("conversation_parts", [])
         for part in parts:
             if part.get("attachments"):
-                return True
+                return True, question
 
-        return False
+        return False, question
 
     except Exception:
-        return False
+        return False, None
 
 
-def has_ticket_attachments(payload: dict) -> bool:
+def has_ticket_attachments(payload: dict) -> tuple[bool, str | None]:
     try:
         item = payload["data"]["item"]
 
+        question = None
+        result = extract_ticket_data(payload)
+        if result:
+            _, question = result
+
         ticket_part = item.get("ticket_part", {})
         if ticket_part.get("attachments"):
-            return True
+            return True, question
 
         ticket = item.get("ticket", {})
         parts = ticket.get("ticket_parts", {}).get("ticket_parts", [])
 
         for part in reversed(parts):
-            author_type = part.get("author", {}).get("type")
+            if part.get("author", {}).get("type") != "user":
+                continue
 
-            if author_type == "user":
-                if part.get("attachments"):
-                    return True
-                return False
+            if part.get("attachments"):
+                return True, question
 
-        return False
+            return False, question
+
+        return False, question
 
     except Exception as e:
-        logger.error(f"Error: {e}")
-        return False
+        logger.error("Error checking ticket attachments: %s", e)
+        return False, None
 
 def extract_conversation_data(payload: dict) -> tuple[str, str] | None:
     try:
@@ -175,6 +187,23 @@ def get_item_id(payload: dict) -> str | None:
         logger.warning("Failed to get item_id: %s", e)
         return None
 
+async def process_ticket(
+    conversation_id: str,
+    question: str,
+    llm_client: YandexLLMClient,
+    knowledge_base: KnowledgeBase,
+    is_ticket: bool = False,
+):
+    async with SessionLocal() as session:
+        await handle_new_ticket(
+            conversation_id=conversation_id,
+            question=question,
+            llm_client=llm_client,
+            knowledge_base=knowledge_base,
+            session=session,
+            is_ticket=is_ticket,
+        )
+
 @router.api_route("/webhook/intercom", methods=["POST", "HEAD"], response_model=None)
 async def intercom_webhook(
         request: Request,
@@ -223,19 +252,33 @@ async def intercom_webhook(
             processed_events.clear()
 
     if topic in TICKET_TOPICS:
-        result = None
-        if topic in TICKET_TOPICS:
-            if has_ticket_attachments(payload):
-                logger.info("Ticket %s contains attachments. Escalating immediately.", item_id)
-                intercom_client = IntercomClient()
-                try:
-                    message = "Ваше сообщение принято. Мы обработаем его в ближайшее время и свяжемся с вами."
-                    await intercom_client.send_ticket_reply(item_id, message)
-                finally:
-                    await intercom_client.close()
-                return {"status": "escalated", "reason": "attachments"}
+        has_attachments, question = has_ticket_attachments(payload)
 
-            result = extract_ticket_data(payload)
+        if has_attachments:
+            logger.info(
+                "Ticket %s contains attachments. Escalating immediately.",
+                item_id,
+            )
+
+            intercom_client = IntercomClient()
+
+            try:
+                await escalate_to_operator(
+                    conversation_id=item_id,
+                    question=question or "Не удалось извлечь текст обращения",
+                    reason="Обращение содержит вложения",
+                    is_ticket=True,
+                    intercom_client=intercom_client,
+                )
+            finally:
+                await intercom_client.close()
+
+            return {
+                "status": "escalated",
+                "reason": "attachments",
+            }
+
+        result = extract_ticket_data(payload)
 
         if not result:
             logger.warning("Could not extract ticket data")
@@ -254,7 +297,7 @@ async def intercom_webhook(
         )
 
         asyncio.create_task(
-            handle_new_ticket(
+            process_ticket(
                 conversation_id=ticket_id,
                 question=question,
                 llm_client=llm_client,
@@ -317,7 +360,7 @@ async def intercom_webhook(
     )
 
     asyncio.create_task(
-        handle_new_ticket(
+        process_ticket(
             conversation_id=conversation_id,
             question=question,
             llm_client=llm_client,

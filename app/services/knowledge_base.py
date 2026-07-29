@@ -56,6 +56,7 @@ class MatchMode(str, Enum):
     NO_MATCH = "no_match"
     TEMPLATE = "template"
     LLM = "llm"
+    OPERATOR = "operator"
 
 
 @dataclass(slots=True)
@@ -215,7 +216,7 @@ class KnowledgeBase:
 
         if "оператор" in question_norm:
             return MatchResult(
-                mode=MatchMode.NO_MATCH,
+                mode=MatchMode.OPERATOR,
                 score=100,
                 category=None,
                 template_answer=None,

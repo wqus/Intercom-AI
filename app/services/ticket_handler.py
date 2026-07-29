@@ -1,27 +1,50 @@
 import logging
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.request import (
+    EscalationReason,
+    RequestResult,
+    RequestType,
+)
+from app.repositories.request_repository import RequestRepository
+from app.services.escalation import escalate_to_operator
+from app.services.intercom_client import IntercomClient
 from app.services.knowledge_base import KnowledgeBase, MatchMode
 from app.services.llm_client import YandexLLMClient
-from app.services.intercom_client import IntercomClient
 
 logger = logging.getLogger("ticket_handler")
 
 
 async def handle_new_ticket(
-        conversation_id: str,
-        question: str,
-        llm_client: YandexLLMClient,
-        knowledge_base: KnowledgeBase,
-        is_ticket: bool = False,
-        intercom_client: IntercomClient | None = None,
+    conversation_id: str,
+    question: str,
+    llm_client: YandexLLMClient,
+    knowledge_base: KnowledgeBase,
+    session: AsyncSession,
+    is_ticket: bool = False,
+    intercom_client: IntercomClient | None = None,
 ) -> None:
     if intercom_client is None:
         intercom_client = IntercomClient()
 
-    logger.info("Processing ticket | id=%s | question=%s", conversation_id, question[:80])
+    repository = RequestRepository(session)
+
+    request_type = (
+        RequestType.TICKET
+        if is_ticket
+        else RequestType.CONVERSATION
+    )
+
+    logger.info(
+        "Processing request | id=%s | question=%s",
+        conversation_id,
+        question[:80],
+    )
 
     try:
-        # Fuzzy match
+        #Fuzzy match
+
         match = knowledge_base.match(question)
 
         logger.info(
@@ -31,26 +54,86 @@ async def handle_new_ticket(
             match.category,
         )
 
+        #TEMPLATE
+
         if match.mode == MatchMode.TEMPLATE:
-            logger.info("Sending template answer for category: %s", match.category)
+            logger.info(
+                "Sending template answer | category=%s",
+                match.category,
+            )
+
             if is_ticket:
-                await intercom_client.send_ticket_reply(conversation_id, match.template_answer)
+                await intercom_client.send_ticket_reply(
+                    conversation_id,
+                    match.template_answer,
+                )
             else:
-                await intercom_client.send_conversations_reply(conversation_id, match.template_answer)
+                await intercom_client.send_conversations_reply(
+                    conversation_id,
+                    match.template_answer,
+                )
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.TEMPLATE,
+                category=match.category,
+                question=question,
+                answer=match.template_answer,
+            )
+
             return
+
+        #USER REQUESTED OPERATOR
+
+        if match.mode == MatchMode.OPERATOR:
+            logger.info("User requested an operator")
+
+            await escalate_to_operator(
+                conversation_id=conversation_id,
+                question=question,
+                reason=EscalationReason.USER_REQUESTED_OPERATOR,
+                is_ticket=is_ticket,
+                intercom_client=intercom_client,
+            )
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.ESCALATED,
+                escalation_reason=EscalationReason.USER_REQUESTED_OPERATOR,
+                question=question,
+            )
+
+            return
+
+        #NO MATCH
 
         if match.mode == MatchMode.NO_MATCH or not match.relevant_entries:
-            logger.info("No KB match — sending human attention message")
-            message = "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
-            if is_ticket:
-                await intercom_client.send_ticket_reply(conversation_id, message)
-            else:
-                await intercom_client.send_conversations_reply(conversation_id, message)
+            logger.info("No KB match")
+
+            await escalate_to_operator(
+                conversation_id=conversation_id,
+                question=question,
+                reason=EscalationReason.NO_CATEGORY,
+                is_ticket=is_ticket,
+                intercom_client=intercom_client,
+            )
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.ESCALATED,
+                escalation_reason=EscalationReason.NO_CATEGORY,
+                question=question,
+            )
+
             return
 
-        # классификация
+        #LLM
+
         logger.info(
-            "Sending to LLM | relevant_entries=%d | hint=%s",
+            "Sending to LLM | relevant_entries=%d | category=%s",
             len(match.relevant_entries),
             match.category,
         )
@@ -65,37 +148,83 @@ async def handle_new_ticket(
             llm_result.can_answer,
         )
 
+        #LLM ANSWER
+
         if llm_result.can_answer and llm_result.answer:
             if is_ticket:
-                await intercom_client.send_ticket_reply(conversation_id, llm_result.answer)
+                await intercom_client.send_ticket_reply(
+                    conversation_id,
+                    llm_result.answer,
+                )
             else:
-                await intercom_client.send_conversations_reply(conversation_id, llm_result.answer)
-        else:
-            logger.info(
-                "LLM cannot answer | reason=%s — sending human attention message",
-                llm_result.reason,
+                await intercom_client.send_conversations_reply(
+                    conversation_id,
+                    llm_result.answer,
+                )
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.LLM,
+                category=match.category,
+                question=question,
+                answer=llm_result.answer,
             )
-            message = "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
-            if is_ticket:
-                await intercom_client.send_ticket_reply(conversation_id, message)
-            else:
-                await intercom_client.send_conversations_reply(conversation_id, message)
+
+            return
+
+        #LLM CANNOT ANSWER
+
+        logger.info(
+            "LLM cannot answer | reason=%s",
+            llm_result.reason,
+        )
+
+        await escalate_to_operator(
+            conversation_id=conversation_id,
+            question=question,
+            reason=EscalationReason.LLM_CANNOT_ANSWER,
+            is_ticket=is_ticket,
+            intercom_client=intercom_client,
+        )
+
+        await repository.create(
+            conversation_id=conversation_id,
+            request_type=request_type,
+            result=RequestResult.ESCALATED,
+            escalation_reason=EscalationReason.LLM_CANNOT_ANSWER,
+            category=match.category,
+            question=question,
+        )
 
     except Exception as e:
-        logger.error(
-            "Unexpected error processing ticket %s: %s — escalating",
+        logger.exception(
+            "Unexpected error while processing request %s",
             conversation_id,
-            e,
-            exc_info=True,
         )
+
         try:
-            message = "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
-            if is_ticket:
-                await intercom_client.send_ticket_reply(conversation_id, message)
-            else:
-                await intercom_client.send_conversations_reply(conversation_id, message)
+            await escalate_to_operator(
+                conversation_id=conversation_id,
+                question=question,
+                reason=EscalationReason.INTERNAL_ERROR,
+                is_ticket=is_ticket,
+                intercom_client=intercom_client,
+            )
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.ESCALATED,
+                escalation_reason=EscalationReason.INTERNAL_ERROR,
+                question=question,
+            )
+
         except Exception:
-            logger.error("Failed to escalate ticket %s after error", conversation_id)
+            logger.exception(
+                "Failed to escalate request %s",
+                conversation_id,
+            )
 
     finally:
         await intercom_client.close()

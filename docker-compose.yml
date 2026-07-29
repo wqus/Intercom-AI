@@ -1,31 +1,54 @@
+version: "3.9"
+
 services:
+  postgres:
+    image: postgres:17
+    container_name: intercom_postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5435:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - intercom-network
+
   intercom-api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: intercom_api
-
-    ports:
-      - "8000:8000"
-
+    restart: unless-stopped
     env_file:
       - .env
-
-    restart: unless-stopped
-
+    ports:
+      - "8000:8000"
     volumes:
-      # если data должна сохраняться между перезапусками
       - ./data:/app/data
-
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-
     networks:
       - intercom-network
+
+volumes:
+  postgres_data:
 
 networks:
   intercom-network:

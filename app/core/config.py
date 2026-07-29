@@ -14,6 +14,13 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = "INFO"
 
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_GROUP_ID: str = ""
+
+    POSTGRES_DB: str = ""
+    POSTGRES_USER: str = ""
+    POSTGRES_PASSWORD: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

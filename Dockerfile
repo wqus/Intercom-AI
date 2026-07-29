@@ -1,8 +1,6 @@
-# ==========================================================
-# Multistage build — итоговый образ без build-зависимостей
-# ==========================================================
+#Multistage build
 
-# --- Stage 1: зависимости ---
+#Stage 1: зависимости
 FROM python:3.12-slim AS builder
 
 WORKDIR /app
@@ -18,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 
-# --- Stage 2: финальный образ ---
+#Stage 2: финальный образ
 FROM python:3.12-slim AS runtime
 
 WORKDIR /app
