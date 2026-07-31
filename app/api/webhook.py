@@ -19,6 +19,9 @@ from app.services.llm_client import YandexLLMClient
 from app.services.ticket_handler import handle_new_ticket
 from app.database.session import SessionLocal
 from app.models.request import EscalationReason
+from app.database.session import SessionLocal
+from app.repositories.request_repository import RequestRepository
+from app.models.request import RequestType, RequestResult, EscalationReason
 
 logger = logging.getLogger("webhook")
 
@@ -356,6 +359,16 @@ async def intercom_webhook(
                 item_id,
             )
 
+            async with SessionLocal() as session:
+                repo = RequestRepository(session)
+                await repo.create(
+                    conversation_id=item_id,
+                    request_type=RequestType.CONVERSATION,
+                    result=RequestResult.ESCALATED,
+                    question=question or "Не удалось извлечь текст обращения",
+                    escalation_reason=EscalationReason.ATTACHMENTS,
+                )
+
             intercom_client = IntercomClient()
 
             try:
@@ -428,6 +441,16 @@ async def intercom_webhook(
 
     if has_attachments:
         logger.info("Item %s contains attachments. Escalating immediately.", item_id)
+
+        async with SessionLocal() as session:
+            repo = RequestRepository(session)
+            await repo.create(
+                conversation_id=item_id,
+                request_type=RequestType.TICKET,
+                result=RequestResult.ESCALATED,
+                question=question or "Не удалось извлечь текст обращения",
+                escalation_reason=EscalationReason.ATTACHMENTS,
+            )
 
         intercom_client = IntercomClient()
 
