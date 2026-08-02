@@ -254,7 +254,6 @@ class KnowledgeBase:
 
         if (
                 top_score >= DIRECT_THRESHOLD
-                and gap >= GAP_THRESHOLD
         ):
             if top_entry.get("requires_clarification"):
                 return MatchResult(
