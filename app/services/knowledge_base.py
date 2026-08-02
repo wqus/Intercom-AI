@@ -10,7 +10,7 @@ from rapidfuzz import fuzz
 
 logger = logging.getLogger("knowledge_base")
 
-NO_MATCH_THRESHOLD = 30
+NO_MATCH_THRESHOLD = 20
 DIRECT_THRESHOLD = 90
 GAP_THRESHOLD = 25
 TOP_N = 5
@@ -57,22 +57,17 @@ class MatchMode(str, Enum):
     TEMPLATE = "template"
     LLM = "llm"
     OPERATOR = "operator"
-
+    CLARIFICATION = "clarification"
 
 @dataclass(slots=True)
 class MatchResult:
     mode: MatchMode
-
     score: float
-
     category: str | None
-
     template_answer: str | None
-
     kb_id: str | None
-
     relevant_entries: list[dict]
-
+    entry: dict | None = None
 
 def normalize(text: str) -> str:
     text = text.lower()
@@ -174,6 +169,9 @@ class KnowledgeBase:
             len(self.entries),
         )
 
+    def get_by_id(self, kb_id: str) -> dict | None:
+        return next((e for e in self.entries if e["id"] == kb_id), None)
+
     def get_scored_entries(
             self,
             question: str,
@@ -258,6 +256,17 @@ class KnowledgeBase:
                 top_score >= DIRECT_THRESHOLD
                 and gap >= GAP_THRESHOLD
         ):
+            if top_entry.get("requires_clarification"):
+                return MatchResult(
+                    mode=MatchMode.CLARIFICATION,
+                    score=top_score,
+                    category=top_entry["category"],
+                    template_answer=top_entry.get("clarification_question"),
+                    kb_id=top_entry["id"],
+                    relevant_entries=[top_entry],
+                    entry=top_entry,
+                )
+
             return MatchResult(
                 mode=MatchMode.TEMPLATE,
                 score=top_score,
@@ -265,6 +274,7 @@ class KnowledgeBase:
                 template_answer=top_entry["template_answer"] + OPERATOR_HINT,
                 kb_id=top_entry["id"],
                 relevant_entries=[top_entry],
+                entry=top_entry,  # NEW
             )
 
         relevant_entries = [

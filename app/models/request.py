@@ -16,15 +16,17 @@ class RequestResult(str, Enum):
     TEMPLATE = "template"
     LLM = "llm"
     ESCALATED = "escalated"
+    IGNORED = "ignored"
 
 
 class EscalationReason(str, Enum):
-    USER_REQUESTED_OPERATOR = "Пользователь запросил оператора"
-    NO_CATEGORY = "Не удалось определить категорию"
-    ATTACHMENTS = "Обращение содержит вложения"
-    LLM_CANNOT_ANSWER = "LLM не смогла ответить"
-    INTERNAL_ERROR = "Внутренняя ошибка"
-
+    USER_REQUESTED_OPERATOR = "user_requested_operator"
+    NO_CATEGORY = "no_category"
+    LLM_CANNOT_ANSWER = "llm_cannot_answer"
+    INTERNAL_ERROR = "internal_error"
+    WANTS_NEW_SCHOOL = "wants_new_school"
+    ATTACHMENTS = "attachments"
+    LLM_NOISE = "llm_noise"
 
 class Request(Base):
     __tablename__ = "requests"

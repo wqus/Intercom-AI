@@ -12,6 +12,9 @@ from app.services.escalation import escalate_to_operator
 from app.services.intercom_client import IntercomClient
 from app.services.knowledge_base import KnowledgeBase, MatchMode
 from app.services.llm_client import YandexLLMClient
+from app.services.clarification_handler import handle_clarification_response
+from app.repositories.pending_clarification_repo import save_pending_clarification
+from app.services.message_filter import is_non_query_message
 
 logger = logging.getLogger("ticket_handler")
 
@@ -47,6 +50,34 @@ async def handle_new_ticket(
     )
 
     try:
+        # === ШАГ 0: проверка pending clarification ===
+        was_clarification = await handle_clarification_response(
+            session=session,
+            conversation_id=conversation_id,
+            answer=question,
+            knowledge_base=knowledge_base,
+            intercom_client=intercom_client,
+            is_ticket=is_ticket,
+            repository=repository,
+            request_type=request_type,
+            user_name=user_name,
+            user_email=user_email,
+            updated_at=updated_at,
+        )
+        if was_clarification:
+            return
+
+        # === ШАГ 0.5: фильтр не-запросов ===
+        if is_non_query_message(question):
+            logger.info(
+                "Non-query message, ignoring | id=%s | text=%s",
+                conversation_id, question[:60]
+            )
+            await repository.create(conversation_id=conversation_id, request_type = request_type,
+                                    result=RequestResult.IGNORED, category=None,
+                                    question=question,answer=None)
+            return
+
         #Fuzzy match
 
         match = knowledge_base.match(question)
@@ -57,7 +88,41 @@ async def handle_new_ticket(
             match.score,
             match.category,
         )
+        #CLARIFICATION NEEDED
 
+        if match.mode == MatchMode.CLARIFICATION:
+            logger.info(
+                "Category requires clarification | category=%s",
+                match.category,
+            )
+
+            if is_ticket:
+                await intercom_client.send_ticket_reply(
+                    conversation_id,
+                    match.template_answer,
+                )
+            else:
+                await intercom_client.send_conversations_reply(
+                    conversation_id,
+                    match.template_answer,
+                )
+
+            await save_pending_clarification(
+                session=session,
+                conversation_id=conversation_id,
+                category_id=match.kb_id,
+            )
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.TEMPLATE,
+                category=match.category,
+                question=question,
+                answer=match.template_answer,
+            )
+
+            return
         #TEMPLATE
 
         if match.mode == MatchMode.TEMPLATE:
@@ -87,7 +152,6 @@ async def handle_new_ticket(
             )
 
             return
-
         #USER REQUESTED OPERATOR
 
         if match.mode == MatchMode.OPERATOR:
@@ -154,9 +218,24 @@ async def handle_new_ticket(
         )
 
         logger.info(
-            "LLM result | can_answer=%s",
+            "LLM result | is_noise=%s | can_answer=%s",
+            llm_result.is_noise,
             llm_result.can_answer,
         )
+
+        if llm_result.is_noise:
+            logger.info("LLM classified as noise | id=%s", conversation_id)
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.IGNORED,
+                category=match.category,
+                question=question,
+                answer=None,
+            )
+
+            return
 
         #LLM ANSWER
 

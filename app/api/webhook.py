@@ -18,8 +18,6 @@ from app.services.knowledge_base import KnowledgeBase
 from app.services.llm_client import YandexLLMClient
 from app.services.ticket_handler import handle_new_ticket
 from app.database.session import SessionLocal
-from app.models.request import EscalationReason
-from app.database.session import SessionLocal
 from app.repositories.request_repository import RequestRepository
 from app.models.request import RequestType, RequestResult, EscalationReason
 
