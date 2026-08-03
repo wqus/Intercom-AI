@@ -26,7 +26,6 @@ class EscalationReason(str, Enum):
     INTERNAL_ERROR = "internal_error"
     WANTS_NEW_SCHOOL = "wants_new_school"
     ATTACHMENTS = "attachments"
-    LLM_NOISE = "llm_noise"
 
 class Request(Base):
     __tablename__ = "requests"
