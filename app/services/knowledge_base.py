@@ -157,10 +157,16 @@ class KnowledgeBase:
             data = json.load(f)
 
         for entry in data:
-
             if entry["id"] == "default":
                 self.default_answer = entry["template_answer"]
                 continue
+
+            if "description" not in entry:
+                logger.warning(
+                    "Entry %s (%s) has no description field",
+                    entry.get("id"),
+                    entry.get("category"),
+                )
 
             self.entries.append(entry)
 
