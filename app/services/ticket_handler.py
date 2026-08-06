@@ -8,12 +8,12 @@ from app.models.request import (
     RequestType,
 )
 from app.repositories.request_repository import RequestRepository
+from app.repositories.pending_clarification_repo import save_pending_clarification
 from app.services.escalation import escalate_to_operator
 from app.services.intercom_client import IntercomClient
 from app.services.knowledge_base import KnowledgeBase, MatchMode
 from app.services.llm_client import YandexLLMClient
 from app.services.clarification_handler import handle_clarification_response
-from app.repositories.pending_clarification_repo import save_pending_clarification
 from app.services.message_filter import is_non_query_message
 
 logger = logging.getLogger("ticket_handler")
@@ -73,9 +73,16 @@ async def handle_new_ticket(
                 "Non-query message, ignoring | id=%s | text=%s",
                 conversation_id, question[:60]
             )
-            await repository.create(conversation_id=conversation_id, request_type = request_type,
-                                    result=RequestResult.IGNORED, category=None,
-                                    question=question,answer=None)
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.IGNORED,
+                category=None,
+                question=question,
+                answer=None,
+            )
+
             return
 
         #Fuzzy match
@@ -88,7 +95,8 @@ async def handle_new_ticket(
             match.score,
             match.category,
         )
-        #CLARIFICATION NEEDED
+
+        #CLARIFICATION NEEDED (fuzzy match путь)
 
         if match.mode == MatchMode.CLARIFICATION:
             logger.info(
@@ -123,6 +131,7 @@ async def handle_new_ticket(
             )
 
             return
+
         #TEMPLATE
 
         if match.mode == MatchMode.TEMPLATE:
@@ -152,6 +161,7 @@ async def handle_new_ticket(
             )
 
             return
+
         #USER REQUESTED OPERATOR
 
         if match.mode == MatchMode.OPERATOR:
@@ -218,10 +228,13 @@ async def handle_new_ticket(
         )
 
         logger.info(
-            "LLM result | is_noise=%s | can_answer=%s",
+            "LLM result | is_noise=%s | can_answer=%s | needs_clarification=%s",
             llm_result.is_noise,
             llm_result.can_answer,
+            llm_result.needs_clarification,
         )
+
+        #LLM NOISE
 
         if llm_result.is_noise:
             logger.info("LLM classified as noise | id=%s", conversation_id)
@@ -233,6 +246,70 @@ async def handle_new_ticket(
                 category=match.category,
                 question=question,
                 answer=None,
+            )
+
+            return
+
+        #LLM CLARIFICATION (новый путь через LLM)
+
+        if llm_result.needs_clarification and llm_result.clarification_kb_id:
+            category = knowledge_base.get_by_id(llm_result.clarification_kb_id)
+
+            if category and category.get("clarification_question"):
+                logger.info(
+                    "LLM triggered clarification | kb_id=%s",
+                    llm_result.clarification_kb_id,
+                )
+
+                if is_ticket:
+                    await intercom_client.send_ticket_reply(
+                        conversation_id, category["clarification_question"]
+                    )
+                else:
+                    await intercom_client.send_conversations_reply(
+                        conversation_id, category["clarification_question"]
+                    )
+
+                await save_pending_clarification(
+                    session=session,
+                    conversation_id=conversation_id,
+                    category_id=llm_result.clarification_kb_id,
+                )
+
+                await repository.create(
+                    conversation_id=conversation_id,
+                    request_type=request_type,
+                    result=RequestResult.TEMPLATE,
+                    category=category["category"],
+                    question=question,
+                    answer=category["clarification_question"],
+                )
+
+                return
+
+            logger.warning(
+                "LLM requested clarification for unknown/invalid kb_id=%s — falling back to escalation",
+                llm_result.clarification_kb_id,
+            )
+            # если kb_id некорректный — не теряем тикет, эскалируем как обычно
+            await escalate_to_operator(
+                conversation_id=conversation_id,
+                question=question,
+                reason=EscalationReason.LLM_CANNOT_ANSWER.value,
+                is_ticket=is_ticket,
+                intercom_client=intercom_client,
+                user_name=user_name,
+                user_email=user_email,
+                updated_at=updated_at
+            )
+
+            await repository.create(
+                conversation_id=conversation_id,
+                request_type=request_type,
+                result=RequestResult.ESCALATED,
+                escalation_reason=EscalationReason.LLM_CANNOT_ANSWER,
+                category=match.category,
+                question=question,
             )
 
             return

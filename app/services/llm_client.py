@@ -15,11 +15,15 @@ class LLMResult:
     answer: str | None
     reason: str | None
     is_noise: bool = False
+    needs_clarification: bool = False  # NEW
+    clarification_kb_id: str | None = None  # NEW
 
 
 def build_user_message(question: str, relevant_entries: list[dict]) -> str:
     entries_text = "\n\n".join(
-        f"[{entry['category']}]\n{entry['template_answer']}"
+        f"[id={entry['id']}] [{entry['category']}]\n"
+        f"requires_clarification={entry.get('requires_clarification', False)}\n"
+        f"{entry.get('clarification_question') or entry['template_answer']}"
         for entry in relevant_entries
     )
     return (
@@ -55,7 +59,10 @@ class YandexLLMClient:
             )
 
             try:
-                text = response.output[0].content[0].text
+                message_item = next(
+                    item for item in response.output if item.type == "message"
+                )
+                text = message_item.content[0].text
                 data = json.loads(text)
             except Exception:
                 logger.error("Bad LLM structure: %s", response)
@@ -63,21 +70,34 @@ class YandexLLMClient:
 
             is_noise = data.get("is_noise", False)
             can_answer = data.get("can_answer", False)
+            needs_clarification = data.get("needs_clarification", False)
+            clarification_kb_id = data.get("clarification_kb_id")
 
             logger.info(
-                "LLM response | is_noise=%s | can_answer=%s | reason=%s",
+                "LLM response | is_noise=%s | can_answer=%s | needs_clarification=%s | reason=%s",
                 is_noise,
                 can_answer,
+                needs_clarification,
                 data.get("reason"),
             )
 
-            # === НОВОЕ: если это шум — не трогаем answer/reason по обычной логике ===
             if is_noise:
                 return LLMResult(
                     can_answer=False,
                     answer=None,
                     reason=None,
                     is_noise=True,
+                )
+
+            # === НОВОЕ: LLM определила что нужен clarification-сценарий ===
+            if needs_clarification and clarification_kb_id:
+                return LLMResult(
+                    can_answer=False,
+                    answer=None,
+                    reason=None,
+                    is_noise=False,
+                    needs_clarification=True,
+                    clarification_kb_id=clarification_kb_id,
                 )
 
             return LLMResult(

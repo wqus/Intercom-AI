@@ -11,8 +11,8 @@ from rapidfuzz import fuzz
 logger = logging.getLogger("knowledge_base")
 
 NO_MATCH_THRESHOLD = 20
-DIRECT_THRESHOLD = 90
-GAP_THRESHOLD = 25
+DIRECT_THRESHOLD = 95
+GAP_THRESHOLD = 30
 TOP_N = 5
 
 STOP_WORDS = {
@@ -260,6 +260,7 @@ class KnowledgeBase:
 
         if (
                 top_score >= DIRECT_THRESHOLD
+                and gap >= GAP_THRESHOLD
         ):
             if top_entry.get("requires_clarification"):
                 return MatchResult(
@@ -279,7 +280,7 @@ class KnowledgeBase:
                 template_answer=top_entry["template_answer"] + OPERATOR_HINT,
                 kb_id=top_entry["id"],
                 relevant_entries=[top_entry],
-                entry=top_entry,  # NEW
+                entry=top_entry,
             )
 
         relevant_entries = [
