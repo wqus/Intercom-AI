@@ -12,7 +12,7 @@ logger = logging.getLogger("knowledge_base")
 
 NO_MATCH_THRESHOLD = 20
 DIRECT_THRESHOLD = 95
-GAP_THRESHOLD = 30
+GAP_THRESHOLD = 35
 TOP_N = 5
 
 STOP_WORDS = {
@@ -289,13 +289,19 @@ class KnowledgeBase:
             if score >= NO_MATCH_THRESHOLD
         ]
 
+        cleaned_entries = []
+        for entry in relevant_entries:
+            clean_entry = entry.copy()
+            clean_entry.pop("match_phrases", None)
+            cleaned_entries.append(clean_entry)
+
         return MatchResult(
             mode=MatchMode.LLM,
             score=top_score,
             category=top_entry["category"],
             template_answer=None,
             kb_id=top_entry["id"],
-            relevant_entries=relevant_entries,
+            relevant_entries=cleaned_entries,
         )
 
     def get_relevant_entries(
