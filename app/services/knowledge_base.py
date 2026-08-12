@@ -1,48 +1,26 @@
 import json
 import logging
 import re
-
+import numpy as np
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import List, Tuple, Optional
 
-from rapidfuzz import fuzz
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger("knowledge_base")
 
-NO_MATCH_THRESHOLD = 20
-DIRECT_THRESHOLD = 95
-GAP_THRESHOLD = 35
-TOP_N = 5
+# Параметры для эмбеддингов
+SIMILARITY_THRESHOLD = 0.4  # Минимальное сходство для "совпадения"
+TOP_N = 3  # Сколько категорий отправлять в LLM
 
+# Стоп-слова для шума
 STOP_WORDS = {
-    "не",
-    "могу",
-    "как",
-    "хочу",
-    "что",
-    "это",
-    "мне",
-    "у",
-    "меня",
-    "мой",
-    "моя",
-    "моё",
-    "можно",
-    "нужно",
-    "надо",
-    "есть",
-    "был",
-    "была",
-    "буду",
-    "вы",
-    "я",
-    "он",
-    "она",
-    "пожалуйста",
-    "помогите",
-    "скажите",
-    "подскажите",
+    "не", "могу", "как", "хочу", "что", "это", "мне", "у", "меня",
+    "мой", "моя", "моё", "можно", "нужно", "надо", "есть", "был",
+    "была", "буду", "вы", "я", "он", "она", "пожалуйста", "помогите",
+    "скажите", "подскажите",
 }
 
 OPERATOR_HINT = (
@@ -59,101 +37,59 @@ class MatchMode(str, Enum):
     OPERATOR = "operator"
     CLARIFICATION = "clarification"
 
+
 @dataclass(slots=True)
 class MatchResult:
     mode: MatchMode
-    score: float
+    score: float  # Для эмбеддингов это similarity (0-1)
     category: str | None
     template_answer: str | None
     kb_id: str | None
     relevant_entries: list[dict]
     entry: dict | None = None
 
+
 def normalize(text: str) -> str:
+    """Нормализация текста для поиска оператора и шума"""
     text = text.lower()
-
     text = re.sub(r"[^\w\s]", " ", text)
-
-    words = [
-        word
-        for word in text.split()
-        if word not in STOP_WORDS and len(word) > 1
-    ]
-
+    words = [word for word in text.split() if word not in STOP_WORDS and len(word) > 1]
     return " ".join(words).strip()
 
 
-def calculate_phrase_score(
-        question_norm: str,
-        phrase_norm: str,
-) -> float:
-    return max(
-        fuzz.token_set_ratio(question_norm, phrase_norm),
-        fuzz.partial_ratio(question_norm, phrase_norm),
-    )
-
-
-def best_score(
-        question_norm: str,
-        phrases: list[str],
-) -> float:
-    if not phrases:
-        return 0.0
-
-    best = 0.0
-
-    for phrase in phrases:
-
-        phrase_norm = normalize(phrase)
-
-        if not phrase_norm:
-            continue
-
-        score = calculate_phrase_score(
-            question_norm,
-            phrase_norm,
-        )
-
-        if score > best:
-            best = score
-
-    return best
-
-
 class KnowledgeBase:
-
     def __init__(
             self,
             path: str = "data/knowledge_base.json",
+            model_name: str = "intfloat/multilingual-e5-small",
+            # ИЛИ для русского: "alphaedge-ai/Qwen3-Embedding-rus-16384"
+            device: str = "cpu",  # или "cuda" если есть GPU
     ) -> None:
-
         self.entries: list[dict] = []
-
+        self.embeddings: list[np.ndarray] = []  # Векторы для каждой категории
         self.default_answer = (
-            "Добрый день!\n"
-            "Уточните, пожалуйста, подробнее ваш вопрос."
+            "Добрый день!\nУточните, пожалуйста, подробнее ваш вопрос."
         )
 
+        # Загружаем модель эмбеддингов
+        logger.info(f"Loading embedding model: {model_name}")
+        self.model = SentenceTransformer(model_name, device=device)
+
+        # Загружаем базу знаний и создаем эмбеддинги
         self._load(path)
+        self._build_embeddings()
 
-    def _load(
-            self,
-            path: str,
-    ) -> None:
+        logger.info(f"Knowledge base loaded: {len(self.entries)} entries with embeddings")
 
+    def _load(self, path: str) -> None:
+        """Загружает JSON с базой знаний"""
         kb_path = Path(path)
 
         if not kb_path.exists():
-            logger.error(
-                "Knowledge base not found: %s",
-                path,
-            )
+            logger.error(f"Knowledge base not found: {path}")
             return
 
-        with open(
-                kb_path,
-                encoding="utf-8",
-        ) as f:
+        with open(kb_path, encoding="utf-8") as f:
             data = json.load(f)
 
         for entry in data:
@@ -163,50 +99,62 @@ class KnowledgeBase:
 
             if "description" not in entry:
                 logger.warning(
-                    "Entry %s (%s) has no description field",
-                    entry.get("id"),
-                    entry.get("category"),
+                    f"Entry {entry.get('id')} ({entry.get('category')}) has no description field"
                 )
 
             self.entries.append(entry)
 
-        logger.info(
-            "Knowledge base loaded: %s entries",
-            len(self.entries),
-        )
-
-    def get_by_id(self, kb_id: str) -> dict | None:
-        return next((e for e in self.entries if e["id"] == kb_id), None)
-
-    def get_scored_entries(
-            self,
-            question: str,
-    ) -> list[tuple[float, dict]]:
-
-        question_norm = normalize(question)
-
-        scored = []
+    def _build_embeddings(self) -> None:
+        """Создает эмбеддинги для всех категорий на основе description"""
+        self.embeddings = []
 
         for entry in self.entries:
-            score = best_score(
-                question_norm,
-                entry.get("match_phrases", []),
+            # Берем category + description как текст для эмбеддинга
+            text = f"{entry['category']} {entry['description']}"
+
+            # Генерируем вектор
+            embedding = self.model.encode(text, normalize_embeddings=True)
+            self.embeddings.append(embedding)
+
+            # Сохраняем эмбеддинг в entry для кэширования
+            entry['_embedding'] = embedding
+
+        # Преобразуем список в матрицу для быстрых вычислений
+        if self.embeddings:
+            self.embeddings_matrix = np.vstack(self.embeddings)
+        else:
+            self.embeddings_matrix = np.array([])
+
+    def get_by_id(self, kb_id: str) -> dict | None:
+        """Возвращает категорию по ID"""
+        return next((e for e in self.entries if e["id"] == kb_id), None)
+
+    def cosine_similarity(self, query_embedding: np.ndarray) -> np.ndarray:
+        """Вычисляет косинусное сходство между запросом и всеми категориями"""
+        if self.embeddings_matrix.size == 0:
+            return np.array([])
+
+        # query_embedding уже нормализован (normalize_embeddings=True)
+        # embeddings_matrix тоже нормализован
+        similarities = np.dot(self.embeddings_matrix, query_embedding)
+        return similarities
+
+    def match(self, question: str) -> MatchResult:
+        """Главный метод для поиска категории по вопросу"""
+
+        # 1. Проверка на оператора
+        question_norm = normalize(question)
+        if "оператор" in question_norm:
+            return MatchResult(
+                mode=MatchMode.OPERATOR,
+                score=1.0,
+                category=None,
+                template_answer=None,
+                kb_id=None,
+                relevant_entries=[],
             )
 
-            scored.append((score, entry))
-
-        scored.sort(
-            key=lambda item: item[0],
-            reverse=True,
-        )
-
-        return scored
-
-    def match(
-            self,
-            question: str,
-    ) -> MatchResult:
-
+        # 2. Если нет категорий — NO_MATCH
         if not self.entries:
             return MatchResult(
                 mode=MatchMode.NO_MATCH,
@@ -216,39 +164,34 @@ class KnowledgeBase:
                 kb_id=None,
                 relevant_entries=[],
             )
-        question_norm = normalize(question)
 
-        if "оператор" in question_norm:
-            return MatchResult(
-                mode=MatchMode.OPERATOR,
-                score=100,
-                category=None,
-                template_answer=None,
-                kb_id=None,
-                relevant_entries=[],
-            )
+        # 3. Генерируем эмбеддинг для вопроса
+        query_embedding = self.model.encode(question, normalize_embeddings=True)
 
-        scored = self.get_scored_entries(question)
+        # 4. Вычисляем сходство со всеми категориями
+        similarities = self.cosine_similarity(query_embedding)
+
+        # 5. Сортируем по убыванию сходства
+        scored = sorted(
+            [
+                (similarities[i], self.entries[i])
+                for i in range(len(self.entries))
+            ],
+            key=lambda x: x[0],
+            reverse=True,
+        )
 
         top_score, top_entry = scored[0]
 
-        top2_score = (
-            scored[1][0]
-            if len(scored) > 1
-            else 0.0
-        )
-
-        gap = top_score - top2_score
-
+        # 6. Логируем результат
+        top2_score = scored[1][0] if len(scored) > 1 else 0.0
         logger.info(
-            "KB match | top1=%.1f | top2=%.1f | gap=%.1f | category=%s",
-            top_score,
-            top2_score,
-            gap,
-            top_entry.get("category"),
+            f"KB match (embeddings) | top1={top_score:.3f} | top2={top2_score:.3f} | "
+            f"category={top_entry.get('category')}"
         )
 
-        if top_score < NO_MATCH_THRESHOLD:
+        # 7. Если сходство ниже порога — NO_MATCH
+        if top_score < SIMILARITY_THRESHOLD:
             return MatchResult(
                 mode=MatchMode.NO_MATCH,
                 score=top_score,
@@ -258,21 +201,21 @@ class KnowledgeBase:
                 relevant_entries=[],
             )
 
-        if (
-                top_score >= DIRECT_THRESHOLD
-                and gap >= GAP_THRESHOLD
-        ):
-            if top_entry.get("requires_clarification"):
-                return MatchResult(
-                    mode=MatchMode.CLARIFICATION,
-                    score=top_score,
-                    category=top_entry["category"],
-                    template_answer=top_entry.get("clarification_question"),
-                    kb_id=top_entry["id"],
-                    relevant_entries=[top_entry],
-                    entry=top_entry,
-                )
+        # 8. Проверка на уточнение (clarification)
+        if top_entry.get("requires_clarification"):
+            return MatchResult(
+                mode=MatchMode.CLARIFICATION,
+                score=top_score,
+                category=top_entry["category"],
+                template_answer=top_entry.get("clarification_question"),
+                kb_id=top_entry["id"],
+                relevant_entries=[top_entry],
+                entry=top_entry,
+            )
 
+        # 9. Если сходство очень высокое и отрыв большой — отдаем шаблон
+        # (только для очевидных случаев)
+        if top_score > 0.85 and (top_score - top2_score) > 0.3:
             return MatchResult(
                 mode=MatchMode.TEMPLATE,
                 score=top_score,
@@ -283,17 +226,16 @@ class KnowledgeBase:
                 entry=top_entry,
             )
 
-        relevant_entries = [
-            entry
-            for score, entry in scored[:TOP_N]
-            if score >= NO_MATCH_THRESHOLD
-        ]
-
-        cleaned_entries = []
-        for entry in relevant_entries:
-            clean_entry = entry.copy()
-            clean_entry.pop("match_phrases", None)
-            cleaned_entries.append(clean_entry)
+        # 10. Иначе — отправляем в LLM с ТОП-3 категориями
+        # ❗ ВАЖНО: УДАЛЯЕМ match_phrases перед отправкой!
+        relevant_entries = []
+        for score, entry in scored[:TOP_N]:
+            if score >= SIMILARITY_THRESHOLD:
+                # Создаем копию и удаляем match_phrases
+                clean_entry = entry.copy()
+                clean_entry.pop("match_phrases", None)
+                clean_entry.pop("_embedding", None)  # Удаляем служебное поле
+                relevant_entries.append(clean_entry)
 
         return MatchResult(
             mode=MatchMode.LLM,
@@ -301,19 +243,29 @@ class KnowledgeBase:
             category=top_entry["category"],
             template_answer=None,
             kb_id=top_entry["id"],
-            relevant_entries=cleaned_entries,
+            relevant_entries=relevant_entries,  # БЕЗ match_phrases!
         )
 
-    def get_relevant_entries(
-            self,
-            question: str,
-            top_n: int = TOP_N,
-    ) -> list[dict]:
+    def get_relevant_entries(self, question: str, top_n: int = TOP_N) -> list[dict]:
+        """Возвращает ТОП-N категорий по смыслу (без match_phrases)"""
+        query_embedding = self.model.encode(question, normalize_embeddings=True)
+        similarities = self.cosine_similarity(query_embedding)
 
-        scored = self.get_scored_entries(question)
+        scored = sorted(
+            [
+                (similarities[i], self.entries[i])
+                for i in range(len(self.entries))
+            ],
+            key=lambda x: x[0],
+            reverse=True,
+        )
 
-        return [
-            entry
-            for score, entry in scored[:top_n]
-            if score >= NO_MATCH_THRESHOLD
-        ]
+        result = []
+        for score, entry in scored[:top_n]:
+            if score >= SIMILARITY_THRESHOLD:
+                clean_entry = entry.copy()
+                clean_entry.pop("match_phrases", None)
+                clean_entry.pop("_embedding", None)
+                result.append(clean_entry)
+
+        return result
