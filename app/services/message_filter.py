@@ -68,7 +68,7 @@ def is_non_query_message(text: str) -> bool:
     word_count = len(cleaned.split())
     has_question_mark = "?" in text
 
-    if word_count <= 2 and not has_question_mark:
+    if word_count < 2 and not has_question_mark:
         if not any(
                 keyword in cleaned
                 for keyword in question_indicators

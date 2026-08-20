@@ -29,23 +29,23 @@ RERANK_TOP_K = 5
 
 # Fuzzy only short-circuits when the phrase is extremely close and there is
 # enough separation from the next category.
-FUZZY_EXACT_THRESHOLD = 98.0
-FUZZY_MARGIN_THRESHOLD = 8.0
+FUZZY_EXACT_THRESHOLD = 97.0
+FUZZY_MARGIN_THRESHOLD = 10.0
 
 # E5 cosine similarity is not probability. It is used as a retrieval gate.
-EMBEDDING_MIN_SCORE = 0.55
-LLM_MIN_EMBEDDING_SCORE = 0.58
+EMBEDDING_MIN_SCORE = 0.50
+LLM_MIN_EMBEDDING_SCORE = 0.53
 
 # CrossEncoder returns MS-MARCO logits. We convert them through sigmoid to a
 # 0..1 relevance-like score. This is NOT a calibrated probability; thresholds
 # should be tuned using your own labeled support questions.
-RERANK_AUTO_THRESHOLD = 0.78
-RERANK_LLM_THRESHOLD = 0.52
-RERANK_MARGIN_THRESHOLD = 0.08
+RERANK_AUTO_THRESHOLD = 0.74
+RERANK_LLM_THRESHOLD = 0.48
+RERANK_MARGIN_THRESHOLD = 0.06
 
 # Business evidence can move ranking, but never overwhelms semantic evidence.
-REQUIRED_PENALTY = 0.18
-NEGATIVE_PENALTY = 0.30
+REQUIRED_PENALTY = 0.15
+NEGATIVE_PENALTY = 0.25
 REQUIRED_BONUS = 0.05
 PRIORITY_TIE_WEIGHT = 0.015
 
@@ -771,7 +771,7 @@ class KnowledgeBase:
         if (
             top["rerank_score"] >= RERANK_LLM_THRESHOLD
             and top_embedding >= LLM_MIN_EMBEDDING_SCORE
-            and margin >= 0.02
+            and margin >= 0.01
         ):
             return MatchResult(
                 mode=MatchMode.LLM,
