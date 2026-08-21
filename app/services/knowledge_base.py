@@ -26,6 +26,7 @@ RERANKER_MODEL_NAME = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 # Retrieval is optimized for recall; CrossEncoder is optimized for precision.
 RETRIEVAL_TOP_K = 12
 RERANK_TOP_K = 5
+LLM_TOP_K = 3
 
 # Fuzzy only short-circuits when the phrase is extremely close and there is
 # enough separation from the next category.
@@ -504,16 +505,11 @@ class KnowledgeBase:
     def _build_reranker_text(entry: dict, best_phrase: str) -> str:
         category = str(entry.get("category") or "")
         scope = str(entry.get("scope") or entry.get("description") or "")
-        when_to_use = "; ".join(str(x) for x in entry.get("when_to_use", [])[:4])
-        when_not = "; ".join(str(x) for x in entry.get("when_not_to_use", [])[:4])
-        negatives = "; ".join(str(x) for x in entry.get("negative_phrases", [])[:6])
+
         return (
             f"Категория: {category}. "
-            f"Область: {scope}. "
-            f"Когда применять: {when_to_use}. "
-            f"Когда не применять: {when_not}. "
-            f"Лучший пример: {best_phrase}. "
-            f"Не путать с примерами: {negatives}."
+            f"Описание: {scope}. "
+            f"Пример запроса: {best_phrase}."
         )
 
     def _rerank_candidates(self, question: str, candidates: list[dict]) -> list[dict]:
@@ -605,7 +601,7 @@ class KnowledgeBase:
 
     def _build_relevant_entries(self, ranked: list[dict]) -> list[dict]:
         result: list[dict] = []
-        for item in ranked[:RERANK_TOP_K]:
+        for item in ranked[:LLM_TOP_K]:
             clean = self._clean_entry_for_llm(item["entry"])
             clean["_embedding_score"] = float(item["embedding_score"])
             clean["_rerank_score"] = float(item["rerank_score"])
