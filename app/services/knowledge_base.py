@@ -507,9 +507,8 @@ class KnowledgeBase:
         scope = str(entry.get("scope") or entry.get("description") or "")
 
         return (
-            f"Категория: {category}. "
-            f"Описание: {scope}. "
-            f"Пример запроса: {best_phrase}."
+            f"{scope}"
+            f"{best_phrase}"
         )
 
     def _rerank_candidates(self, question: str, candidates: list[dict]) -> list[dict]:
