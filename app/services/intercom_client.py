@@ -85,9 +85,10 @@ class IntercomClient:
             conversation_id: str,
             text: str,
             admin_id: Optional[str] = None,
+            escalate: bool = False,
     ) -> bool:
         if settings.DRY_RUN:
-            logger.info("[DRY RUN] reply conv=%s", conversation_id)
+            logger.info("[DRY RUN] reply conv=%s escalate=%s", conversation_id, escalate)
             return True
 
         admin_id = admin_id or settings.INTERCOM_ADMIN_ID
@@ -96,6 +97,19 @@ class IntercomClient:
             return False
 
         try:
+            # Помечаем тегом escalated, если нужно
+            if escalate:
+                tag_resp = await self._client.post(
+                    f"{INTERCOM_API_BASE}/conversations/{conversation_id}/tags",
+                    json={
+                        "id": "15975673",
+                        "admin_id": admin_id,
+                    },
+                )
+                tag_resp.raise_for_status()
+                logger.info("Tagged conversation %s as escalated", conversation_id)
+
+            # Отправляем ответ
             resp = await self._client.post(
                 f"{INTERCOM_API_BASE}/conversations/{conversation_id}/reply",
                 json={
@@ -121,9 +135,10 @@ class IntercomClient:
             ticket_id: str,
             text: str,
             admin_id: Optional[str] = None,
+            escalate: bool = False,
     ) -> bool:
         if settings.DRY_RUN:
-            logger.info("[DRY RUN] ticket reply id=%s", ticket_id)
+            logger.info("[DRY RUN] ticket reply id=%s escalate=%s", ticket_id, escalate)
             return True
 
         admin_id = admin_id or settings.INTERCOM_ADMIN_ID
@@ -132,6 +147,19 @@ class IntercomClient:
             return False
 
         try:
+            # Помечаем тегом escalated, если нужно
+            if escalate:
+                tag_resp = await self._client.post(
+                    f"{INTERCOM_API_BASE}/tickets/{ticket_id}/tags",
+                    json={
+                        "id": "15975673",
+                        "admin_id": admin_id,
+                    },
+                )
+                tag_resp.raise_for_status()
+                logger.info("Tagged ticket %s as escalated", ticket_id)
+
+            # Отправляем ответ
             resp = await self._client.post(
                 f"{INTERCOM_API_BASE}/tickets/{ticket_id}/reply",
                 json={

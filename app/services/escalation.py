@@ -15,9 +15,17 @@ async def escalate_to_operator(
     message = "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
 
     if is_ticket:
-        await intercom_client.send_ticket_reply(conversation_id, message)
+        await intercom_client.send_ticket_reply(
+            conversation_id,
+            message,
+            escalate=True
+        )
     else:
-        await intercom_client.send_conversations_reply(conversation_id, message)
+        await intercom_client.send_conversations_reply(
+            conversation_id,
+            message,
+            escalate=True
+        )
 
     await notify_operator(
         conversation_id=conversation_id,
