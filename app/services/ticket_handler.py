@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.request import (
-    EscalationReason,
-    RequestResult,
-    RequestType,
-)
+from app.models.request import EscalationReason, RequestResult, RequestType
 from app.repositories.pending_clarification_repo import save_pending_clarification
 from app.repositories.request_repository import RequestRepository
 from app.services.clarification_handler import handle_clarification_response
@@ -41,7 +36,6 @@ async def handle_new_ticket(
     updated_at: str = "",
 ) -> None:
     """Execute the KB -> template/clarification/LLM -> operator pipeline."""
-
     owns_intercom_client = intercom_client is None
     client = intercom_client or IntercomClient()
     repository = RequestRepository(session)
@@ -107,13 +101,11 @@ async def handle_new_ticket(
             await save_result(RequestResult.TEMPLATE, answer=knowledge_base.default_answer)
             return
 
-        # Direct operator request always wins, even over an existing clarification state.
         if contains_operator_request(question):
             await escalate(EscalationReason.USER_REQUESTED_OPERATOR)
             return
 
-        # If the user is answering a pending clarification, consume it before
-        # normal intent classification.
+        # Existing, intent-specific clarification state remains unchanged.
         if await handle_clarification_response(
             session=session,
             conversation_id=conversation_id,
@@ -135,6 +127,12 @@ async def handle_new_ticket(
             return
 
         matches = knowledge_base.match_many(question)
+        logger.info(
+            "KB match_many | id=%s | parts=%d | modes=%s",
+            conversation_id,
+            len(matches),
+            [m.mode.value for m in matches],
+        )
 
         if len(matches) == 1:
             await _execute_match(
@@ -195,13 +193,15 @@ async def _execute_match(
     escalate: Callable[..., Awaitable[None]],
 ) -> None:
     logger.info(
-        "KB decision | id=%s | mode=%s | kb_id=%s | score=%.4f | margin=%.4f | embedding=%.4f",
+        "KB decision | id=%s | mode=%s | kb_id=%s | score=%.4f | margin=%.4f | embedding=%.4f | reason=%s | subquestion=%s",
         conversation_id,
         match.mode.value,
         match.kb_id,
         match.score,
         match.margin,
         match.embedding_score,
+        match.decision_reason,
+        match.subquestion,
     )
 
     if match.mode == MatchMode.OPERATOR:
@@ -209,7 +209,6 @@ async def _execute_match(
             EscalationReason.USER_REQUESTED_OPERATOR,
             category=match.category,
             question_text=original_question,
-
         )
         return
 
@@ -217,7 +216,7 @@ async def _execute_match(
         await escalate(
             EscalationReason.NO_CATEGORY,
             category=match.category,
-            question_text=original_question,
+            question_text=match.subquestion or original_question,
         )
         return
 
@@ -241,7 +240,7 @@ async def _execute_match(
             RequestResult.TEMPLATE,
             category=match.category,
             answer=match.template_answer,
-            question_text=original_question,
+            question_text=match.subquestion or original_question,
         )
         return
 
@@ -259,7 +258,7 @@ async def _execute_match(
             RequestResult.TEMPLATE,
             category=match.category,
             answer=match.template_answer,
-            question_text=original_question,
+            question_text=match.subquestion or original_question,
         )
         return
 
@@ -298,21 +297,18 @@ async def _execute_llm(
     escalate: Callable[..., Awaitable[None]],
 ) -> None:
     candidates = match.relevant_entries
-    candidate_ids = {
-        str(entry.get("id"))
-        for entry in candidates
-        if entry.get("id")
-    }
+    candidate_ids = {str(entry.get("id")) for entry in candidates if entry.get("id")}
 
     if not candidate_ids:
         await escalate(EscalationReason.NO_CATEGORY, category=match.category, question_text=question)
         return
 
     logger.info(
-        "Calling constrained LLM | id=%s | candidates=%s | top=%s",
+        "Calling constrained LLM | id=%s | candidates=%s | top=%s | subquestion=%r",
         conversation_id,
         sorted(candidate_ids),
         match.kb_id,
+        question,
     )
 
     result = await llm_client.classify(
@@ -321,17 +317,11 @@ async def _execute_llm(
     )
 
     if result.is_noise:
-        await save_result(
-            RequestResult.IGNORED,
-            category=match.category,
-            question_text=question,
-        )
+        await save_result(RequestResult.IGNORED, category=match.category, question_text=question)
         return
 
     if result.needs_clarification:
         kb_id = str(result.clarification_kb_id or "")
-
-        # The LLM may only select a category already retrieved by our KB.
         if kb_id not in candidate_ids:
             logger.warning(
                 "LLM returned out-of-candidate clarification | kb_id=%s | candidates=%s",
@@ -399,8 +389,7 @@ async def _execute_multiple_matches(
     save_result: Callable[..., Awaitable[None]],
     escalate: Callable[..., Awaitable[None]],
 ) -> None:
-    """Answer multiple independent intents without silently dropping an unknown one."""
-
+    """Process independent subquestions independently, without reclassifying the whole message."""
     deterministic_answers: list[str] = []
     ambiguous: list[MatchResult] = []
     clarifications: list[MatchResult] = []
@@ -431,8 +420,8 @@ async def _execute_multiple_matches(
         )
         return
 
-    # A clarification changes the state of the conversation. Do not combine it
-    # with an ambiguous LLM conversation state.
+    # Keep the existing one-at-a-time clarification behavior. Multiple independent
+    # stateful clarifications in one message remain intentionally conservative.
     if clarifications:
         if len(clarifications) != 1 or ambiguous or no_matches:
             await escalate(
@@ -467,7 +456,8 @@ async def _execute_multiple_matches(
         )
         return
 
-    # Unknown part means we cannot honestly claim the whole message was answered.
+    # We deliberately keep current policy for genuinely unresolved fragments:
+    # no user rephrase flow yet, so escalate instead of pretending we answered all parts.
     if no_matches:
         await escalate(
             EscalationReason.NO_CATEGORY,
@@ -491,14 +481,16 @@ async def _execute_multiple_matches(
         await escalate(EscalationReason.NO_CATEGORY, question_text=original_question)
         return
 
-    # Resolve each ambiguous part independently with the constrained LLM.
     answers = list(deterministic_answers)
-
     for match in ambiguous:
         candidates = match.relevant_entries
         candidate_ids = {str(entry.get("id")) for entry in candidates if entry.get("id")}
         if not candidate_ids:
-            await escalate(EscalationReason.LLM_CANNOT_ANSWER, category=match.category, question_text=original_question)
+            await escalate(
+                EscalationReason.LLM_CANNOT_ANSWER,
+                category=match.category,
+                question_text=match.subquestion or original_question,
+            )
             return
 
         subquestion = match.subquestion or original_question
@@ -513,23 +505,39 @@ async def _execute_multiple_matches(
         if result.needs_clarification:
             kb_id = str(result.clarification_kb_id or "")
             if kb_id not in candidate_ids:
-                await escalate(EscalationReason.LLM_CANNOT_ANSWER, category=match.category, question_text=original_question)
+                await escalate(
+                    EscalationReason.LLM_CANNOT_ANSWER,
+                    category=match.category,
+                    question_text=subquestion,
+                )
                 return
 
             category = knowledge_base.get_by_id(kb_id)
             clarification = category.get("clarification_question") if category else None
             if not clarification:
-                await escalate(EscalationReason.LLM_CANNOT_ANSWER, category=match.category, question_text=original_question)
+                await escalate(
+                    EscalationReason.LLM_CANNOT_ANSWER,
+                    category=match.category,
+                    question_text=subquestion,
+                )
                 return
 
-            # More than one state transition in one message is deliberately conservative.
-            await escalate(EscalationReason.LLM_CANNOT_ANSWER, category=match.category, question_text=original_question)
+            # Existing clarification state is one-at-a-time by design.
+            await escalate(
+                EscalationReason.LLM_CANNOT_ANSWER,
+                category=match.category,
+                question_text=original_question,
+            )
             return
 
         if result.can_answer and result.answer:
             answers.append(result.answer)
         else:
-            await escalate(EscalationReason.LLM_CANNOT_ANSWER, category=match.category, question_text=original_question)
+            await escalate(
+                EscalationReason.LLM_CANNOT_ANSWER,
+                category=match.category,
+                question_text=subquestion,
+            )
             return
 
     if not answers:

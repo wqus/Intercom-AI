@@ -52,11 +52,16 @@ NEGATIVE_LEXICAL_PENALTY = 0.22
 CONFLICT_PENALTY = 0.16
 GENERIC_RERANK_WEIGHT = 0.10
 
-# Final acceptance is based on relative evidence, not generic model probability.
-AUTO_SCORE = 0.64
-LLM_SCORE = 0.45
-AUTO_MARGIN = 0.10
-LLM_MARGIN = 0.035
+# Decision thresholds are deliberately based on the composite ranking signal.
+# These are routing thresholds, NOT probabilities. The important companion
+# signal is the top-vs-second margin and the presence of lexical evidence.
+AUTO_SCORE = 0.82
+AUTO_MARGIN = 0.075
+LLM_SCORE = 0.56
+LLM_MARGIN = 0.020
+HIGH_SCORE_LOW_MARGIN = 0.88
+LEXICAL_EVIDENCE_MIN = 0.18
+SEMANTIC_GAP_FOR_LLM = 0.020
 
 # Hard rejection for unusable input.
 MIN_MEANINGFUL_CHARS = 3
@@ -73,7 +78,7 @@ OPERATOR_HINT = (
 
 # Words that MUST preserve meaning in support intents.
 STOP_WORDS = {
-    "это", "мне", "у", "меня", "мой", "моя", "мое", "моё",
+    "могу", "как", "что", "это", "мне", "у", "меня", "мой", "моя", "мое", "моё",
     "можно", "нужно", "надо", "есть", "был", "была", "буду", "вы", "я", "он", "она",
     "пожалуйста", "помогите", "скажите", "подскажите", "ли", "а", "и", "же", "бы", "быть",
     # Deliberately NOT removing: не, нет, нельзя, уже, только, без, еще/ещё.
@@ -164,6 +169,7 @@ class MatchResult:
     fuzzy_score: float = 0.0
     embedding_score: float = 0.0
     subquestion: str | None = None
+    decision_reason: str = ""
 
 
 # ============================================================
@@ -227,6 +233,7 @@ def _split_structural_questions(text: str) -> list[str]:
             continue
         for item in re.split(r"\s+(?=\d+[.)]\s+)", chunk):
             item = re.sub(r"^\s*\d+[.)]\s*", "", item).strip()
+            item = re.sub(r"^(?:и|а|также)\s+", "", item, flags=re.IGNORECASE)
             if item:
                 result.append(item)
     meaningful = [x for x in result if len(tokenize(x)) >= 2]
@@ -237,6 +244,7 @@ def _split_conjunctive_question(text: str) -> list[str]:
     q = text.strip()
     for pattern in (r"\s+а\s+также\s+", r"\s+и еще\s+", r"\s+и\s+"):
         parts = [p.strip(" ,") for p in re.split(pattern, q, maxsplit=1, flags=re.IGNORECASE)]
+        parts = [re.sub(r"^(?:и|а|также)\s+", "", p, flags=re.IGNORECASE) for p in parts]
         if len(parts) == 2 and all(len(tokenize(p)) >= 3 for p in parts):
             return parts
     return [q]
@@ -316,7 +324,7 @@ class KnowledgeBase:
 
     def __init__(
         self,
-        path: str = "data/knowledge_base.json",
+        path: str = "data/knowledge_base_v2.json",
         model_name: str = EMBEDDING_MODEL_NAME,
         reranker_model_name: str = RERANKER_MODEL_NAME,
         device: str = "cpu",
@@ -483,53 +491,141 @@ class KnowledgeBase:
     # --------------------------------------------------------
 
     def _hard_rule_match(self, question: str) -> str | None:
+        """Return a deterministic intent only when the wording contains a strong
+        business signal. Rules intentionally use token-prefix checks for Russian
+        inflection/order variation instead of requiring an exact phrase.
+        """
         q = normalize_light(question)
-        matches: list[str] = []
+        tokens = q.split()
+
+        def has_any(*prefixes: str) -> bool:
+            return any(token.startswith(prefix) for token in tokens for prefix in prefixes)
+
+        def has_phrase(*phrases: str) -> bool:
+            return any(normalize_light(p) in q for p in phrases)
+
+        def has_school() -> bool:
+            return any(token.startswith("школ") for token in tokens)
+
+        def has_flow() -> bool:
+            return any(token.startswith(("поток", "потоков")) for token in tokens)
+
+        # ----------------------------------------------------
+        # School lifecycle: the most important conflict group.
+        # ----------------------------------------------------
+        explicit_transfer = (
+            has_any("смен") and has_school()
+        ) or (
+            has_any("перейд", "перевод", "перевест") and has_school()
+        )
+        explicit_return = has_any("восстанов", "верн", "обратн") and (
+            has_school() or has_any("отчис", "исключ", "ушел", "ушла", "вышел", "вышла")
+        )
+        explicit_exclusion = has_any("исключ", "выгнал", "отчисл") and (
+            has_phrase("меня", "мне") or has_any("лиш")
+        )
+
+        # Voluntary exit must be checked before generic school/education retrieval.
+        # `отчислиться` is voluntary; `меня отчислили` is an already completed exclusion.
+        voluntary_exit = (
+            has_any("выйт", "уйт", "покин", "прекрат", "удалит", "убер") and has_school()
+        ) or has_phrase(
+            "отчислиться из школы",
+            "хочу отчислиться из школы",
+            "как отчислиться из школы",
+        )
+
+        if explicit_transfer:
+            return "kb_006"
+        if explicit_return:
+            return "kb_008"
+        if explicit_exclusion and not voluntary_exit:
+            return "kb_007"
+        if voluntary_exit and not explicit_transfer and not explicit_return:
+            return "kb_005"
+
+        # Exit from all schools is intentionally very specific.
+        if has_phrase("из всех школ", "из всех направлений", "из всего обучения", "отовсюду", "нигде не учиться"):
+            return "kb_024"
+
+        # ----------------------------------------------------
+        # Mentor family.
+        # ----------------------------------------------------
+        if has_any("стать") and has_any("настав", "ментор") and not has_phrase("мой наставник"):
+            return "kb_023"
+        if has_any("программ") and has_any("наставнич") and not has_any("мой настав", "ментор"):
+            return "kb_034"
+        if has_any("заявк") and has_any("настав", "ментор") and has_any("повтор", "снов", "отказ", "отклон"):
+            return "kb_025"
+        if has_any("настав", "ментор") and not has_phrase("стать наставником", "стать ментором"):
+            return "kb_009"
+
+        # ----------------------------------------------------
+        # Education entry / school registration / registration failure.
+        # ----------------------------------------------------
+        registration_failure = (
+            has_any("запис", "вступ", "попаст") and
+            (has_any("не", "нет") or has_phrase("ошибка при записи", "нет кнопки записи", "не пускает в школу"))
+        )
+        school_registration = has_school() and has_any("запис", "вступ", "попаст", "выбрат")
+        general_training = has_any("обуч", "учит", "учеб")
+        if registration_failure and school_registration:
+            return "kb_002"
+        if school_registration and not registration_failure:
+            return "kb_033"
+
+        # Explicit 'how to start/get into training' must not be stolen by kb_033.
+        if general_training and has_any("попаст", "начат", "старт", "попад", "участв") and not school_registration:
+            return "kb_035"
+
+        # ----------------------------------------------------
+        # Current / next stream boundaries.
+        # ----------------------------------------------------
+        already_started = (
+            (has_any("уже", "опоздал", "текущ") and has_any("начал", "идет", "старт", "поток", "школ"))
+            or has_phrase("школа уже началась", "уже идет поток", "уже стартовала школа")
+        )
+        if already_started:
+            return "kb_015"
+
+        asks_flow_date = (
+            has_flow() and
+            (has_any("когда", "дат", "старт", "запуск", "начн", "следующ", "нов") or any(ch.isdigit() for ch in q))
+        )
+        if asks_flow_date:
+            return "kb_016"
+
+        # ----------------------------------------------------
+        # Telegram / codes / QR.
+        # ----------------------------------------------------
+        if (has_any("инвайт") or has_phrase("код приглашения")) and not has_any("qr"):
+            return "kb_013"
+        if has_any("qr"):
+            return "kb_014"
+        if has_any("не добав", "добавь", "не включ") and has_any("чат", "групп", "телеграм", "тг"):
+            return "kb_021"
+        if has_any("ссылк") and has_any("чат", "телеграм", "тг", "групп"):
+            return "kb_004"
+
+        # Fall back to the explicitly curated rules only when exactly one rule fires.
+        matches: list[tuple[str, int, int]] = []
         for entry_id, positives, negatives in HARD_INTENT_RULES:
             if not any(normalize_light(p) in q for p in positives):
                 continue
             if any(normalize_light(n) in q for n in negatives):
                 continue
-            matches.append(entry_id)
+            best_trigger_len = max(
+                (len(normalize_light(p)) for p in positives if normalize_light(p) in q),
+                default=0,
+            )
+            priority = int(self.entries_by_id.get(entry_id, {}).get("priority", 0))
+            matches.append((entry_id, best_trigger_len, priority))
 
-        # Special boundaries for education intents.
-        failure = any(x in q for x in (
-            "не могу запис", "не получается запис", "не дает запис", "нет кнопки записи",
-            "ошибка при записи", "не пускает", "не работает запись",
-        ))
-        school_specific = any(x in q for x in ("в школу", "школу", "конкретную школу"))
-        global_training = any(x in q for x in (
-            "как попасть на обучение", "как начать обучение", "как начать учиться",
-            "как стать участником обучения", "хочу попасть на обучение", "хочу учиться", "хочу начать учиться",
-            "как попасть на поток", "как попасть на запуск", "с чего начать обучение",
-        )) and not any(x in q for x in ("не могу", "не получается", "ошибка", "не работает"))
+        if matches:
+            matches.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            if len(matches) == 1 or matches[0][1] > matches[1][1] + 4:
+                return matches[0][0]
 
-        if failure and school_specific:
-            return "kb_002"
-        if not failure and school_specific and any(x in q for x in ("как записаться", "как попасть", "где выбрать", "выбрать школу", "как вступить")):
-            return "kb_033"
-        # Robust phrase variants where users insert pronouns or context words.
-        if ("не добавили" in q or "добавьте меня" in q or "не включили" in q) and any(x in q for x in ("чат", "групп", "телеграм", "тг")):
-            return "kb_021"
-        if any(x in q for x in ("восстанов", "вернуться", "обратно")) and any(x in q for x in ("отчис", "исключ", "ушел", "ушла", "вышел", "вышла")):
-            return "kb_008"
-        if not failure and global_training and not school_specific:
-            return "kb_035"
-        if ("попасть" in q or "начать" in q) and "обучение" in q and not school_specific and not failure:
-            return "kb_035"
-
-        # Do not return a rule merely because a very generic phrase is present.
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            # Prefer the most specific (longest trigger) category.
-            scored = []
-            for entry_id in matches:
-                triggers = next((p for i, p, _ in HARD_INTENT_RULES if i == entry_id), ())
-                best = max((len(normalize_light(x)) for x in triggers if normalize_light(x) in q), default=0)
-                scored.append((best, self.entries_by_id[entry_id].get("priority", 0), entry_id))
-            scored.sort(reverse=True)
-            return scored[0][2]
         return None
 
     # --------------------------------------------------------
@@ -835,21 +931,76 @@ class KnowledgeBase:
         )
 
         entry = top["entry"]
+        has_lexical = bool(top["positive_hits"]) or float(top["bm25_score"]) >= LEXICAL_EVIDENCE_MIN
+        semantic_gap = (
+            float(top["semantic_score"]) - float(second["semantic_score"])
+            if second else float(top["semantic_score"])
+        )
+
         if entry.get("requires_clarification"):
-            return MatchResult(MatchMode.CLARIFICATION, top_score, entry.get("category"), entry.get("clarification_question"), entry.get("id"), relevant_entries, entry=entry, second_score=second_score, margin=margin, embedding_score=float(top["embedding_score"]), subquestion=question)
+            return MatchResult(
+                MatchMode.CLARIFICATION, top_score, entry.get("category"),
+                entry.get("clarification_question"), entry.get("id"),
+                relevant_entries, entry=entry, second_score=second_score,
+                margin=margin, embedding_score=float(top["embedding_score"]),
+                subquestion=question, decision_reason="kb_requires_clarification",
+            )
 
-        # If a direct lexical contradiction is present and the alternative is strong,
-        # do not auto-accept the top semantic result.
-        if top["negative_hits"]:
-            return MatchResult(MatchMode.LLM if margin >= 0.02 else MatchMode.NO_MATCH, top_score, entry.get("category") if margin >= 0.02 else None, None, entry.get("id") if margin >= 0.02 else None, relevant_entries, entry=entry if margin >= 0.02 else None, second_score=second_score, margin=margin, embedding_score=float(top["embedding_score"]), subquestion=question)
+        # A contradiction is strong evidence against automatic template routing.
+        # If the candidate is nevertheless plausible, let the constrained LLM inspect it.
+        if top["negative_hits"] or top["constraint_evidence"]["forbidden_hits"]:
+            if (
+                top_score >= LLM_SCORE
+                and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM)
+            ):
+                return MatchResult(
+                    MatchMode.LLM, top_score, entry.get("category"), None, entry.get("id"),
+                    relevant_entries, entry=entry, second_score=second_score, margin=margin,
+                    embedding_score=float(top["embedding_score"]), subquestion=question,
+                    decision_reason="contradiction_requires_llm",
+                )
+            return MatchResult(
+                MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
+                entry=None, second_score=second_score, margin=margin,
+                embedding_score=float(top["embedding_score"]), subquestion=question,
+                decision_reason="strong_contradiction",
+            )
 
+        # Very strong and well-separated candidate -> deterministic template.
+        # A strong score with weak separation is intentionally NOT auto-accepted.
         if top_score >= AUTO_SCORE and margin >= AUTO_MARGIN:
-            return MatchResult(MatchMode.TEMPLATE, top_score, entry.get("category"), (entry.get("template_answer") or "") + OPERATOR_HINT, entry.get("id"), relevant_entries, entry=entry, second_score=second_score, margin=margin, embedding_score=float(top["embedding_score"]), subquestion=question)
+            return MatchResult(
+                MatchMode.TEMPLATE, top_score, entry.get("category"),
+                (entry.get("template_answer") or "") + OPERATOR_HINT, entry.get("id"),
+                relevant_entries, entry=entry, second_score=second_score, margin=margin,
+                embedding_score=float(top["embedding_score"]), subquestion=question,
+                decision_reason="high_score_high_margin",
+            )
 
-        if top_score >= LLM_SCORE and margin >= LLM_MARGIN:
-            return MatchResult(MatchMode.LLM, top_score, entry.get("category"), None, entry.get("id"), relevant_entries, entry=entry, second_score=second_score, margin=margin, embedding_score=float(top["embedding_score"]), subquestion=question)
+        # Strong candidate but close second: send to LLM instead of dropping to NO_MATCH.
+        # This fixes cases such as final=1.00, margin=0.028 where the top result
+        # is clearly relevant but two intents are close.
+        llm_eligible = (
+            top_score >= LLM_SCORE
+            and (
+                margin >= LLM_MARGIN
+                or (top_score >= HIGH_SCORE_LOW_MARGIN and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM))
+            )
+        )
+        if llm_eligible:
+            return MatchResult(
+                MatchMode.LLM, top_score, entry.get("category"), None, entry.get("id"),
+                relevant_entries, entry=entry, second_score=second_score, margin=margin,
+                embedding_score=float(top["embedding_score"]), subquestion=question,
+                decision_reason="plausible_but_ambiguous",
+            )
 
-        return MatchResult(MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries, entry=None, second_score=second_score, margin=margin, embedding_score=float(top["embedding_score"]), subquestion=question)
+        # Weak candidate: current product policy still escalates NO_MATCH.
+        return MatchResult(
+            MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries, entry=None,
+            second_score=second_score, margin=margin, embedding_score=float(top["embedding_score"]),
+            subquestion=question, decision_reason="weak_or_unresolved",
+        )
 
     # --------------------------------------------------------
     # FUZZY / DEBUG
@@ -898,6 +1049,7 @@ class KnowledgeBase:
                 "second_score": decision.second_score,
                 "margin": decision.margin,
                 "embedding_score": decision.embedding_score,
+                "decision_reason": decision.decision_reason,
             },
             "hard_rule": self._hard_rule_match(question),
             "fuzzy": [
@@ -925,15 +1077,13 @@ class KnowledgeBase:
         }
 
     def match_many(self, question: str) -> list[MatchResult]:
+        """Classify each independent sub-question without collapsing the whole message.
+
+        A low-confidence fragment must remain visible to the caller; otherwise a
+        successful first fragment can silently hide a second unanswered question.
+        """
         question = (question or "").strip()
         parts = split_user_questions(question)
         if len(parts) <= 1:
             return [self.match(question)]
-        results = [self.match(part) for part in parts]
-        # If splitting produced a low-confidence fragment, classify the original
-        # message as one unit instead of hallucinating multiple intents.
-        if any(r.mode == MatchMode.NO_MATCH for r in results):
-            whole = self.match(question)
-            if whole.mode != MatchMode.NO_MATCH:
-                return [whole]
-        return results[:MAX_SUBQUESTIONS]
+        return [self.match(part) for part in parts[:MAX_SUBQUESTIONS]]
