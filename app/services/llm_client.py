@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -17,13 +18,14 @@ class LLMResult:
     can_answer: bool
     answer: str | None
     reason: str | None
+    selected_kb_id: str | None = None
     is_noise: bool = False
     needs_clarification: bool = False
     clarification_kb_id: str | None = None
 
 
 def _entry_for_llm(entry: dict[str, Any]) -> dict[str, Any]:
-    """Pass useful intent evidence to the LLM, not only the final template."""
+    """Expose the semantic/business evidence needed for a constrained decision."""
     allowed = (
         "id",
         "category",
@@ -42,12 +44,16 @@ def _entry_for_llm(entry: dict[str, Any]) -> dict[str, Any]:
         "requires_clarification",
         "clarification_question",
         "template_answer",
+        "hard_negative_examples",
     )
     result = {key: entry[key] for key in allowed if key in entry}
-    # Internal scoring fields are useful to the caller but should not dominate
-    # the semantic evidence shown to the LLM.
+
+    # Diagnostic signals are useful for the LLM to understand why the candidate
+    # was retrieved, but are explicitly secondary to semantic/business evidence.
     for key in (
         "_embedding_score",
+        "_semantic_top3",
+        "_semantic_prototype",
         "_semantic_score",
         "_bm25_score",
         "_rrf_score",
@@ -56,29 +62,41 @@ def _entry_for_llm(entry: dict[str, Any]) -> dict[str, Any]:
         "_best_match_phrase",
         "_positive_hits",
         "_negative_hits",
+        "_constraint_evidence",
     ):
         if key in entry:
             result[key] = entry[key]
+
     return result
 
 
-def build_user_message(question: str, relevant_entries: list[dict]) -> str:
+def build_user_message(question: str, relevant_entries: list[dict[str, Any]]) -> str:
     payload = {
-        "task": "Выберите правильный intent для вопроса клиента и, только если он достаточно однозначен, сформируйте ответ.",
-        "rules": [
-            "Разрешено выбирать ТОЛЬКО один из переданных candidate id.",
-            "Нельзя придумывать новый id или использовать категорию вне списка кандидатов.",
-            "Учитывайте definition/scope/when_to_use/when_not_to_use и negative_phrases сильнее поверхностного сходства слов.",
-            "Если два кандидата близки и нельзя надёжно выбрать один, верните needs_clarification=true и clarification_kb_id одного из кандидатов только если это действительно наиболее подходящий вариант.",
-            "Если ни один кандидат не соответствует вопросу, верните is_noise=false, can_answer=false, needs_clarification=false.",
-            "Если сообщение является мусором/набором бессмысленных символов, верните is_noise=true.",
-            "Ответ должен опираться только на информацию переданных кандидатов и не выдумывать правила бизнеса.",
+        "task": (
+            "Определи, какой из предложенных intent лучше всего соответствует "
+            "вопросу клиента. Если выбранный intent действительно позволяет ответить "
+            "по его базе знаний, сформируй краткий точный ответ."
+        ),
+        "decision_policy": [
+            "Выбирать разрешено только один id из candidates.",
+            "selected_kb_id обязателен при can_answer=true.",
+            "Нельзя придумывать новый id.",
+            "Оценивай намерение клиента, а не только совпадение отдельных слов.",
+            "Сначала учитывай definition/scope/when_to_use/when_not_to_use/constraints/negative_phrases.",
+            "positive_examples помогают понять формулировки, но сами по себе не доказывают intent.",
+            "Если несколько кандидатов остаются действительно неразличимыми, используй needs_clarification=true.",
+            "При needs_clarification=true обязательно укажи clarification_kb_id из candidates.",
+            "Если ни один кандидат не подходит, can_answer=false и needs_clarification=false.",
+            "Если вопрос является бессмысленным мусором, is_noise=true.",
+            "Не выдумывай факты, которых нет в переданных кандидатах.",
+            "Не используй сведения из других категорий и не смешивай ответы нескольких кандидатов.",
         ],
         "question": question,
         "candidates": [_entry_for_llm(entry) for entry in relevant_entries],
         "output_schema": {
             "is_noise": "boolean",
             "can_answer": "boolean",
+            "selected_kb_id": "string|null",
             "needs_clarification": "boolean",
             "clarification_kb_id": "string|null",
             "reason": "string|null",
@@ -86,6 +104,38 @@ def build_user_message(question: str, relevant_entries: list[dict]) -> str:
         },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _extract_message_text(response: Any) -> str:
+    """Extract the first message text from the Responses API object."""
+    for item in getattr(response, "output", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", []) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            # Some SDK/model combinations expose content as dict-like values.
+            if isinstance(content, dict):
+                text_value = content.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    return text_value.strip()
+    raise ValueError("LLM response does not contain a message text")
+
+
+def _strip_json_fence(text: str) -> str:
+    text = text.strip()
+    if not text.startswith("```"):
+        return text
+
+    lines = text.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    if lines and lines[0].strip().lower() == "json":
+        lines = lines[1:]
+    return "\n".join(lines).strip()
 
 
 class YandexLLMClient:
@@ -102,46 +152,92 @@ class YandexLLMClient:
         question: str,
         relevant_entries: list[dict],
     ) -> LLMResult:
-        user_message = build_user_message(question, relevant_entries)
+        if not question.strip():
+            return LLMResult(False, None, "empty_question")
+
+        candidates = [
+            entry for entry in relevant_entries
+            if entry.get("id")
+        ]
+        if not candidates:
+            return LLMResult(False, None, "no_candidates")
+
+        candidate_ids = {str(entry["id"]) for entry in candidates}
+        user_message = build_user_message(question, candidates)
 
         try:
+            # Current compatibility path: rely on the stored Yandex prompt for the
+            # model/system setup and ask for strict JSON in the user payload.
             response = await self._client.responses.create(
                 prompt={"id": self.prompt_id},
                 input=user_message,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "intent_decision",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "is_noise": {"type": ["boolean"]},
+                                "can_answer": {"type": ["boolean"]},
+                                "selected_kb_id": {"type": ["string", "null"]},
+                                "needs_clarification": {"type": ["boolean"]},
+                                "clarification_kb_id": {"type": ["string", "null"]},
+                                "reason": {"type": ["string", "null"]},
+                                "answer": {"type": ["string", "null"]},
+                            },
+                            "required": [
+                                "is_noise",
+                                "can_answer",
+                                "selected_kb_id",
+                                "needs_clarification",
+                                "clarification_kb_id",
+                                "reason",
+                                "answer",
+                            ],
+                        },
+                    }
+                },
             )
 
-            message_item = next(
-                item for item in response.output if item.type == "message"
-            )
-            text = message_item.content[0].text.strip()
-
-            # Be tolerant of accidental markdown fences around JSON.
-            if text.startswith("```"):
-                text = text.strip("`").strip()
-                if text.lower().startswith("json"):
-                    text = text[4:].lstrip()
-
+            text = _strip_json_fence(_extract_message_text(response))
             data = json.loads(text)
+
             if not isinstance(data, dict):
                 raise ValueError("LLM output must be a JSON object")
 
             is_noise = bool(data.get("is_noise", False))
             can_answer = bool(data.get("can_answer", False))
             needs_clarification = bool(data.get("needs_clarification", False))
+
+            selected_kb_id = data.get("selected_kb_id")
+            selected_kb_id = (
+                str(selected_kb_id).strip()
+                if selected_kb_id is not None and str(selected_kb_id).strip()
+                else None
+            )
+
             clarification_kb_id = data.get("clarification_kb_id")
-            if clarification_kb_id is not None:
-                clarification_kb_id = str(clarification_kb_id).strip() or None
+            clarification_kb_id = (
+                str(clarification_kb_id).strip()
+                if clarification_kb_id is not None and str(clarification_kb_id).strip()
+                else None
+            )
 
             answer = data.get("answer")
             answer = answer.strip() if isinstance(answer, str) and answer.strip() else None
+
             reason = data.get("reason")
             reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
 
             logger.info(
-                "LLM response | noise=%s | can_answer=%s | needs_clarification=%s | clarification_kb_id=%s | reason=%s",
+                "LLM response | noise=%s | can_answer=%s | selected=%s | "
+                "clarification=%s | reason=%s",
                 is_noise,
                 can_answer,
-                needs_clarification,
+                selected_kb_id,
                 clarification_kb_id,
                 reason,
             )
@@ -149,26 +245,64 @@ class YandexLLMClient:
             if is_noise:
                 return LLMResult(False, None, reason, is_noise=True)
 
-            # Never let an answer without answer text through.
-            if can_answer and not answer:
-                can_answer = False
-                reason = reason or "missing_answer"
+            # Never accept a model-produced answer without a valid selected intent.
+            if can_answer:
+                if selected_kb_id not in candidate_ids:
+                    logger.warning(
+                        "LLM selected invalid candidate | selected=%s | candidates=%s",
+                        selected_kb_id,
+                        sorted(candidate_ids),
+                    )
+                    return LLMResult(
+                        False,
+                        None,
+                        "invalid_selected_kb_id",
+                    )
 
-            if needs_clarification and clarification_kb_id:
+                if not answer:
+                    return LLMResult(
+                        False,
+                        None,
+                        "missing_answer",
+                        selected_kb_id=selected_kb_id,
+                    )
+
+                # If the model says can_answer, clarification must be false.
+                if needs_clarification:
+                    needs_clarification = False
+
+                return LLMResult(
+                    can_answer=True,
+                    answer=answer + OPERATOR_HINT,
+                    reason=reason,
+                    selected_kb_id=selected_kb_id,
+                )
+
+            if needs_clarification:
+                if clarification_kb_id not in candidate_ids:
+                    logger.warning(
+                        "LLM selected invalid clarification candidate | selected=%s | candidates=%s",
+                        clarification_kb_id,
+                        sorted(candidate_ids),
+                    )
+                    return LLMResult(
+                        False,
+                        None,
+                        "invalid_clarification_kb_id",
+                    )
+
                 return LLMResult(
                     can_answer=False,
                     answer=None,
                     reason=reason,
-                    is_noise=False,
                     needs_clarification=True,
                     clarification_kb_id=clarification_kb_id,
                 )
 
             return LLMResult(
-                can_answer=can_answer,
-                answer=(answer + OPERATOR_HINT) if can_answer and answer else None,
-                reason=reason,
-                is_noise=False,
+                can_answer=False,
+                answer=None,
+                reason=reason or "no_suitable_candidate",
             )
 
         except Exception as exc:
@@ -177,5 +311,4 @@ class YandexLLMClient:
                 can_answer=False,
                 answer=None,
                 reason="llm_unavailable_or_invalid_output",
-                is_noise=False,
             )

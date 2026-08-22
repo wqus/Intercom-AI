@@ -63,6 +63,11 @@ HIGH_SCORE_LOW_MARGIN = 0.88
 LEXICAL_EVIDENCE_MIN = 0.18
 SEMANTIC_GAP_FOR_LLM = 0.020
 
+# Additional deterministic evidence. These are ranking features, not probabilities.
+FUZZY_PHRASE_WEIGHT = 0.10
+REQUIRED_EVIDENCE_WEIGHT = 0.06
+CONFLICT_COMPETITOR_MARGIN = 0.12
+
 # Hard rejection for unusable input.
 MIN_MEANINGFUL_CHARS = 3
 MIN_ALNUM_RATIO = 0.45
@@ -324,7 +329,7 @@ class KnowledgeBase:
 
     def __init__(
         self,
-        path: str = "data/knowledge_base_v2.json",
+        path: str = "data/knowledge_base.json",
         model_name: str = EMBEDDING_MODEL_NAME,
         reranker_model_name: str = RERANKER_MODEL_NAME,
         device: str = "cpu",
@@ -382,7 +387,7 @@ class KnowledgeBase:
                 self.default_answer = str(raw.get("template_answer") or self.default_answer)
                 continue
             if entry_id in self.entries_by_id:
-                continue
+                raise ValueError(f"Duplicate knowledge-base id: {entry_id}")
 
             entry = dict(raw)
             for field in (
@@ -417,6 +422,28 @@ class KnowledgeBase:
             entry["_positive_norm"] = [normalize_light(p) for p in entry["positive_examples"] if isinstance(p, str)]
             self.entries.append(entry)
             self.entries_by_id[entry_id] = entry
+
+        self._validate_entries()
+
+    def _validate_entries(self) -> None:
+        """Fail fast on KB structure errors that would make ranking unreliable."""
+        known_ids = set(self.entries_by_id)
+        for entry in self.entries:
+            for field in ("positive_examples", "negative_phrases", "required_phrases"):
+                values = entry.get(field, [])
+                if not all(isinstance(x, str) and x.strip() for x in values):
+                    raise ValueError(f"KB {entry['id']}: field {field} must contain non-empty strings")
+            for conflict_id in entry.get("conflict_ids", []):
+                if str(conflict_id) not in known_ids:
+                    raise ValueError(
+                        f"KB {entry['id']}: unknown conflict_id {conflict_id}"
+                    )
+            constraints = entry.get("constraints") or {}
+            for key in ("must_have_any", "must_have_all", "must_not_have"):
+                if key in constraints and not isinstance(constraints[key], list):
+                    raise ValueError(
+                        f"KB {entry['id']}: constraints.{key} must be a list"
+                    )
 
     def _build_indexes(self) -> None:
         passages: list[str] = []
@@ -472,11 +499,9 @@ class KnowledgeBase:
         family = str(entry.get("family") or "")
         definition = str(entry.get("definition") or entry.get("scope") or entry.get("description") or "")
         positives = ". ".join(str(x) for x in entry.get("positive_examples", [])[:10])
-        not_use = ". ".join(str(x) for x in entry.get("when_not_to_use", [])[:5])
         return (
             f"Семейство: {family}. Категория: {category}. "
-            f"Определение: {definition}. Положительные примеры: {positives}. "
-            f"Не использовать: {not_use}."
+            f"Определение: {definition}. Положительные примеры: {positives}."
         )
 
     # --------------------------------------------------------
@@ -525,6 +550,13 @@ class KnowledgeBase:
             has_phrase("меня", "мне") or has_any("лиш")
         )
 
+        # Exit from all schools must win over generic voluntary-exit signals.
+        if has_phrase(
+            "из всех школ", "из всех направлений", "из всего обучения",
+            "отовсюду", "нигде не учиться",
+        ):
+            return "kb_024"
+
         # Voluntary exit must be checked before generic school/education retrieval.
         # `отчислиться` is voluntary; `меня отчислили` is an already completed exclusion.
         voluntary_exit = (
@@ -543,10 +575,6 @@ class KnowledgeBase:
             return "kb_007"
         if voluntary_exit and not explicit_transfer and not explicit_return:
             return "kb_005"
-
-        # Exit from all schools is intentionally very specific.
-        if has_phrase("из всех школ", "из всех направлений", "из всего обучения", "отовсюду", "нигде не учиться"):
-            return "kb_024"
 
         # ----------------------------------------------------
         # Mentor family.
@@ -730,9 +758,50 @@ class KnowledgeBase:
                 hits.append(phrase)
         return hits
 
+    def _best_fuzzy_phrase_score(self, question: str, entry: dict) -> float:
+        """Best phrase-level lexical similarity on a 0..1 scale.
+
+        This is intentionally a secondary signal. It helps with word-order
+        variation and minor typos, but cannot override semantic contradictions.
+        """
+        q = normalize_light(question)
+        best = 0.0
+        for phrase in entry.get("positive_examples", []):
+            p = normalize_light(phrase)
+            if not p:
+                continue
+            score = max(
+                fuzz.token_set_ratio(q, p),
+                fuzz.partial_ratio(q, p),
+            ) / 100.0
+            best = max(best, float(score))
+        return best
+
     def _negative_hits(self, question: str, entry: dict) -> list[str]:
         q = normalize_light(question)
-        return [p for p in entry.get("negative_phrases", []) if isinstance(p, str) and normalize_light(p) in q]
+        return [
+            p for p in entry.get("negative_phrases", [])
+            if isinstance(p, str) and normalize_light(p) in q
+        ]
+
+    def _required_evidence(self, question: str, entry: dict) -> dict[str, Any]:
+        """Treat legacy required_phrases as weak evidence, never as a hard gate.
+
+        Older KB records encode both AND-like and OR-like requirements in one
+        flat list. Using them as a hard AND would reject valid Russian variants,
+        so we score the strongest matching evidence instead.
+        """
+        q = normalize_light(question)
+        phrases = [
+            normalize_light(p) for p in entry.get("required_phrases", [])
+            if isinstance(p, str) and normalize_light(p)
+        ]
+        if not phrases:
+            return {"hits": [], "coverage": 0.0}
+
+        hits = [p for p in phrases if p in q]
+        coverage = len(hits) / len(phrases)
+        return {"hits": hits, "coverage": float(coverage)}
 
     def _constraint_evidence(self, question: str, entry: dict) -> dict[str, Any]:
         q = normalize_light(question)
@@ -782,15 +851,22 @@ class KnowledgeBase:
             positives = self._lexical_phrase_hits(question, entry)
             negatives = self._negative_hits(question, entry)
             constraints = self._constraint_evidence(question, entry)
+            required = self._required_evidence(question, entry)
+            fuzzy_phrase = self._best_fuzzy_phrase_score(question, entry)
 
             semantic = (
                 SEMANTIC_MAX_WEIGHT * item["embedding_score"]
                 + SEMANTIC_TOP3_WEIGHT * item["semantic_top3"]
                 + SEMANTIC_CATEGORY_WEIGHT * item["semantic_prototype"]
             )
-            # Combine semantic with rank fusion; do not interpret either as probability.
-            base = 0.72 * semantic + 0.28 * min(1.0, item["rrf_score"] / (1.0 / (RRF_K + 1.0) * 2.0))
+            # RRF is a rank-fusion signal. Normalize it against its theoretical
+            # best-case value when the candidate is first in both rank lists.
+            rrf_max = 2.0 / (RRF_K + 1.0)
+            rrf_norm = min(1.0, item["rrf_score"] / max(rrf_max, 1e-9))
+
+            base = 0.68 * semantic + 0.20 * rrf_norm + 0.12 * fuzzy_phrase
             lexical_bonus = POSITIVE_LEXICAL_BONUS if positives else 0.0
+            required_bonus = REQUIRED_EVIDENCE_WEIGHT * required["coverage"]
             negative_penalty = NEGATIVE_LEXICAL_PENALTY if negatives else 0.0
             conflict_penalty = CONFLICT_PENALTY if constraints["forbidden_hits"] else 0.0
             group_bonus = REQUIRED_GROUP_BONUS if constraints["failed_any_groups"] == 0 and constraints["constraint_groups"] else 0.0
@@ -798,6 +874,7 @@ class KnowledgeBase:
             final = (
                 base
                 + lexical_bonus
+                + required_bonus
                 + group_bonus
                 - negative_penalty
                 - conflict_penalty
@@ -808,6 +885,9 @@ class KnowledgeBase:
             item.update({
                 "rerank_score": generic,
                 "semantic_score": float(semantic),
+                "rrf_normalized": float(rrf_norm),
+                "fuzzy_phrase_score": float(fuzzy_phrase),
+                "required_evidence": required,
                 "final_score": float(final),
                 "positive_hits": positives,
                 "negative_hits": negatives,
@@ -862,6 +942,9 @@ class KnowledgeBase:
                 "_rrf_score": float(item["rrf_score"]),
                 "_rerank_score": float(item["rerank_score"]),
                 "_semantic_score": float(item["semantic_score"]),
+                "_rrf_normalized": float(item.get("rrf_normalized", 0.0)),
+                "_fuzzy_phrase_score": float(item.get("fuzzy_phrase_score", 0.0)),
+                "_required_evidence": item.get("required_evidence", {}),
                 "_final_score": float(item["final_score"]),
                 "_best_match_phrase": item["best_phrase"],
                 "_positive_hits": item["positive_hits"],
@@ -891,18 +974,10 @@ class KnowledgeBase:
         if not self.entries:
             return MatchResult(MatchMode.NO_MATCH, 0.0, None, None, None, [], subquestion=question)
 
-        # 1) Safe exact/fuzzy only when the full query strongly matches and no contradiction exists.
-        fuzzy = self._fuzzy_candidates(question)
-        if fuzzy:
-            top_f = fuzzy[0]
-            second_f = fuzzy[1]["score"] if len(fuzzy) > 1 else 0.0
-            if top_f["score"] >= 96.0 and top_f["score"] - second_f >= 8.0 and not top_f["negative_hits"]:
-                entry = top_f["entry"]
-                if entry.get("requires_clarification"):
-                    return MatchResult(MatchMode.CLARIFICATION, top_f["score"] / 100.0, entry.get("category"), entry.get("clarification_question"), entry.get("id"), [self._clean_entry_for_llm(entry)], entry=entry, second_score=second_f / 100.0, margin=(top_f["score"] - second_f) / 100.0, fuzzy_score=top_f["score"] / 100.0, subquestion=question)
-                return MatchResult(MatchMode.TEMPLATE, top_f["score"] / 100.0, entry.get("category"), (entry.get("template_answer") or "") + OPERATOR_HINT, entry.get("id"), [self._clean_entry_for_llm(entry)], entry=entry, second_score=second_f / 100.0, margin=(top_f["score"] - second_f) / 100.0, fuzzy_score=top_f["score"] / 100.0, subquestion=question)
-
-        # 2) High-confidence deterministic rule.
+        # 1) High-confidence deterministic business rule.
+        # Rules are evaluated before fuzzy/semantic retrieval so explicit intent
+        # boundaries (e.g. leave vs transfer vs restore) cannot be stolen by a
+        # semantically similar category.
         hard_id = self._hard_rule_match(question)
         if hard_id:
             entry = self.entries_by_id.get(hard_id)
@@ -910,7 +985,19 @@ class KnowledgeBase:
                 logger.info("KB v2 hard rule | kb_id=%s | question=%r", hard_id, question)
                 if entry.get("requires_clarification"):
                     return MatchResult(MatchMode.CLARIFICATION, 0.99, entry.get("category"), entry.get("clarification_question"), hard_id, [self._clean_entry_for_llm(entry)], entry=entry, margin=0.99, subquestion=question)
-                return MatchResult(MatchMode.TEMPLATE, 0.99, entry.get("category"), (entry.get("template_answer") or "") + OPERATOR_HINT, hard_id, [self._clean_entry_for_llm(entry)], entry=entry, margin=0.99, subquestion=question)
+                return MatchResult(MatchMode.TEMPLATE, 0.99, entry.get("category"), (entry.get("template_answer") or "") + OPERATOR_HINT, hard_id, [self._clean_entry_for_llm(entry)], entry=entry, margin=0.99, subquestion=question, decision_reason="hard_rule")
+
+        # 2) Safe fuzzy shortcut. Fuzzy may only auto-answer when the phrase
+        # match is extremely strong and the result is clearly separated.
+        fuzzy = self._fuzzy_candidates(question)
+        if fuzzy:
+            top_f = fuzzy[0]
+            second_f = fuzzy[1]["score"] if len(fuzzy) > 1 else 0.0
+            if top_f["score"] >= 96.0 and top_f["score"] - second_f >= 8.0 and not top_f["negative_hits"]:
+                entry = top_f["entry"]
+                if entry.get("requires_clarification"):
+                    return MatchResult(MatchMode.CLARIFICATION, top_f["score"] / 100.0, entry.get("category"), entry.get("clarification_question"), entry.get("id"), [self._clean_entry_for_llm(entry)], entry=entry, second_score=second_f / 100.0, margin=(top_f["score"] - second_f) / 100.0, fuzzy_score=top_f["score"] / 100.0, subquestion=question, decision_reason="strong_fuzzy_match")
+                return MatchResult(MatchMode.TEMPLATE, top_f["score"] / 100.0, entry.get("category"), (entry.get("template_answer") or "") + OPERATOR_HINT, entry.get("id"), [self._clean_entry_for_llm(entry)], entry=entry, second_score=second_f / 100.0, margin=(top_f["score"] - second_f) / 100.0, fuzzy_score=top_f["score"] / 100.0, subquestion=question, decision_reason="strong_fuzzy_match")
 
         # 3) Hybrid retrieval.
         candidates = self._retrieve_candidates(question)
@@ -931,11 +1018,17 @@ class KnowledgeBase:
         )
 
         entry = top["entry"]
-        has_lexical = bool(top["positive_hits"]) or float(top["bm25_score"]) >= LEXICAL_EVIDENCE_MIN
+        has_lexical = (
+            bool(top["positive_hits"])
+            or float(top["bm25_score"]) >= LEXICAL_EVIDENCE_MIN
+            or float(top.get("fuzzy_phrase_score", 0.0)) >= 0.88
+        )
         semantic_gap = (
             float(top["semantic_score"]) - float(second["semantic_score"])
             if second else float(top["semantic_score"])
         )
+        top_conflicts = set(str(x) for x in entry.get("conflict_ids", []))
+        second_is_known_conflict = bool(second and str(second["entry"]["id"]) in top_conflicts)
 
         if entry.get("requires_clarification"):
             return MatchResult(
@@ -968,7 +1061,11 @@ class KnowledgeBase:
 
         # Very strong and well-separated candidate -> deterministic template.
         # A strong score with weak separation is intentionally NOT auto-accepted.
-        if top_score >= AUTO_SCORE and margin >= AUTO_MARGIN:
+        if (
+            top_score >= AUTO_SCORE
+            and margin >= AUTO_MARGIN
+            and (not second_is_known_conflict or margin >= CONFLICT_COMPETITOR_MARGIN)
+        ):
             return MatchResult(
                 MatchMode.TEMPLATE, top_score, entry.get("category"),
                 (entry.get("template_answer") or "") + OPERATOR_HINT, entry.get("id"),
@@ -985,6 +1082,7 @@ class KnowledgeBase:
             and (
                 margin >= LLM_MARGIN
                 or (top_score >= HIGH_SCORE_LOW_MARGIN and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM))
+                or (second_is_known_conflict and top_score >= LLM_SCORE)
             )
         )
         if llm_eligible:
@@ -1067,6 +1165,9 @@ class KnowledgeBase:
                     "rrf_score": x["rrf_score"],
                     "rerank_score": x["rerank_score"],
                     "semantic_score": x["semantic_score"],
+                    "rrf_normalized": x.get("rrf_normalized", 0.0),
+                    "fuzzy_phrase_score": x.get("fuzzy_phrase_score", 0.0),
+                    "required_evidence": x.get("required_evidence", {}),
                     "final_score": x["final_score"],
                     "positive_hits": x["positive_hits"],
                     "negative_hits": x["negative_hits"],
