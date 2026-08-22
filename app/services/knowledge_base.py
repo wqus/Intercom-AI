@@ -68,6 +68,13 @@ FUZZY_PHRASE_WEIGHT = 0.10
 REQUIRED_EVIDENCE_WEIGHT = 0.06
 CONFLICT_COMPETITOR_MARGIN = 0.12
 
+# Intent-fit layer: semantic similarity alone is not enough for template routing.
+# Strong question-type mismatches (e.g. AGE vs PROCEDURE, DURATION vs PRICE)
+# reduce fit and can block an unsafe automatic template.
+INTENT_FIT_TEMPLATE_MIN = 0.55
+INTENT_FIT_LLM_MIN = 0.28
+INTENT_FIT_HARD_MISMATCH = 0.18
+
 # Hard rejection for unusable input.
 MIN_MEANINGFUL_CHARS = 3
 MIN_ALNUM_RATIO = 0.45
@@ -173,6 +180,8 @@ class MatchResult:
     margin: float = 0.0
     fuzzy_score: float = 0.0
     embedding_score: float = 0.0
+    intent_fit_score: float = 0.0
+    intent_fit_reason: str = ""
     subquestion: str | None = None
     decision_reason: str = ""
 
@@ -246,20 +255,42 @@ def _split_structural_questions(text: str) -> list[str]:
 
 
 def _split_conjunctive_question(text: str) -> list[str]:
+    """Generate conservative conjunction split candidates.
+
+    We do not assume every "и" means two intents. The caller validates the
+    fragments against the actual classifier before accepting the split.
+    """
     q = text.strip()
-    for pattern in (r"\s+а\s+также\s+", r"\s+и еще\s+", r"\s+и\s+"):
-        parts = [p.strip(" ,") for p in re.split(pattern, q, maxsplit=1, flags=re.IGNORECASE)]
-        parts = [re.sub(r"^(?:и|а|также)\s+", "", p, flags=re.IGNORECASE) for p in parts]
-        if len(parts) == 2 and all(len(tokenize(p)) >= 3 for p in parts):
+    patterns = (
+        r"\s+а\s+также\s+",
+        r"\s+и\s+еще\s+",
+        r"\s+также\s+",
+        r"\s+и\s+",
+    )
+    for pattern in patterns:
+        parts = [
+            p.strip(" ,;")
+            for p in re.split(pattern, q, maxsplit=1, flags=re.IGNORECASE)
+        ]
+        parts = [
+            re.sub(r"^(?:и|а|также)\s+", "", p, flags=re.IGNORECASE).strip(" ,;")
+            for p in parts
+        ]
+        if len(parts) == 2 and all(len(normalize_light(p).split()) >= 2 for p in parts):
             return parts
     return [q]
 
 
 def split_user_questions(text: str, max_questions: int = MAX_SUBQUESTIONS) -> list[str]:
+    """Split only on high-confidence structural boundaries.
+
+    Conjunctions are validated later against actual intent predictions, so a
+    normal single intent containing "и" is not accidentally fragmented.
+    """
     structural = _split_structural_questions(text)
     if len(structural) > 1:
         return structural[:max_questions]
-    return _split_conjunctive_question(text)[:max_questions]
+    return [text.strip()]
 
 
 # ============================================================
@@ -361,7 +392,7 @@ class KnowledgeBase:
         self._build_indexes()
 
         logger.info(
-            "KB v2 loaded | categories=%d | phrase_records=%d | reranker=%s",
+            "KB v6 loaded | categories=%d | phrase_records=%d | reranker=%s",
             len(self.entries), len(self.phrase_records), self.reranker is not None,
         )
 
@@ -777,6 +808,165 @@ class KnowledgeBase:
             best = max(best, float(score))
         return best
 
+    # --------------------------------------------------------
+    # INTENT FIT / QUESTION-TYPE COMPATIBILITY
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _question_facets(question: str) -> set[str]:
+        """Detect strong question-type signals without requiring ML training.
+
+        This is deliberately conservative: a facet is emitted only for strong,
+        phrase-level indicators. These signals are used as a safety/fit layer,
+        not as a replacement for semantic retrieval.
+        """
+        q = normalize_light(question)
+        facets: set[str] = set()
+
+        patterns: dict[str, tuple[str, ...]] = {
+            "age": (
+                "с какого возраста", "до какого возраста", "со скольки лет",
+                "с какого лет", "после 50", "после 40", "после 30",
+                "сколько лет можно", "возраст", "лет можно учиться",
+            ),
+            "duration": (
+                "сколько длится", "как долго длится", "как долго идет",
+                "как долго обучение", "сколько месяцев", "сколько недель",
+                "сколько по времени", "длительность обучения", "продолжительность обучения",
+            ),
+            "price": (
+                "сколько стоит", "стоимость", "цена", "платно ли", "платное ли",
+                "нужно ли платить", "надо ли платить", "бесплатно ли",
+            ),
+            "date": (
+                "когда следующий", "когда новый", "когда старт", "когда запуск",
+                "какая дата", "дата старта", "даты потока", "в какой день",
+            ),
+            "procedure": (
+                "как попасть", "как записаться", "как начать", "что нужно чтобы",
+                "как вступить", "как стать участником", "как учиться",
+            ),
+            "location": (
+                "где находится", "где найти", "где посмотреть", "куда прийти",
+                "где выбрать", "где взять", "где получить",
+            ),
+            "technical_failure": (
+                "не работает", "не открывается", "не запускается", "ошибка",
+                "не загружается", "не сканируется", "не принимает", "не могу войти",
+            ),
+            "access": (
+                "нет доступа", "не пускает", "не вижу", "закрыт доступ", "как получить доступ",
+            ),
+        }
+        for facet, phrases in patterns.items():
+            if any(p in q for p in phrases):
+                facets.add(facet)
+        return facets
+
+    @staticmethod
+    def _entry_supported_facets(entry: dict) -> set[str]:
+        """Infer which strong question types an intent's examples support."""
+        texts: list[str] = []
+        texts.extend(str(x) for x in entry.get("positive_examples", [])[:30])
+        texts.extend(str(x) for x in entry.get("when_to_use", [])[:10])
+        return KnowledgeBase._question_facets(". ".join(texts))
+
+    def _intent_fit(self, question: str, entry: dict, *, fuzzy_phrase: float = 0.0) -> tuple[float, str]:
+        """Score how well the *intent contract* of an entry matches the query.
+
+        Semantic similarity answers "what is this text about?".
+        Intent fit answers "does this question ask for the kind of action/state
+        this category is designed to handle?".
+
+        Explicit KB intent signals take precedence over inferred facets.
+        """
+        q = normalize_light(question)
+        q_facets = self._question_facets(question)
+
+        explicit_facets = {
+            str(x).strip()
+            for x in entry.get("intent_facets", [])
+            if isinstance(x, str) and str(x).strip()
+        }
+        supported = explicit_facets or self._entry_supported_facets(entry)
+
+        signals = entry.get("intent_signals") or {}
+        positive_signals = [
+            normalize_light(str(x))
+            for x in signals.get("positive", [])
+            if isinstance(x, str) and normalize_light(str(x))
+        ]
+        negative_signals = [
+            normalize_light(str(x))
+            for x in signals.get("negative", [])
+            if isinstance(x, str) and normalize_light(str(x))
+        ]
+
+        positive_hits = [x for x in positive_signals if x in q]
+        negative_hits = [x for x in negative_signals if x in q]
+
+        # A direct positive intent signal is strong evidence, but not a hard gate.
+        if positive_hits and not negative_hits:
+            signal_strength = min(1.0, 0.55 + 0.12 * len(positive_hits))
+        elif positive_hits and negative_hits:
+            signal_strength = 0.50
+        else:
+            signal_strength = 0.0
+
+        # Explicit negative intent signals are stronger than generic semantics.
+        if negative_hits:
+            fit = 0.12 + 0.10 * min(1.0, fuzzy_phrase)
+            return float(min(fit, 0.25)), (
+                "explicit_negative_signal:" + ",".join(negative_hits[:3])
+            )
+
+        if q_facets:
+            overlap = q_facets & supported
+            if overlap:
+                facet_fit = 0.80 + 0.15 * (len(overlap) / max(1, len(q_facets)))
+            else:
+                facet_fit = 0.18
+        else:
+            facet_fit = 0.55 + 0.25 * min(1.0, fuzzy_phrase)
+
+        # Blend explicit intent signals with facet compatibility.
+        if signal_strength:
+            fit = 0.60 * signal_strength + 0.40 * facet_fit
+        else:
+            fit = facet_fit
+
+        # If the KB explicitly declares a single intent type and the query has
+        # a strong, incompatible facet, keep the fit conservative.
+        intent_type = str(entry.get("intent_type") or "").strip()
+        strong_mismatch_pairs = {
+            "education_entry": {"age", "duration", "price", "date"},
+            "school_registration": {"age", "duration", "price", "date"},
+            "education_price": {"age", "duration", "date"},
+            "flow_date": {"age", "duration", "price"},
+            "subscription_charge": {"age", "duration", "date"},
+            "rent_payment_issue": {"age", "duration", "date", "price"},
+        }
+        if intent_type in strong_mismatch_pairs and q_facets & strong_mismatch_pairs[intent_type]:
+            fit = min(fit, 0.22)
+            return float(fit), (
+                f"intent_type_mismatch:{intent_type};"
+                f"query={','.join(sorted(q_facets & strong_mismatch_pairs[intent_type]))}"
+            )
+
+        fit = max(0.0, min(0.98, fit))
+        if q_facets and not (q_facets & supported):
+            reason = (
+                f"facet_mismatch:query={','.join(sorted(q_facets))};"
+                f"intent={','.join(sorted(supported)) or 'none'}"
+            )
+        elif positive_hits:
+            reason = "positive_intent_signal:" + ",".join(positive_hits[:3])
+        elif q_facets:
+            reason = "facet_overlap:" + ",".join(sorted(q_facets & supported))
+        else:
+            reason = "no_strong_question_facet"
+        return float(fit), reason
+
     def _negative_hits(self, question: str, entry: dict) -> list[str]:
         q = normalize_light(question)
         return [
@@ -853,6 +1043,9 @@ class KnowledgeBase:
             constraints = self._constraint_evidence(question, entry)
             required = self._required_evidence(question, entry)
             fuzzy_phrase = self._best_fuzzy_phrase_score(question, entry)
+            intent_fit, intent_fit_reason = self._intent_fit(
+                question, entry, fuzzy_phrase=fuzzy_phrase
+            )
 
             semantic = (
                 SEMANTIC_MAX_WEIGHT * item["embedding_score"]
@@ -880,6 +1073,11 @@ class KnowledgeBase:
                 - conflict_penalty
                 + GENERIC_RERANK_WEIGHT * generic
             )
+            # Keep the original final_score for continuity, but use a small
+            # intent-fit adjustment for candidate ordering. A semantically similar
+            # category with the wrong question type should not outrank a candidate
+            # whose intent contract actually matches the question.
+            ranking_score = final + 0.16 * (intent_fit - 0.5)
 
             item = dict(item)
             item.update({
@@ -888,6 +1086,9 @@ class KnowledgeBase:
                 "rrf_normalized": float(rrf_norm),
                 "fuzzy_phrase_score": float(fuzzy_phrase),
                 "required_evidence": required,
+                "intent_fit_score": float(intent_fit),
+                "intent_fit_reason": intent_fit_reason,
+                "ranking_score": float(ranking_score),
                 "final_score": float(final),
                 "positive_hits": positives,
                 "negative_hits": negatives,
@@ -895,19 +1096,25 @@ class KnowledgeBase:
             })
             ranked.append(item)
 
-        ranked.sort(key=lambda x: x["final_score"], reverse=True)
+        ranked.sort(key=lambda x: x.get("ranking_score", x["final_score"]), reverse=True)
         return ranked[:FINAL_CANDIDATES]
 
     @staticmethod
     def _reranker_text(entry: dict, best_phrase: str) -> str:
         category = str(entry.get("category") or "")
         family = str(entry.get("family") or "")
+        intent_type = str(entry.get("intent_type") or "")
+        facets = ", ".join(str(x) for x in entry.get("intent_facets", [])[:8])
         definition = str(entry.get("definition") or entry.get("scope") or entry.get("description") or "")
         positives = "; ".join(str(x) for x in entry.get("positive_examples", [])[:8])
         negatives = "; ".join(str(x) for x in entry.get("negative_phrases", [])[:5])
+        signal_pos = "; ".join(str(x) for x in (entry.get("intent_signals") or {}).get("positive", [])[:8])
+        signal_neg = "; ".join(str(x) for x in (entry.get("intent_signals") or {}).get("negative", [])[:8])
         return (
-            f"Семейство: {family}. Категория: {category}. "
-            f"Определение: {definition}. Положительные примеры: {positives}. "
+            f"Семейство: {family}. Тип интента: {intent_type}. Фасеты: {facets}. "
+            f"Категория: {category}. Определение: {definition}. "
+            f"Положительные примеры: {positives}. "
+            f"Intent-сигналы: {signal_pos}. Не подходит для: {signal_neg}. "
             f"Не использовать для: {negatives}. Лучший пример: {best_phrase}."
         )
 
@@ -926,7 +1133,7 @@ class KnowledgeBase:
             "id", "category", "family", "definition", "match_phrases", "positive_examples",
             "negative_phrases", "required_phrases", "constraints", "priority", "scope",
             "when_to_use", "when_not_to_use", "confused_with", "requires_clarification",
-            "clarification_question", "template_answer", "description", "hard_negative_examples",
+            "clarification_question", "template_answer", "description", "hard_negative_examples", "intent_type", "intent_facets", "intent_signals",
         }
         return {k: v for k, v in entry.items() if k in allowed}
 
@@ -945,11 +1152,17 @@ class KnowledgeBase:
                 "_rrf_normalized": float(item.get("rrf_normalized", 0.0)),
                 "_fuzzy_phrase_score": float(item.get("fuzzy_phrase_score", 0.0)),
                 "_required_evidence": item.get("required_evidence", {}),
+                "_intent_fit_score": float(item.get("intent_fit_score", 0.0)),
+                "_intent_fit_reason": item.get("intent_fit_reason", ""),
+                "_ranking_score": float(item.get("ranking_score", item["final_score"])),
                 "_final_score": float(item["final_score"]),
                 "_best_match_phrase": item["best_phrase"],
                 "_positive_hits": item["positive_hits"],
                 "_negative_hits": item["negative_hits"],
                 "_constraint_evidence": item["constraint_evidence"],
+                "_intent_type": item["entry"].get("intent_type"),
+                "_intent_facets": item["entry"].get("intent_facets", []),
+
             })
             result.append(clean)
         return result
@@ -968,7 +1181,7 @@ class KnowledgeBase:
 
         ok, reason = _quality_gate(question)
         if not ok:
-            logger.info("KB v2 input rejected as unknown | reason=%s | question=%r", reason, question)
+            logger.info("KB v6 input rejected as unknown | reason=%s | question=%r", reason, question)
             return MatchResult(MatchMode.NO_MATCH, 0.0, None, None, None, [], subquestion=question)
 
         if not self.entries:
@@ -982,7 +1195,7 @@ class KnowledgeBase:
         if hard_id:
             entry = self.entries_by_id.get(hard_id)
             if entry and not self._negative_hits(question, entry):
-                logger.info("KB v2 hard rule | kb_id=%s | question=%r", hard_id, question)
+                logger.info("KB v6 hard rule | kb_id=%s | question=%r", hard_id, question)
                 if entry.get("requires_clarification"):
                     return MatchResult(MatchMode.CLARIFICATION, 0.99, entry.get("category"), entry.get("clarification_question"), hard_id, [self._clean_entry_for_llm(entry)], entry=entry, margin=0.99, subquestion=question)
                 return MatchResult(MatchMode.TEMPLATE, 0.99, entry.get("category"), (entry.get("template_answer") or "") + OPERATOR_HINT, hard_id, [self._clean_entry_for_llm(entry)], entry=entry, margin=0.99, subquestion=question, decision_reason="hard_rule")
@@ -1013,8 +1226,8 @@ class KnowledgeBase:
         relevant_entries = self._build_relevant_entries(ranked)
 
         logger.info(
-            "KB v2 decision | kb_id=%s | final=%.4f | margin=%.4f | emb=%.4f | sem=%.4f | bm25=%.4f | rrf=%.4f | rerank=%.4f | pos=%s | neg=%s",
-            top["entry"]["id"], top_score, margin, top["embedding_score"], top["semantic_score"], top["bm25_score"], top["rrf_score"], top["rerank_score"], top["positive_hits"], top["negative_hits"],
+            "KB v5 decision | kb_id=%s | final=%.4f | margin=%.4f | emb=%.4f | sem=%.4f | bm25=%.4f | rrf=%.4f | rerank=%.4f | fit=%.4f | fit_reason=%s | pos=%s | neg=%s",
+            top["entry"]["id"], top_score, margin, top["embedding_score"], top["semantic_score"], top["bm25_score"], top["rrf_score"], top["rerank_score"], top.get("intent_fit_score", 0.0), top.get("intent_fit_reason", ""), top["positive_hits"], top["negative_hits"],
         )
 
         entry = top["entry"]
@@ -1029,6 +1242,9 @@ class KnowledgeBase:
         )
         top_conflicts = set(str(x) for x in entry.get("conflict_ids", []))
         second_is_known_conflict = bool(second and str(second["entry"]["id"]) in top_conflicts)
+        intent_fit = float(top.get("intent_fit_score", 0.0))
+        intent_fit_reason = str(top.get("intent_fit_reason", ""))
+        hard_intent_mismatch = intent_fit < INTENT_FIT_HARD_MISMATCH
 
         if entry.get("requires_clarification"):
             return MatchResult(
@@ -1037,6 +1253,26 @@ class KnowledgeBase:
                 relevant_entries, entry=entry, second_score=second_score,
                 margin=margin, embedding_score=float(top["embedding_score"]),
                 subquestion=question, decision_reason="kb_requires_clarification",
+            )
+
+        # A strong question-type mismatch blocks automatic template routing.
+        # If the candidate remains semantically plausible, the LLM may inspect the
+        # candidate set; otherwise the query is unresolved.
+        if hard_intent_mismatch:
+            if top_score >= LLM_SCORE and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM):
+                return MatchResult(
+                    MatchMode.LLM, top_score, entry.get("category"), None, entry.get("id"),
+                    relevant_entries, entry=entry, second_score=second_score, margin=margin,
+                    embedding_score=float(top["embedding_score"]),
+                    intent_fit_score=intent_fit, intent_fit_reason=intent_fit_reason,
+                    subquestion=question, decision_reason="intent_fit_mismatch_requires_llm",
+                )
+            return MatchResult(
+                MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
+                entry=None, second_score=second_score, margin=margin,
+                embedding_score=float(top["embedding_score"]),
+                intent_fit_score=intent_fit, intent_fit_reason=intent_fit_reason,
+                subquestion=question, decision_reason="intent_fit_mismatch",
             )
 
         # A contradiction is strong evidence against automatic template routing.
@@ -1064,14 +1300,15 @@ class KnowledgeBase:
         if (
             top_score >= AUTO_SCORE
             and margin >= AUTO_MARGIN
+            and intent_fit >= INTENT_FIT_TEMPLATE_MIN
             and (not second_is_known_conflict or margin >= CONFLICT_COMPETITOR_MARGIN)
         ):
             return MatchResult(
                 MatchMode.TEMPLATE, top_score, entry.get("category"),
                 (entry.get("template_answer") or "") + OPERATOR_HINT, entry.get("id"),
                 relevant_entries, entry=entry, second_score=second_score, margin=margin,
-                embedding_score=float(top["embedding_score"]), subquestion=question,
-                decision_reason="high_score_high_margin",
+                embedding_score=float(top["embedding_score"]), intent_fit_score=intent_fit, intent_fit_reason=intent_fit_reason,
+                subquestion=question, decision_reason="high_score_high_margin",
             )
 
         # Strong candidate but close second: send to LLM instead of dropping to NO_MATCH.
@@ -1079,24 +1316,27 @@ class KnowledgeBase:
         # is clearly relevant but two intents are close.
         llm_eligible = (
             top_score >= LLM_SCORE
+            and intent_fit >= INTENT_FIT_LLM_MIN
             and (
                 margin >= LLM_MARGIN
                 or (top_score >= HIGH_SCORE_LOW_MARGIN and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM))
                 or (second_is_known_conflict and top_score >= LLM_SCORE)
+                or intent_fit < INTENT_FIT_TEMPLATE_MIN
             )
         )
         if llm_eligible:
             return MatchResult(
                 MatchMode.LLM, top_score, entry.get("category"), None, entry.get("id"),
                 relevant_entries, entry=entry, second_score=second_score, margin=margin,
-                embedding_score=float(top["embedding_score"]), subquestion=question,
-                decision_reason="plausible_but_ambiguous",
+                embedding_score=float(top["embedding_score"]), intent_fit_score=intent_fit, intent_fit_reason=intent_fit_reason,
+                subquestion=question, decision_reason="plausible_but_ambiguous",
             )
 
         # Weak candidate: current product policy still escalates NO_MATCH.
         return MatchResult(
             MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries, entry=None,
             second_score=second_score, margin=margin, embedding_score=float(top["embedding_score"]),
+            intent_fit_score=intent_fit, intent_fit_reason=intent_fit_reason,
             subquestion=question, decision_reason="weak_or_unresolved",
         )
 
@@ -1147,6 +1387,8 @@ class KnowledgeBase:
                 "second_score": decision.second_score,
                 "margin": decision.margin,
                 "embedding_score": decision.embedding_score,
+                "intent_fit_score": decision.intent_fit_score,
+                "intent_fit_reason": decision.intent_fit_reason,
                 "decision_reason": decision.decision_reason,
             },
             "hard_rule": self._hard_rule_match(question),
@@ -1172,19 +1414,54 @@ class KnowledgeBase:
                     "positive_hits": x["positive_hits"],
                     "negative_hits": x["negative_hits"],
                     "best_phrase": x["best_phrase"],
+                    "intent_fit_score": x.get("intent_fit_score", 0.0),
+                    "intent_fit_reason": x.get("intent_fit_reason", ""),
+                    "ranking_score": x.get("ranking_score", x["final_score"]),
                 }
                 for x in ranked
             ],
         }
 
-    def match_many(self, question: str) -> list[MatchResult]:
-        """Classify each independent sub-question without collapsing the whole message.
+    def _validate_conjunction_split(self, parts: list[str]) -> bool:
+        """Accept an `и` split only when fragments resolve to distinct intents."""
+        if len(parts) != 2:
+            return False
 
-        A low-confidence fragment must remain visible to the caller; otherwise a
-        successful first fragment can silently hide a second unanswered question.
-        """
+        left = self.match(parts[0])
+        right = self.match(parts[1])
+
+        if left.mode == MatchMode.OPERATOR or right.mode == MatchMode.OPERATOR:
+            return False
+        if left.kb_id is None or right.kb_id is None:
+            return False
+        if left.kb_id == right.kb_id:
+            return False
+
+        left_confident = (
+            left.mode in (MatchMode.TEMPLATE, MatchMode.CLARIFICATION)
+            or (left.mode == MatchMode.LLM and left.score >= LLM_SCORE)
+        )
+        right_confident = (
+            right.mode in (MatchMode.TEMPLATE, MatchMode.CLARIFICATION)
+            or (right.mode == MatchMode.LLM and right.score >= LLM_SCORE)
+        )
+        if not (left_confident and right_confident):
+            return False
+
+        return True
+
+    def match_many(self, question: str) -> list[MatchResult]:
+        """Classify independent intents without blindly splitting on conjunctions."""
         question = (question or "").strip()
-        parts = split_user_questions(question)
-        if len(parts) <= 1:
+        if not question:
             return [self.match(question)]
-        return [self.match(part) for part in parts[:MAX_SUBQUESTIONS]]
+
+        structural = split_user_questions(question)
+        if len(structural) > 1:
+            return [self.match(part) for part in structural[:MAX_SUBQUESTIONS]]
+
+        conjunction_candidates = _split_conjunctive_question(question)
+        if len(conjunction_candidates) == 2 and self._validate_conjunction_split(conjunction_candidates):
+            return [self.match(part) for part in conjunction_candidates]
+
+        return [self.match(question)]
