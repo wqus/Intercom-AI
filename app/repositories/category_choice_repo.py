@@ -30,13 +30,22 @@ async def create_category_choice(
     if len(candidate_ids) < 2 or len(candidate_ids) > 3:
         raise ValueError("Category choice requires 2 or 3 candidates")
 
-    existing = await get_pending_category_choice(session, conversation_id)
+    # Ищем любую существующую запись по conversation_id
+    result = await session.execute(
+        select(ConversationCategoryChoice).where(
+            ConversationCategoryChoice.conversation_id == conversation_id
+        )
+    )
+    existing = result.scalar_one_or_none()
+
     if existing is not None:
         existing.question = question
         existing.candidate_1 = candidate_ids[0]
         existing.candidate_2 = candidate_ids[1]
         existing.candidate_3 = candidate_ids[2] if len(candidate_ids) == 3 else None
+        existing.status = CategoryChoiceStatus.PENDING
         existing.attempts = 0
+        existing.selected_candidates = None
         return existing
 
     state = ConversationCategoryChoice(
@@ -50,7 +59,7 @@ async def create_category_choice(
     )
     session.add(state)
     await session.flush()
-    return state
+    return statew
 
 
 async def increment_attempts(
