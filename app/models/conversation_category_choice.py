@@ -14,6 +14,13 @@ class CategoryChoiceStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class CategoryChoiceStatus(str, Enum):
+    PENDING = "pending"
+    RESOLVED = "resolved"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
 class ConversationCategoryChoice(Base):
     __tablename__ = "conversation_category_choices"
 
@@ -35,7 +42,10 @@ class ConversationCategoryChoice(Base):
     )
 
     status: Mapped[CategoryChoiceStatus] = mapped_column(
-        SqlEnum(CategoryChoiceStatus),
+        SqlEnum(
+            CategoryChoiceStatus,
+            name="category_choice_status",
+        ),
         default=CategoryChoiceStatus.PENDING,
         nullable=False,
         index=True,
