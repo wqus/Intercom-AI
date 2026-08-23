@@ -50,20 +50,30 @@ POSITIVE_LEXICAL_BONUS = 0.16
 REQUIRED_GROUP_BONUS = 0.08
 NEGATIVE_LEXICAL_PENALTY = 0.22
 CONFLICT_PENALTY = 0.16
+CONFLICT_COMPETITOR_MARGIN = 0.10
 GENERIC_RERANK_WEIGHT = 0.10
 
 # Decision thresholds. These are routing thresholds, NOT probabilities.
 # The score is deliberately bounded to [0, 1].
-AUTO_SCORE = 0.90
-AUTO_MARGIN = 0.12
-LLM_SCORE = 0.60
+# Calibrated for correct routing: high-confidence TEMPLATE, mid CATEGORY_CHOICE, else LLM/NO_MATCH.
+AUTO_SCORE = 0.86
+AUTO_MARGIN = 0.10
+LLM_SCORE = 0.57
 LLM_MARGIN = 0.035
-HIGH_SCORE_LOW_MARGIN = 0.90
+HIGH_SCORE_LOW_MARGIN = 0.82
 LEXICAL_EVIDENCE_MIN = 0.28
 SEMANTIC_GAP_FOR_LLM = 0.025
 MIN_REAL_INTENT_EVIDENCE = 0.34
 MIN_REAL_INTENT_FIT = 0.48
-MIN_TEMPLATE_EVIDENCE = 0.48
+MIN_TEMPLATE_EVIDENCE = 0.43
+
+# Strong-evidence TEMPLATE override (point 3/6): allows TEMPLATE below AUTO_SCORE
+# only when affirmative lexical/intent evidence is present.
+STRONG_EVIDENCE_TEMPLATE_SCORE = 0.70
+STRONG_EVIDENCE_TEMPLATE_MARGIN = 0.05
+STRONG_EVIDENCE_TEMPLATE_FIT = 0.60
+STRONG_EVIDENCE_TEMPLATE_FAMILY = 0.40
+STRONG_EVIDENCE_MIN_REAL = 0.42
 
 # Retrieval/ranking weights. Kept bounded and re-normalized when reranker is off.
 SEMANTIC_MAX_WEIGHT = 0.34
@@ -77,12 +87,12 @@ RRF_WEIGHT = 0.04
 RERANK_WEIGHT = 0.10
 
 # Safety thresholds for automatic actions.
-INTENT_FIT_TEMPLATE_MIN = 0.72
-INTENT_FIT_LLM_MIN = 0.45
+INTENT_FIT_TEMPLATE_MIN = 0.68
+INTENT_FIT_LLM_MIN = 0.42
 INTENT_FIT_HARD_MISMATCH = 0.25
 MIN_QUERY_QUALITY_TEMPLATE = 0.22
 MIN_QUERY_QUALITY_LLM = 0.20
-MIN_QUERY_QUALITY_CHOICE = 0.20
+MIN_QUERY_QUALITY_CHOICE = 0.18
 MIN_FAMILY_FIT_TEMPLATE = 0.35
 
 # User-facing fallback routing.
@@ -90,12 +100,14 @@ REPHRASE_SCORE_MAX = 0.50
 REPHRASE_INTENT_FIT_MAX = 0.25
 REPHRASE_QUERY_QUALITY_MAX = 0.50
 
-CATEGORY_CHOICE_MIN_SCORE = 0.68
-CATEGORY_CHOICE_MIN_INTENT_FIT = 0.55
-CATEGORY_CHOICE_MAX_MARGIN = 0.08
-CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.045
+# CATEGORY_CHOICE as a working middle mode (point 7).
+CATEGORY_CHOICE_MIN_SCORE = 0.52
+CATEGORY_CHOICE_MIN_INTENT_FIT = 0.40
+CATEGORY_CHOICE_MAX_MARGIN = 0.22
+CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.08
 CATEGORY_CHOICE_MAX_CANDIDATES = 3
 CATEGORY_CHOICE_MIN_CANDIDATES = 2
+CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.28
 
 # Fuzzy shortcut is intentionally very strict and additionally requires
 # semantic/intention agreement after the exact phrase match.
@@ -876,6 +888,62 @@ class KnowledgeBase:
             return "kb_016"
 
         # ----------------------------------------------------
+        # Account / phone verification (before generic "код").
+        # Narrow: SMS / confirmation code for phone number only.
+        # ----------------------------------------------------
+        phone_signal = has_any("телефон", "номер") or has_phrase(
+            "подтверждения номера", "подтвердить номер", "подтверждение номера",
+        )
+        sms_signal = has_any("смс", "sms") or has_phrase(
+            "не приходит смс", "смс с кодом", "смс код",
+        )
+        code_confirm = has_phrase(
+            "код на телефон",
+            "код подтверждения",
+            "не приходит код",
+            "код подтверждения номера",
+        )
+        facility_code_noise = has_any("калит", "домофон", "двер") or has_phrase(
+            "код калитки", "код двери", "код домофона",
+        )
+        invite_or_qr_noise = has_any("инвайт", "qr") or has_phrase("код приглашения")
+        # SMS + code in this product almost always means phone verification.
+        phone_verification = (
+            (phone_signal and (sms_signal or code_confirm or has_any("код")))
+            or (sms_signal and has_any("код"))
+            or (phone_signal and code_confirm)
+        )
+        if phone_verification and not facility_code_noise and not invite_or_qr_noise:
+            return "kb_027"
+
+        # Facility / gate / door code (physical entrance).
+        if (
+            has_any("калит", "домофон")
+            or (
+                has_any("код")
+                and has_any("двер", "вход")
+                and not has_any("инвайт", "qr", "приглаш", "смс", "sms", "телефон")
+            )
+            or has_phrase("код калитки", "код двери", "код домофона", "пароль от двери")
+        ):
+            if not has_any("инвайт", "qr", "смс", "sms") and not has_phrase("код приглашения"):
+                return "kb_019"
+
+        # No access to schools section in the app.
+        if (
+            (has_any("нет", "не") and has_any("доступ") and has_school())
+            or has_phrase(
+                "не вижу школы",
+                "не открываются школы",
+                "нет школ в приложении",
+                "нет доступа к школам",
+                "не вижу школы в приложении",
+                "закрыты школы",
+            )
+        ) and not has_any("инвайт", "qr", "запис", "смс", "телефон"):
+            return "kb_017"
+
+        # ----------------------------------------------------
         # Telegram / codes / QR.
         # ----------------------------------------------------
         if (has_any("инвайт") or has_phrase("код приглашения")) and not has_any("qr"):
@@ -1271,6 +1339,34 @@ class KnowledgeBase:
     def _candidate_has_direct_support(item: dict) -> bool:
         return bool(item.get("positive_hits") or float(item.get("lexical_score", 0.0)) >= 0.38 or float(item.get("fuzzy_phrase_score", 0.0)) >= 0.90 or float((item.get("required_evidence") or {}).get("coverage", 0.0)) >= 0.50)
 
+    @staticmethod
+    def _has_strong_affirmative_evidence(item: dict) -> bool:
+        """Decision-layer gate (points 3/6): ranking similarity is not enough.
+
+        TEMPLATE may only fire on strong affirmative evidence — direct phrase hit,
+        near-exact fuzzy match, or strong lexical + intent/family agreement.
+        """
+        positive = bool(item.get("positive_hits"))
+        fuzzy = float(item.get("fuzzy_phrase_score", 0.0))
+        lexical = float(item.get("lexical_score", 0.0))
+        intent = float(item.get("intent_fit_score", 0.0))
+        family = float(item.get("family_fit_score", 0.0))
+        real_ev = float(item.get("real_intent_evidence", 0.0))
+
+        if item.get("negative_hits") or (item.get("constraint_evidence") or {}).get("forbidden_hits"):
+            return False
+
+        # Direct positive phrase hit is the strongest signal.
+        if positive and intent >= 0.55 and family >= 0.30 and real_ev >= 0.36:
+            return True
+        # Near-duplicate wording.
+        if fuzzy >= 0.92 and intent >= 0.58 and family >= 0.35 and real_ev >= 0.38:
+            return True
+        # Strong lexical + intent contract, no contradiction.
+        if lexical >= 0.55 and intent >= 0.68 and family >= 0.45 and real_ev >= 0.42:
+            return True
+        return False
+
     def _rank_candidates(self, question: str, candidates: list[dict]) -> list[dict]:
         if not candidates:
             return []
@@ -1516,8 +1612,29 @@ class KnowledgeBase:
             "evidence_score": float(item.get("evidence_score", 0.0)),
         }
 
+    def _force_top_choice_candidates(self, ranked: list[dict], n: int = 3) -> list[dict]:
+        """TEMP: always take top-N ranked as choice candidates (no safety filters).
+        Used while LLM path is disabled.
+        """
+        if not ranked:
+            return []
+        top_score = float(ranked[0].get("final_score", 0.0))
+        second_score = float(ranked[1].get("final_score", 0.0)) if len(ranked) > 1 else 0.0
+        top_margin = top_score - second_score if len(ranked) > 1 else top_score
+        result: list[dict] = []
+        for item in ranked[:n]:
+            payload = self._choice_candidate_payload(item)
+            payload["margin"] = float(top_margin)
+            result.append(payload)
+        return result
+
     def _category_choice_candidates(self, ranked: list[dict]) -> list[dict]:
-        """Return only genuinely plausible, user-selectable alternatives."""
+        """Working middle mode (point 7): 2–3 plausible alternatives when TEMPLATE
+        is not safe enough but the query is not garbage.
+
+        Filters are intentionally milder than TEMPLATE gates. We still drop
+        contradicted candidates and pure noise.
+        """
         if not ranked:
             return []
 
@@ -1531,27 +1648,27 @@ class KnowledgeBase:
             return []
         if top_score < CATEGORY_CHOICE_MIN_SCORE:
             return []
+        # If margin is huge, top is already clear — prefer TEMPLATE/LLM, not choice.
         if top_margin > CATEGORY_CHOICE_MAX_MARGIN:
             return []
 
         eligible: list[dict] = []
-        for item in ranked[:CATEGORY_CHOICE_MAX_CANDIDATES]:
+        for item in ranked[: max(CATEGORY_CHOICE_MAX_CANDIDATES + 2, 5)]:
             score = float(item.get("final_score", 0.0))
             fit = float(item.get("intent_fit_score", 0.0))
-            family_fit = float(item.get("family_fit_score", 0.0))
             constraints = item.get("constraint_evidence", {}) or {}
 
             if score < CATEGORY_CHOICE_MIN_SCORE:
                 continue
             if fit < CATEGORY_CHOICE_MIN_INTENT_FIT:
                 continue
-            if float(item.get("real_intent_evidence", 0.0)) < MIN_REAL_INTENT_EVIDENCE:
+            if float(item.get("real_intent_evidence", 0.0)) < CATEGORY_CHOICE_MIN_REAL_EVIDENCE:
                 continue
             if item.get("negative_hits"):
                 continue
             if constraints.get("forbidden_hits"):
                 continue
-            if top_score - score > CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST * 2.0:
+            if top_score - score > CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST * 3.0:
                 continue
 
             payload = self._choice_candidate_payload(item)
@@ -1561,9 +1678,7 @@ class KnowledgeBase:
         if len(eligible) < CATEGORY_CHOICE_MIN_CANDIDATES:
             return []
 
-        # Avoid duplicate representations of the same intent type. Different
-        # intents inside one family (e.g. school registration vs education entry)
-        # are valid alternatives and must remain selectable.
+        # Prefer distinct intent types; keep different intents inside one family.
         unique: list[dict] = []
         seen_ids: set[str] = set()
         seen_intent_types: set[str] = set()
@@ -1926,8 +2041,9 @@ class KnowledgeBase:
                 and quality.score >= MIN_QUERY_QUALITY_LLM
                 and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM)
             ):
+                # TEMP: LLM disabled → top-3 categories instead
                 return MatchResult(
-                    MatchMode.LLM,
+                    MatchMode.CATEGORY_CHOICE,
                     top_score,
                     entry.get("category"),
                     None,
@@ -1942,8 +2058,10 @@ class KnowledgeBase:
                     family_fit_score=family_fit,
                     query_quality_score=quality.score,
                     subquestion=question,
-                    decision_reason="hard_intent_mismatch_requires_llm",
+                    decision_reason="temp_llm_disabled:hard_intent_mismatch_top3",
+                    choice_candidates=self._force_top_choice_candidates(ranked, 3),
                 )
+                # return MatchResult(MatchMode.LLM, ... decision_reason="hard_intent_mismatch_requires_llm")
             return MatchResult(
                 MatchMode.NO_MATCH,
                 top_score,
@@ -1973,8 +2091,9 @@ class KnowledgeBase:
                 and quality.score >= MIN_QUERY_QUALITY_LLM
                 and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM)
             ):
+                # TEMP: LLM disabled → top-3 categories instead
                 return MatchResult(
-                    MatchMode.LLM,
+                    MatchMode.CATEGORY_CHOICE,
                     top_score,
                     entry.get("category"),
                     None,
@@ -1989,8 +2108,10 @@ class KnowledgeBase:
                     family_fit_score=family_fit,
                     query_quality_score=quality.score,
                     subquestion=question,
-                    decision_reason="contradiction_requires_llm",
+                    decision_reason="temp_llm_disabled:contradiction_top3",
+                    choice_candidates=self._force_top_choice_candidates(ranked, 3),
                 )
+                # return MatchResult(MatchMode.LLM, ... decision_reason="contradiction_requires_llm")
             return MatchResult(
                 MatchMode.NO_MATCH,
                 top_score,
@@ -2009,8 +2130,22 @@ class KnowledgeBase:
                 decision_reason="contradiction",
             )
 
-        # TEMPLATE requires all safety gates, not just a high score.
-        if (
+        # ----------------------------------------------------
+        # TEMPLATE (points 3/6): high-confidence path OR strong affirmative evidence.
+        # Ranking score alone is never enough — need evidence + fit + margin safety.
+        # ----------------------------------------------------
+        strong_evidence = self._has_strong_affirmative_evidence(top)
+        competitor_ok = (
+            not second_is_known_conflict
+            or margin >= CONFLICT_COMPETITOR_MARGIN
+        )
+        second_fit_ok = (
+            not second
+            or float(second.get("intent_fit_score", 0.0)) <= intent_fit - 0.04
+            or margin >= AUTO_MARGIN
+        )
+
+        high_confidence_template = (
             quality.score >= MIN_QUERY_QUALITY_TEMPLATE
             and top_score >= AUTO_SCORE
             and margin >= AUTO_MARGIN
@@ -2018,16 +2153,25 @@ class KnowledgeBase:
             and family_fit >= MIN_FAMILY_FIT_TEMPLATE
             and real_evidence >= MIN_TEMPLATE_EVIDENCE
             and direct_support
-            and (
-                not second_is_known_conflict
-                or margin >= CONFLICT_COMPETITOR_MARGIN
-            )
-            and (
-                not second
-                or float(second.get("intent_fit_score", 0.0)) <= intent_fit - 0.05
-                or margin >= AUTO_MARGIN
-            )
-        ):
+            and competitor_ok
+            and second_fit_ok
+        )
+
+        # Override: slightly lower score is OK only with strong affirmative evidence.
+        strong_evidence_template = (
+            strong_evidence
+            and quality.score >= MIN_QUERY_QUALITY_TEMPLATE
+            and top_score >= STRONG_EVIDENCE_TEMPLATE_SCORE
+            and margin >= STRONG_EVIDENCE_TEMPLATE_MARGIN
+            and intent_fit >= STRONG_EVIDENCE_TEMPLATE_FIT
+            and family_fit >= STRONG_EVIDENCE_TEMPLATE_FAMILY
+            and real_evidence >= STRONG_EVIDENCE_MIN_REAL
+            and direct_support
+            and competitor_ok
+            and not contradiction
+        )
+
+        if high_confidence_template or strong_evidence_template:
             return MatchResult(
                 MatchMode.TEMPLATE,
                 top_score,
@@ -2044,11 +2188,43 @@ class KnowledgeBase:
                 family_fit_score=family_fit,
                 query_quality_score=quality.score,
                 subquestion=question,
-                decision_reason="high_confidence_template",
+                decision_reason=(
+                    "high_confidence_template"
+                    if high_confidence_template
+                    else "strong_evidence_template"
+                ),
             )
 
-        # LLM is allowed only when the query itself is meaningful and the
-        # candidate has a minimally plausible intent contract.
+        # ----------------------------------------------------
+        # CATEGORY_CHOICE middle mode (point 7): before LLM.
+        # When TEMPLATE is not safe but 2–3 sensible alternatives exist.
+        # ----------------------------------------------------
+        choice_candidates = self._category_choice_candidates(ranked)
+        if len(choice_candidates) >= CATEGORY_CHOICE_MIN_CANDIDATES:
+            return MatchResult(
+                MatchMode.CATEGORY_CHOICE,
+                top_score,
+                entry.get("category"),
+                None,
+                entry.get("id"),
+                relevant_entries,
+                entry=entry,
+                second_score=second_score,
+                margin=margin,
+                embedding_score=float(top["embedding_score"]),
+                intent_fit_score=intent_fit,
+                intent_fit_reason=intent_fit_reason,
+                family_fit_score=family_fit,
+                query_quality_score=quality.score,
+                subquestion=question,
+                decision_reason="category_choice_middle_mode",
+                choice_candidates=choice_candidates,
+            )
+
+        # ----------------------------------------------------
+        # TEMP: LLM disabled — send top-3 categories instead.
+        # Original LLM path kept below as comment for easy restore.
+        # ----------------------------------------------------
         llm_eligible = (
             quality.score >= MIN_QUERY_QUALITY_LLM
             and top_score >= LLM_SCORE
@@ -2073,7 +2249,7 @@ class KnowledgeBase:
         )
         if llm_eligible:
             return MatchResult(
-                MatchMode.LLM,
+                MatchMode.CATEGORY_CHOICE,
                 top_score,
                 entry.get("category"),
                 None,
@@ -2088,11 +2264,29 @@ class KnowledgeBase:
                 family_fit_score=family_fit,
                 query_quality_score=quality.score,
                 subquestion=question,
-                decision_reason="ambiguous_or_requires_llm",
+                decision_reason="temp_llm_disabled:ambiguous_top3",
+                choice_candidates=self._force_top_choice_candidates(ranked, 3),
             )
+            # return MatchResult(
+            #     MatchMode.LLM,
+            #     top_score,
+            #     entry.get("category"),
+            #     None,
+            #     entry.get("id"),
+            #     relevant_entries,
+            #     entry=entry,
+            #     second_score=second_score,
+            #     margin=margin,
+            #     embedding_score=float(top["embedding_score"]),
+            #     intent_fit_score=intent_fit,
+            #     intent_fit_reason=intent_fit_reason,
+            #     family_fit_score=family_fit,
+            #     query_quality_score=quality.score,
+            #     subquestion=question,
+            #     decision_reason="ambiguous_or_requires_llm",
+            # )
 
-        # Everything else is unresolved. The orchestrator decides whether to
-        # offer CATEGORY_CHOICE, request REPHRASE, or escalate.
+        # Unresolved: orchestrator may REPHRASE / escalate.
         return MatchResult(
             MatchMode.NO_MATCH,
             top_score,
@@ -2109,7 +2303,7 @@ class KnowledgeBase:
             query_quality_score=quality.score,
             subquestion=question,
             decision_reason="insufficient_confidence",
-            choice_candidates=self._category_choice_candidates(ranked),
+            choice_candidates=choice_candidates or None,
         )
 
     # --------------------------------------------------------
@@ -2221,11 +2415,19 @@ class KnowledgeBase:
             return False
 
         left_confident = (
-            left.mode in (MatchMode.TEMPLATE, MatchMode.CLARIFICATION)
+            left.mode in (
+                MatchMode.TEMPLATE,
+                MatchMode.CLARIFICATION,
+                MatchMode.CATEGORY_CHOICE,
+            )
             or (left.mode == MatchMode.LLM and left.score >= LLM_SCORE)
         )
         right_confident = (
-            right.mode in (MatchMode.TEMPLATE, MatchMode.CLARIFICATION)
+            right.mode in (
+                MatchMode.TEMPLATE,
+                MatchMode.CLARIFICATION,
+                MatchMode.CATEGORY_CHOICE,
+            )
             or (right.mode == MatchMode.LLM and right.score >= LLM_SCORE)
         )
         if not (left_confident and right_confident):
