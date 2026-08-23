@@ -59,7 +59,7 @@ async def create_category_choice(
     )
     session.add(state)
     await session.flush()
-    return statew
+    return state
 
 
 async def increment_attempts(
