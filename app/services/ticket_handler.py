@@ -10,6 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.request import EscalationReason, RequestResult, RequestType
 from app.repositories.pending_clarification_repo import save_pending_clarification
+from app.repositories.rephrase_state_repo import get_rephrase_state, register_failure, clear_rephrase_state
+from app.repositories.category_choice_repo import (
+    get_pending_category_choice,
+    create_category_choice,
+    increment_attempts as increment_choice_attempts,
+    resolve_category_choice,
+    cancel_category_choice,
+)
 from app.repositories.request_repository import RequestRepository
 from app.services.clarification_handler import handle_clarification_response
 from app.services.escalation import escalate_to_operator
@@ -22,8 +30,207 @@ from app.services.knowledge_base import (
 )
 from app.services.llm_client import YandexLLMClient
 from app.services.message_filter import is_non_query_message
+from app.services.conversation_state_orchestrator import (
+    MAX_REPHRASE_FAILURES,
+    MAX_CATEGORY_CHOICE_ATTEMPTS,
+    candidate_ids_from_state,
+    selected_candidate_ids_from_text,
+)
 
 logger = logging.getLogger("ticket_handler")
+
+
+async def _send_rephrase_prompt(
+    send_reply: Callable[[str], Awaitable[None]],
+) -> None:
+    await send_reply(
+        "Не удалось точно понять ваш вопрос. "
+        "Пожалуйста, переформулируйте его немного подробнее."
+    )
+
+
+async def _start_or_continue_rephrase(
+    *,
+    session: AsyncSession,
+    conversation_id: str,
+    question: str,
+    send_reply: Callable[[str], Awaitable[None]],
+    escalate: Callable[..., Awaitable[None]],
+) -> bool:
+    """Return True when the request is fully handled by the REPHRASE flow."""
+    state = await register_failure(
+        session=session,
+        conversation_id=conversation_id,
+        original_question=question,
+    )
+
+    if state.attempts >= MAX_REPHRASE_FAILURES:
+        await clear_rephrase_state(session, conversation_id)
+        await escalate(
+            EscalationReason.NO_CATEGORY,
+            question_text=question,
+        )
+        return True
+
+    await _send_rephrase_prompt(send_reply)
+    return True
+
+
+async def _handle_pending_category_choice(
+    *,
+    session: AsyncSession,
+    conversation_id: str,
+    question: str,
+    knowledge_base: KnowledgeBase,
+    send_reply: Callable[[str], Awaitable[None]],
+    llm_client: YandexLLMClient,
+    repository: RequestRepository,
+    save_result: Callable[..., Awaitable[None]],
+    escalate: Callable[..., Awaitable[None]],
+) -> bool:
+    """Consume an active CATEGORY_CHOICE state before ordinary classification."""
+    state = await get_pending_category_choice(session, conversation_id)
+    if state is None:
+        return False
+
+    candidate_ids = candidate_ids_from_state(state)
+    selected_ids = selected_candidate_ids_from_text(
+        knowledge_base,
+        state,
+        question,
+    )
+
+    if not selected_ids:
+        attempts = await increment_choice_attempts(session, state)
+        if attempts >= MAX_CATEGORY_CHOICE_ATTEMPTS:
+            await cancel_category_choice(session, state)
+            await escalate(
+                EscalationReason.NO_CATEGORY,
+                question_text=question,
+            )
+            return True
+
+        await send_reply(
+            f"Пожалуйста, выберите номер одного или нескольких вариантов: "
+            f"{', '.join(str(i) for i in range(1, len(candidate_ids) + 1))}."
+        )
+        return True
+
+    await resolve_category_choice(session, state, selected_ids)
+
+    answers: list[str] = []
+    categories: list[str] = []
+
+    for kb_id in selected_ids:
+        entry = knowledge_base.get_by_id(kb_id)
+        if entry is None:
+            logger.error(
+                "CATEGORY_CHOICE references missing KB id | conv=%s | kb_id=%s",
+                conversation_id,
+                kb_id,
+            )
+            await escalate(
+                EscalationReason.INTERNAL_ERROR,
+                question_text=state.question,
+            )
+            return True
+
+        if entry.get("requires_clarification"):
+            # Existing stateful clarification is one-at-a-time.
+            if len(selected_ids) != 1:
+                await escalate(
+                    EscalationReason.LLM_CANNOT_ANSWER,
+                    category=entry.get("category"),
+                    question_text=state.question,
+                )
+                return True
+
+            clarification = entry.get("clarification_question")
+            if not clarification:
+                await escalate(
+                    EscalationReason.INTERNAL_ERROR,
+                    category=entry.get("category"),
+                    question_text=state.question,
+                )
+                return True
+
+            await send_reply(clarification)
+            await save_pending_clarification(
+                session=session,
+                conversation_id=conversation_id,
+                category_id=kb_id,
+            )
+            await save_result(
+                RequestResult.TEMPLATE,
+                category=entry.get("category"),
+                answer=clarification,
+                question_text=state.question,
+            )
+            return True
+
+        answer = entry.get("template_answer")
+        if not answer:
+            # A selected category should still be answerable. Give the
+            # constrained LLM a single-category decision context.
+            result = await llm_client.classify(
+                question=state.question,
+                relevant_entries=[knowledge_base._clean_entry_for_llm(entry)],
+            )
+            if not result.can_answer or not result.answer:
+                await escalate(
+                    EscalationReason.LLM_CANNOT_ANSWER,
+                    category=entry.get("category"),
+                    question_text=state.question,
+                )
+                return True
+            answer = result.answer
+
+        answers.append(answer)
+        if entry.get("category"):
+            categories.append(str(entry["category"]))
+
+    response = "\n\n".join(answers)
+    await send_reply(response)
+    await save_result(
+        RequestResult.TEMPLATE,
+        category="multiple" if len(categories) > 1 else (categories[0] if categories else None),
+        answer=response,
+        question_text=state.question,
+    )
+    return True
+
+
+async def _maybe_start_category_choice(
+    *,
+    session: AsyncSession,
+    conversation_id: str,
+    question: str,
+    knowledge_base: KnowledgeBase,
+    send_reply: Callable[[str], Awaitable[None]],
+    save_result: Callable[..., Awaitable[None]],
+) -> bool:
+    candidates = knowledge_base.get_category_choice_candidates(question)
+    if len(candidates) < 2:
+        return False
+
+    candidate_ids = [str(candidate["kb_id"]) for candidate in candidates]
+    await create_category_choice(
+        session=session,
+        conversation_id=conversation_id,
+        question=question,
+        candidate_ids=candidate_ids,
+    )
+
+    await send_reply(
+        knowledge_base.format_category_choice(candidates)
+    )
+    await save_result(
+        RequestResult.TEMPLATE,
+        category="category_choice",
+        answer=knowledge_base.format_category_choice(candidates),
+        question_text=question,
+    )
+    return True
 
 
 async def handle_new_ticket(
@@ -112,7 +319,22 @@ async def handle_new_ticket(
             await escalate(EscalationReason.USER_REQUESTED_OPERATOR)
             return
 
-        # Existing intent-specific clarification is intentionally checked first.
+        # A pending CATEGORY_CHOICE is a strict conversational state:
+        # numeric selection is expected instead of ordinary classification.
+        if await _handle_pending_category_choice(
+            session=session,
+            conversation_id=conversation_id,
+            question=question,
+            knowledge_base=knowledge_base,
+            send_reply=send_reply,
+            llm_client=llm_client,
+            repository=repository,
+            save_result=save_result,
+            escalate=escalate,
+        ):
+            return
+
+        # Existing intent-specific clarification remains a separate state.
         if await handle_clarification_response(
             session=session,
             conversation_id=conversation_id,
@@ -223,7 +445,26 @@ async def _execute_match(
         return
 
     if match.mode == MatchMode.NO_MATCH:
-        # Current policy: unresolved single question escalates.
+        if await _maybe_start_category_choice(
+            session=session,
+            conversation_id=conversation_id,
+            question=question_for_result,
+            knowledge_base=knowledge_base,
+            send_reply=send_reply,
+            save_result=save_result,
+        ):
+            return
+
+        if knowledge_base.is_rephrase_candidate(match):
+            await _start_or_continue_rephrase(
+                session=session,
+                conversation_id=conversation_id,
+                question=question_for_result,
+                send_reply=send_reply,
+                escalate=escalate,
+            )
+            return
+
         await escalate(
             EscalationReason.NO_CATEGORY,
             category=match.category,
@@ -424,6 +665,28 @@ async def _execute_llm(
         )
         return
 
+    # LLM could not safely answer. Give the user a choice if retrieval
+    # still found multiple sufficiently strong candidates.
+    if await _maybe_start_category_choice(
+        session=session,
+        conversation_id=conversation_id,
+        question=question,
+        knowledge_base=knowledge_base,
+        send_reply=send_reply,
+        save_result=save_result,
+    ):
+        return
+
+    if knowledge_base.is_rephrase_candidate(match):
+        await _start_or_continue_rephrase(
+            session=session,
+            conversation_id=conversation_id,
+            question=question,
+            send_reply=send_reply,
+            escalate=escalate,
+        )
+        return
+
     await escalate(
         EscalationReason.LLM_CANNOT_ANSWER,
         category=match.category,
@@ -613,17 +876,58 @@ async def _execute_multiple_matches(
         )
 
     if unresolved:
-        # No rephrase/top-k stage yet: escalate the unresolved subquestion(s)
-        # individually rather than discarding successful answers.
-        unique = []
-        seen = set()
+        unique: list[tuple[str, str | None, MatchResult]] = []
+        seen: set[str] = set()
         for item in unresolved:
             text = item.subquestion or original_question
             if text not in seen:
-                unique.append((text, item.category))
+                unique.append((text, item.category, item))
                 seen.add(text)
 
-        for text, category in unique:
+        # Handle one unresolved subquestion at a time. This keeps the
+        # conversational state unambiguous.
+        for text, category, item in unique:
+            if await _maybe_start_category_choice(
+                session=session,
+                conversation_id=conversation_id,
+                question=text,
+                knowledge_base=knowledge_base,
+                send_reply=send_reply,
+                save_result=save_result,
+            ):
+                if resolved_answers:
+                    await send_reply("\n\n".join(x[0] for x in resolved_answers))
+                return
+
+            if knowledge_base.is_rephrase_candidate(item):
+                if resolved_answers:
+                    await send_reply(
+                        "\n\n".join(x[0] for x in resolved_answers)
+                        + "\n\nНе удалось точно понять ещё один вопрос. "
+                        "Пожалуйста, переформулируйте его подробнее."
+                    )
+                    await save_result(
+                        RequestResult.TEMPLATE,
+                        category="multiple",
+                        answer="\n\n".join(x[0] for x in resolved_answers),
+                        question_text=original_question,
+                    )
+                    await register_failure(
+                        session=session,
+                        conversation_id=conversation_id,
+                        original_question=text,
+                    )
+                    return
+
+                await _start_or_continue_rephrase(
+                    session=session,
+                    conversation_id=conversation_id,
+                    question=text,
+                    send_reply=send_reply,
+                    escalate=escalate,
+                )
+                return
+
             await escalate(
                 EscalationReason.NO_CATEGORY,
                 category=category,

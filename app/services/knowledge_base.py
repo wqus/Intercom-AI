@@ -75,6 +75,18 @@ INTENT_FIT_TEMPLATE_MIN = 0.55
 INTENT_FIT_LLM_MIN = 0.28
 INTENT_FIT_HARD_MISMATCH = 0.18
 
+# User-facing fallback routing.
+# These are intentionally conservative. They are routing thresholds, not
+# probabilities, and will later be calibrated on real production data.
+REPHRASE_SCORE_MAX = 0.50
+REPHRASE_INTENT_FIT_MAX = 0.18
+
+CATEGORY_CHOICE_MIN_SCORE = 0.62
+CATEGORY_CHOICE_MIN_INTENT_FIT = 0.40
+CATEGORY_CHOICE_MAX_MARGIN = 0.075
+CATEGORY_CHOICE_MAX_CANDIDATES = 3
+CATEGORY_CHOICE_MIN_CANDIDATES = 2
+
 # Hard rejection for unusable input.
 MIN_MEANINGFUL_CHARS = 3
 MIN_ALNUM_RATIO = 0.45
@@ -90,8 +102,8 @@ OPERATOR_HINT = (
 
 # Words that MUST preserve meaning in support intents.
 STOP_WORDS = {
-    "могу", "как", "что", "это", "мне", "у", "меня", "мой", "моя", "мое", "моё",
-    "можно", "нужно", "надо", "есть", "был", "была", "буду", "вы", "я", "он", "она",
+    "что", "это", "у", "меня", "мой", "моя", "мое", "моё",
+    "нужно", "надо", "вы", "я", "он", "она",
     "пожалуйста", "помогите", "скажите", "подскажите", "ли", "а", "и", "же", "бы", "быть",
     # Deliberately NOT removing: не, нет, нельзя, уже, только, без, еще/ещё.
 }
@@ -165,6 +177,8 @@ class MatchMode(str, Enum):
     LLM = "llm"
     OPERATOR = "operator"
     CLARIFICATION = "clarification"
+    CATEGORY_CHOICE = "category_choice"
+    REPHRASE = "rephrase"
 
 
 @dataclass(slots=True)
@@ -184,6 +198,7 @@ class MatchResult:
     intent_fit_reason: str = ""
     subquestion: str | None = None
     decision_reason: str = ""
+    choice_candidates: list[dict] | None = None
 
 
 # ============================================================
@@ -351,7 +366,8 @@ class KnowledgeBase:
       2. Hybrid candidate generation: lexical BM25 + E5 embeddings.
       3. Per-intent evidence: positive phrases, negative phrases, constraints.
       4. Optional generic CrossEncoder as a *small* ranking feature only.
-      5. Abstention: TEMPLATE / LLM / CLARIFICATION / UNKNOWN.
+      5. Intent-fit safety layer and routing.
+      6. Future user-state helpers: CATEGORY_CHOICE / REPHRASE.
 
     Important: E5 cosine and generic CrossEncoder scores are ranking features,
     not probabilities. The classifier therefore relies heavily on relative
@@ -432,6 +448,10 @@ class KnowledgeBase:
             entry["id"] = entry_id
             entry["family"] = entry.get("family") or FAMILIES.get(entry_id, "other")
             entry["priority"] = int(entry.get("priority") or 0)
+            entry["choice_label"] = (
+                str(entry.get("choice_label") or "").strip()
+                or str(entry.get("category") or entry_id).strip()
+            )
             entry["constraints"] = entry.get("constraints") if isinstance(entry.get("constraints"), dict) else {}
 
             # Keep the original phrases as the canonical retrieval examples.
@@ -460,6 +480,8 @@ class KnowledgeBase:
         """Fail fast on KB structure errors that would make ranking unreliable."""
         known_ids = set(self.entries_by_id)
         for entry in self.entries:
+            if not isinstance(entry.get("choice_label"), str) or not entry["choice_label"].strip():
+                raise ValueError(f"KB {entry['id']}: choice_label must be a non-empty string")
             for field in ("positive_examples", "negative_phrases", "required_phrases"):
                 values = entry.get(field, [])
                 if not all(isinstance(x, str) and x.strip() for x in values):
@@ -1133,7 +1155,8 @@ class KnowledgeBase:
             "id", "category", "family", "definition", "match_phrases", "positive_examples",
             "negative_phrases", "required_phrases", "constraints", "priority", "scope",
             "when_to_use", "when_not_to_use", "confused_with", "requires_clarification",
-            "clarification_question", "template_answer", "description", "hard_negative_examples", "intent_type", "intent_facets", "intent_signals",
+            "clarification_question", "template_answer", "description", "hard_negative_examples",
+            "intent_type", "intent_facets", "intent_signals", "choice_label",
         }
         return {k: v for k, v in entry.items() if k in allowed}
 
@@ -1162,10 +1185,172 @@ class KnowledgeBase:
                 "_constraint_evidence": item["constraint_evidence"],
                 "_intent_type": item["entry"].get("intent_type"),
                 "_intent_facets": item["entry"].get("intent_facets", []),
-
+                "_choice_label": item["entry"].get("choice_label"),
             })
             result.append(clean)
         return result
+
+    # --------------------------------------------------------
+    # USER-FACING FALLBACK CANDIDATES
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _choice_candidate_payload(item: dict) -> dict:
+        entry = item["entry"]
+        return {
+            "kb_id": str(entry["id"]),
+            "choice_label": str(entry.get("choice_label") or entry.get("category") or entry["id"]),
+            "category": str(entry.get("category") or ""),
+            "score": float(item.get("final_score", 0.0)),
+            "ranking_score": float(item.get("ranking_score", item.get("final_score", 0.0))),
+            "second_score": 0.0,
+            "margin": 0.0,
+            "embedding_score": float(item.get("embedding_score", 0.0)),
+            "intent_fit_score": float(item.get("intent_fit_score", 0.0)),
+            "intent_fit_reason": str(item.get("intent_fit_reason", "")),
+        }
+
+    def _category_choice_candidates(self, ranked: list[dict]) -> list[dict]:
+        """Return only candidates strong enough to be shown to a user.
+
+        A candidate is eligible only when:
+        - it has enough overall evidence;
+        - its intent contract is not obviously incompatible;
+        - it has no direct negative/forbidden evidence;
+        - it is among the top candidates.
+        """
+        if not ranked:
+            return []
+
+        top = ranked[0]
+        top_score = float(top.get("final_score", 0.0))
+        top_fit = float(top.get("intent_fit_score", 0.0))
+        second_score = float(ranked[1].get("final_score", 0.0)) if len(ranked) > 1 else 0.0
+        top_margin = top_score - second_score if len(ranked) > 1 else top_score
+
+        eligible: list[dict] = []
+        for item in ranked[:CATEGORY_CHOICE_MAX_CANDIDATES]:
+            score = float(item.get("final_score", 0.0))
+            fit = float(item.get("intent_fit_score", 0.0))
+            constraints = item.get("constraint_evidence", {}) or {}
+
+            if score < CATEGORY_CHOICE_MIN_SCORE:
+                continue
+            if fit < CATEGORY_CHOICE_MIN_INTENT_FIT:
+                continue
+            if item.get("negative_hits"):
+                continue
+            if constraints.get("forbidden_hits"):
+                continue
+
+            payload = self._choice_candidate_payload(item)
+            payload["margin"] = float(top_margin)
+            eligible.append(payload)
+
+        # User choice is useful only when there is real ambiguity. Two candidates
+        # should be close enough that selecting one is meaningful.
+        if len(eligible) < CATEGORY_CHOICE_MIN_CANDIDATES:
+            return []
+        if top_margin > CATEGORY_CHOICE_MAX_MARGIN:
+            return []
+
+        # Avoid displaying several candidates that are effectively the same KB
+        # intent/family due to retrieval noise.
+        unique: list[dict] = []
+        seen_ids: set[str] = set()
+        for candidate in eligible:
+            kb_id = candidate["kb_id"]
+            if kb_id not in seen_ids:
+                unique.append(candidate)
+                seen_ids.add(kb_id)
+
+        return unique[:CATEGORY_CHOICE_MAX_CANDIDATES]
+
+    def get_category_choice_candidates(
+        self,
+        question: str,
+        top_n: int = CATEGORY_CHOICE_MAX_CANDIDATES,
+    ) -> list[dict]:
+        """Get safe candidates for the future CATEGORY_CHOICE conversation state.
+
+        This method does not change the normal match() routing yet. It is a
+        pure decision helper used by the orchestration/state layer.
+        """
+        if top_n < CATEGORY_CHOICE_MIN_CANDIDATES:
+            raise ValueError("top_n must be at least 2")
+
+        candidates = self._retrieve_candidates(
+            question,
+            max(RETRIEVAL_TOP_K, top_n),
+        )
+        ranked = self._rank_candidates(question, candidates)
+        eligible = self._category_choice_candidates(ranked)
+        return eligible[:top_n]
+
+    @staticmethod
+    def format_category_choice(
+        candidates: list[dict],
+        *,
+        intro: str = (
+            "Если среди представленных ниже вариантов есть тот, "
+            "который относится к вашему вопросу, напишите его номер:"
+        ),
+    ) -> str:
+        """Render a user-facing category choice message.
+
+        Only presentation labels are used here. KB IDs/scores stay internal.
+        """
+        if not candidates:
+            raise ValueError("At least one candidate is required")
+
+        lines = [intro, ""]
+        for index, candidate in enumerate(candidates, start=1):
+            lines.append(f"{index}. {candidate['choice_label']}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def parse_category_choice(
+        text: str,
+        *,
+        max_index: int,
+    ) -> list[int]:
+        """Parse one or several numeric choices: '1', '1,3', '1 и 3', etc.
+
+        Returns unique indices in the order supplied by the user.
+        This parser is intentionally strict and should run only while a
+        CATEGORY_CHOICE state is pending.
+        """
+        if max_index < 1:
+            raise ValueError("max_index must be positive")
+
+        normalized = normalize_light(text)
+        normalized = re.sub(r"\b(?:мне нужны|мне нужен|нужны|нужен|выбираю|беру|варианты?)\b", " ", normalized)
+        normalized = normalized.replace("и", ",")
+        raw_numbers = re.findall(r"\d+", normalized)
+
+        if not raw_numbers:
+            return []
+
+        values: list[int] = []
+        for raw in raw_numbers:
+            value = int(raw)
+            if value < 1 or value > max_index:
+                return []
+            if value not in values:
+                values.append(value)
+
+        return values
+
+    @staticmethod
+    def is_rephrase_candidate(result: MatchResult) -> bool:
+        """Whether a result is weak enough for the future REPHRASE state."""
+        return (
+            result.mode == MatchMode.NO_MATCH
+            and (
+                result.score < REPHRASE_SCORE_MAX
+                or result.intent_fit_score <= REPHRASE_INTENT_FIT_MAX
+            )
+        )
 
     # --------------------------------------------------------
     # MAIN MATCH
@@ -1417,6 +1602,7 @@ class KnowledgeBase:
                     "intent_fit_score": x.get("intent_fit_score", 0.0),
                     "intent_fit_reason": x.get("intent_fit_reason", ""),
                     "ranking_score": x.get("ranking_score", x["final_score"]),
+                    "choice_label": x["entry"].get("choice_label"),
                 }
                 for x in ranked
             ],
