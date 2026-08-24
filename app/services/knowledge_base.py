@@ -58,22 +58,22 @@ GENERIC_RERANK_WEIGHT = 0.10
 # Calibrated for correct routing: high-confidence TEMPLATE, mid CATEGORY_CHOICE, else LLM/NO_MATCH.
 AUTO_SCORE = 0.86
 AUTO_MARGIN = 0.10
-LLM_SCORE = 0.57
+LLM_SCORE = 0.55
 LLM_MARGIN = 0.035
 HIGH_SCORE_LOW_MARGIN = 0.82
 LEXICAL_EVIDENCE_MIN = 0.28
 SEMANTIC_GAP_FOR_LLM = 0.025
-MIN_REAL_INTENT_EVIDENCE = 0.34
+MIN_REAL_INTENT_EVIDENCE = 0.38
 MIN_REAL_INTENT_FIT = 0.48
-MIN_TEMPLATE_EVIDENCE = 0.43
+MIN_TEMPLATE_EVIDENCE = 0.46
 
 # Strong-evidence TEMPLATE override (point 3/6): allows TEMPLATE below AUTO_SCORE
 # only when affirmative lexical/intent evidence is present.
-STRONG_EVIDENCE_TEMPLATE_SCORE = 0.70
+STRONG_EVIDENCE_TEMPLATE_SCORE = 0.74
 STRONG_EVIDENCE_TEMPLATE_MARGIN = 0.05
-STRONG_EVIDENCE_TEMPLATE_FIT = 0.60
-STRONG_EVIDENCE_TEMPLATE_FAMILY = 0.40
-STRONG_EVIDENCE_MIN_REAL = 0.42
+STRONG_EVIDENCE_TEMPLATE_FIT = 0.65
+STRONG_EVIDENCE_TEMPLATE_FAMILY = 0.41
+STRONG_EVIDENCE_MIN_REAL = 0.46
 
 # Retrieval/ranking weights. Kept bounded and re-normalized when reranker is off.
 SEMANTIC_MAX_WEIGHT = 0.34
@@ -87,7 +87,7 @@ RRF_WEIGHT = 0.04
 RERANK_WEIGHT = 0.10
 
 # Safety thresholds for automatic actions.
-INTENT_FIT_TEMPLATE_MIN = 0.68
+INTENT_FIT_TEMPLATE_MIN = 0.65
 INTENT_FIT_LLM_MIN = 0.42
 INTENT_FIT_HARD_MISMATCH = 0.25
 MIN_QUERY_QUALITY_TEMPLATE = 0.22
@@ -101,17 +101,19 @@ REPHRASE_INTENT_FIT_MAX = 0.25
 REPHRASE_QUERY_QUALITY_MAX = 0.50
 
 # CATEGORY_CHOICE as a working middle mode (point 7).
-CATEGORY_CHOICE_MIN_SCORE = 0.52
-CATEGORY_CHOICE_MIN_INTENT_FIT = 0.40
-CATEGORY_CHOICE_MAX_MARGIN = 0.22
-CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.08
+# Only when 2+ candidates have real support — never as a mask for "no category".
+CATEGORY_CHOICE_MIN_SCORE = 0.62
+CATEGORY_CHOICE_MIN_INTENT_FIT = 0.55
+CATEGORY_CHOICE_MAX_MARGIN = 0.12
+CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.06
 CATEGORY_CHOICE_MAX_CANDIDATES = 3
 CATEGORY_CHOICE_MIN_CANDIDATES = 2
-CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.28
+CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.40
+CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT = True
 
 # Fuzzy shortcut is intentionally very strict and additionally requires
 # semantic/intention agreement after the exact phrase match.
-FUZZY_AUTO_MIN = 97.0
+FUZZY_AUTO_MIN = 98.0
 FUZZY_AUTO_MARGIN = 10.0
 
 # Hard rejection for unusable input.
@@ -444,6 +446,41 @@ def _query_quality(text: str, domain_terms: set[str] | None = None) -> QueryQual
     )
 
 
+# Pure greetings / politeness — never a standalone intent.
+_GREETING_ONLY_RE = re.compile(
+    r"^(?:"
+    r"добрый\s+(?:день|вечер|утро)|доброй\s+ночи|доброго\s+дня|"
+    r"здравствуйте|здравствуй|привет(?:ик)?|хай|здорово|"
+    r"hello|hi|good\s+(?:morning|afternoon|evening)|"
+    r"спасибо|благодарю|пожалуйста"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_greeting_only(text: str) -> bool:
+    """True for standalone greetings like 'Добрый день!' with no real question."""
+    q = normalize_light(text)
+    if not q:
+        return True
+    if _GREETING_ONLY_RE.match(q):
+        return True
+    tokens = tokenize(q)
+    # Extremely short politeness with no domain signal.
+    if len(tokens) <= 2 and not any(
+        t.startswith((
+            "школ", "запис", "поток", "настав", "код", "чат", "оплат",
+            "прилож", "смс", "телефон", "обуч", "аккаунт",
+        ))
+        for t in tokens
+    ):
+        if any(t.startswith((
+            "добр", "здравств", "привет", "спасиб", "благодар",
+        )) for t in tokens):
+            return True
+    return False
+
+
 def _split_structural_questions(text: str) -> list[str]:
     chunks = re.split(r"(?:\?+|!+|\n+)", (text or "").strip())
     result: list[str] = []
@@ -456,8 +493,14 @@ def _split_structural_questions(text: str) -> list[str]:
             item = re.sub(r"^(?:и|а|также)\s+", "", item, flags=re.IGNORECASE)
             if item:
                 result.append(item)
-    meaningful = [x for x in result if len(tokenize(x)) >= 2]
-    return meaningful[:MAX_SUBQUESTIONS] if len(meaningful) > 1 else [text]
+    # Drop pure greetings so "Добрый день! Как записаться..." stays one intent.
+    meaningful = [
+        x for x in result
+        if len(tokenize(x)) >= 2 and not _is_greeting_only(x)
+    ]
+    return meaningful[:MAX_SUBQUESTIONS] if len(meaningful) > 1 else (
+        meaningful if meaningful else [text]
+    )
 
 
 def _split_conjunctive_question(text: str) -> list[str]:
@@ -492,11 +535,20 @@ def split_user_questions(text: str, max_questions: int = MAX_SUBQUESTIONS) -> li
 
     Conjunctions are validated later against actual intent predictions, so a
     normal single intent containing "и" is not accidentally fragmented.
+    Pure greetings are never treated as separate questions.
     """
+    text = (text or "").strip()
+    if not text:
+        return [text]
+
     structural = _split_structural_questions(text)
+    structural = [s for s in structural if not _is_greeting_only(s)]
     if len(structural) > 1:
         return structural[:max_questions]
-    return [text.strip()]
+    if len(structural) == 1:
+        return structural
+    # Everything was greeting-only — keep original for quality gate.
+    return [text]
 
 
 # ============================================================
@@ -1657,12 +1709,18 @@ class KnowledgeBase:
             score = float(item.get("final_score", 0.0))
             fit = float(item.get("intent_fit_score", 0.0))
             constraints = item.get("constraint_evidence", {}) or {}
+            reason = str(item.get("intent_fit_reason", ""))
 
             if score < CATEGORY_CHOICE_MIN_SCORE:
                 continue
             if fit < CATEGORY_CHOICE_MIN_INTENT_FIT:
                 continue
             if float(item.get("real_intent_evidence", 0.0)) < CATEGORY_CHOICE_MIN_REAL_EVIDENCE:
+                continue
+            # Do not offer categories that only matched via weak facet overlap.
+            if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not item.get("direct_support"):
+                continue
+            if reason.startswith("facet_overlap") and not item.get("positive_hits"):
                 continue
             if item.get("negative_hits"):
                 continue
@@ -1999,10 +2057,28 @@ class KnowledgeBase:
         )
 
         # Similarity alone can never establish that a real supported intent exists.
+        # Weak facet-only fit without phrase/lexical support = no real category match.
+        weak_facet_only = (
+            str(intent_fit_reason).startswith("facet_overlap")
+            and not top.get("positive_hits")
+            and float(top.get("fuzzy_phrase_score", 0.0)) < 0.90
+        )
         unsupported_intent = (
-            real_evidence < MIN_REAL_INTENT_EVIDENCE
-            and intent_fit < MIN_REAL_INTENT_FIT
-            and not direct_support
+            (
+                real_evidence < MIN_REAL_INTENT_EVIDENCE
+                and intent_fit < MIN_REAL_INTENT_FIT
+                and not direct_support
+            )
+            or (
+                not direct_support
+                and real_evidence < 0.50
+                and weak_facet_only
+            )
+            or (
+                not direct_support
+                and real_evidence < MIN_REAL_INTENT_EVIDENCE
+                and float(top.get("fuzzy_phrase_score", 0.0)) < 0.88
+            )
         )
         if unsupported_intent:
             return MatchResult(
@@ -2034,34 +2110,8 @@ class KnowledgeBase:
                 decision_reason="kb_requires_clarification",
             )
 
-        # Hard semantic/intention mismatch: never auto-template.
+        # Hard semantic/intention mismatch: never auto-template, never fake top-3.
         if intent_fit < INTENT_FIT_HARD_MISMATCH:
-            if (
-                top_score >= LLM_SCORE
-                and quality.score >= MIN_QUERY_QUALITY_LLM
-                and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM)
-            ):
-                # TEMP: LLM disabled → top-3 categories instead
-                return MatchResult(
-                    MatchMode.CATEGORY_CHOICE,
-                    top_score,
-                    entry.get("category"),
-                    None,
-                    entry.get("id"),
-                    relevant_entries,
-                    entry=entry,
-                    second_score=second_score,
-                    margin=margin,
-                    embedding_score=float(top["embedding_score"]),
-                    intent_fit_score=intent_fit,
-                    intent_fit_reason=intent_fit_reason,
-                    family_fit_score=family_fit,
-                    query_quality_score=quality.score,
-                    subquestion=question,
-                    decision_reason="temp_llm_disabled:hard_intent_mismatch_top3",
-                    choice_candidates=self._force_top_choice_candidates(ranked, 3),
-                )
-                # return MatchResult(MatchMode.LLM, ... decision_reason="hard_intent_mismatch_requires_llm")
             return MatchResult(
                 MatchMode.NO_MATCH,
                 top_score,
@@ -2080,38 +2130,12 @@ class KnowledgeBase:
                 decision_reason="hard_intent_mismatch",
             )
 
-        # Direct contradiction: never auto-template.
+        # Direct contradiction: never auto-template, never fake top-3.
         contradiction = bool(
             top["negative_hits"]
             or top["constraint_evidence"].get("forbidden_hits")
         )
         if contradiction:
-            if (
-                top_score >= LLM_SCORE
-                and quality.score >= MIN_QUERY_QUALITY_LLM
-                and (has_lexical or semantic_gap >= SEMANTIC_GAP_FOR_LLM)
-            ):
-                # TEMP: LLM disabled → top-3 categories instead
-                return MatchResult(
-                    MatchMode.CATEGORY_CHOICE,
-                    top_score,
-                    entry.get("category"),
-                    None,
-                    entry.get("id"),
-                    relevant_entries,
-                    entry=entry,
-                    second_score=second_score,
-                    margin=margin,
-                    embedding_score=float(top["embedding_score"]),
-                    intent_fit_score=intent_fit,
-                    intent_fit_reason=intent_fit_reason,
-                    family_fit_score=family_fit,
-                    query_quality_score=quality.score,
-                    subquestion=question,
-                    decision_reason="temp_llm_disabled:contradiction_top3",
-                    choice_candidates=self._force_top_choice_candidates(ranked, 3),
-                )
-                # return MatchResult(MatchMode.LLM, ... decision_reason="contradiction_requires_llm")
             return MatchResult(
                 MatchMode.NO_MATCH,
                 top_score,
@@ -2222,8 +2246,9 @@ class KnowledgeBase:
             )
 
         # ----------------------------------------------------
-        # TEMP: LLM disabled — send top-3 categories instead.
-        # Original LLM path kept below as comment for easy restore.
+        # TEMP: LLM disabled.
+        # Only offer top categories when they have REAL support.
+        # Otherwise NO_MATCH — do not invent a category that does not exist.
         # ----------------------------------------------------
         llm_eligible = (
             quality.score >= MIN_QUERY_QUALITY_LLM
@@ -2248,14 +2273,36 @@ class KnowledgeBase:
             )
         )
         if llm_eligible:
+            # Prefer filtered choice candidates; never force unrelated top-3.
+            safe_choices = choice_candidates or self._category_choice_candidates(ranked)
+            if len(safe_choices) >= CATEGORY_CHOICE_MIN_CANDIDATES:
+                return MatchResult(
+                    MatchMode.CATEGORY_CHOICE,
+                    top_score,
+                    entry.get("category"),
+                    None,
+                    entry.get("id"),
+                    relevant_entries,
+                    entry=entry,
+                    second_score=second_score,
+                    margin=margin,
+                    embedding_score=float(top["embedding_score"]),
+                    intent_fit_score=intent_fit,
+                    intent_fit_reason=intent_fit_reason,
+                    family_fit_score=family_fit,
+                    query_quality_score=quality.score,
+                    subquestion=question,
+                    decision_reason="temp_llm_disabled:safe_category_choice",
+                    choice_candidates=safe_choices,
+                )
+            # No safe alternatives → admit we don't know (orchestrator: rephrase/operator).
             return MatchResult(
-                MatchMode.CATEGORY_CHOICE,
+                MatchMode.NO_MATCH,
                 top_score,
-                entry.get("category"),
                 None,
-                entry.get("id"),
+                None,
+                None,
                 relevant_entries,
-                entry=entry,
                 second_score=second_score,
                 margin=margin,
                 embedding_score=float(top["embedding_score"]),
@@ -2264,27 +2311,8 @@ class KnowledgeBase:
                 family_fit_score=family_fit,
                 query_quality_score=quality.score,
                 subquestion=question,
-                decision_reason="temp_llm_disabled:ambiguous_top3",
-                choice_candidates=self._force_top_choice_candidates(ranked, 3),
+                decision_reason="temp_llm_disabled:no_safe_category",
             )
-            # return MatchResult(
-            #     MatchMode.LLM,
-            #     top_score,
-            #     entry.get("category"),
-            #     None,
-            #     entry.get("id"),
-            #     relevant_entries,
-            #     entry=entry,
-            #     second_score=second_score,
-            #     margin=margin,
-            #     embedding_score=float(top["embedding_score"]),
-            #     intent_fit_score=intent_fit,
-            #     intent_fit_reason=intent_fit_reason,
-            #     family_fit_score=family_fit,
-            #     query_quality_score=quality.score,
-            #     subquestion=question,
-            #     decision_reason="ambiguous_or_requires_llm",
-            # )
 
         # Unresolved: orchestrator may REPHRASE / escalate.
         return MatchResult(
@@ -2303,7 +2331,7 @@ class KnowledgeBase:
             query_quality_score=quality.score,
             subquestion=question,
             decision_reason="insufficient_confidence",
-            choice_candidates=choice_candidates or None,
+            choice_candidates=None,
         )
 
     # --------------------------------------------------------

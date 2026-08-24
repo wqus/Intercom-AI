@@ -113,6 +113,8 @@ async def _handle_pending_category_choice(
         await send_reply(
             f"Пожалуйста, выберите номер одного или нескольких вариантов: "
             f"{', '.join(str(i) for i in range(1, len(candidate_ids) + 1))}."
+            f"Если ни один из предложенных варинтов не подходит, напишите \"оператор\" для передачи вашего запроса специалисту"
+
         )
         return True
 
