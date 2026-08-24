@@ -21,9 +21,21 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     cid=str(item.get("id") or "")
     if not cid: return None
     source=item.get("source",{}) or {}
-    parts=item.get("conversation_parts",{}).get("conversation_parts",[]) or []
-    user_parts=[p for p in parts if p.get("author",{}).get("type")=="user"]
-    part=user_parts[-1] if user_parts else source
+    parts = item.get("conversation_parts", {}).get("conversation_parts", []) or []
+    user_parts = [p for p in parts if (p.get("author", {}) or {}).get("type") == "user"]
+
+    if payload.get("topic") == "conversation.user.replied":
+        # This webhook is specifically about a customer reply. Never fall back
+        # to an admin/bot source. Some payload shapes omit conversation_parts
+        # and expose the user message directly in source.
+        if user_parts:
+            part = user_parts[-1]
+        elif (source.get("author", {}) or {}).get("type") in {None, "user"}:
+            part = source
+        else:
+            return None
+    else:
+        part = user_parts[-1] if user_parts else source
     text=_strip(part.get("body",""))
     attachments=bool(source.get("attachments")) or any(bool(p.get("attachments")) for p in parts)
     author=part.get("author",{}) or source.get("author",{}) or {}

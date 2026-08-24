@@ -161,3 +161,74 @@ def test_llm_route_falls_back_to_rephrase_when_no_safe_top3(monkeypatch):
     assert trace.decision == Decision.REPHRASE
     assert trace.llm_used is False
     assert actions and "переформулируйте" in actions[0].text
+
+
+def test_escalation_delivery_secondary_failure_does_not_bubble():
+    import asyncio
+    from app.application.support_service import SupportApplication
+    from app.domain.enums import Channel
+    from app.domain.models import InboundMessage
+
+    class FakePipeline: pass
+
+    class FakeIntercom:
+        async def send_reply(self, *args): return True
+        async def add_escalation_tag(self, *args): raise RuntimeError("tag failed")
+
+    class FakeTelegram:
+        async def notify_escalation(self, **kwargs): raise RuntimeError("telegram failed")
+
+    app = SupportApplication(FakePipeline(), FakeIntercom(), FakeTelegram())
+    msg = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "оператор")
+    asyncio.run(app._deliver(msg, "Передаю оператору", True))
+
+
+
+
+def test_trace_preserves_all_quality_metrics():
+    from app.application.decision_pipeline import DecisionPipeline
+    from app.infrastructure.ai.knowledge_base import MatchMode, MatchResult
+
+    match = MatchResult(
+        MatchMode.TEMPLATE, 0.7742, "Cat", "answer", "kb_1", [],
+        margin=0.0421,
+        embedding_score=0.9123,
+        semantic_score=0.7345,
+        lexical_score=0.8123,
+        fuzzy_score=0.9678,
+        intent_fit_score=0.7012,
+        family_fit_score=0.6432,
+        evidence_score=0.5521,
+        real_intent_evidence=0.4988,
+        query_quality_score=0.4123,
+        domain_support_score=0.3777,
+        ontology_alignment_score=0.6888,
+        negative_contrast_score=0.0911,
+        contrastive_margin=0.1337,
+        contrastive_competitor_id="kb_2",
+        contrastive_reason="positive_vs_negative",
+        decision_reason="test_metrics",
+    )
+
+    class FakeKB: pass
+    trace, _ = __import__('asyncio').run(
+        DecisionPipeline(FakeKB(), object()).decide_match(match, "q")
+    )
+
+    assert trace.score == 0.7742
+    assert trace.margin == 0.0421
+    assert trace.embedding_score == 0.9123
+    assert trace.semantic_score == 0.7345
+    assert trace.lexical_score == 0.8123
+    assert trace.fuzzy_score == 0.9678
+    assert trace.intent_fit_score == 0.7012
+    assert trace.family_fit_score == 0.6432
+    assert trace.evidence_score == 0.5521
+    assert trace.real_intent_evidence == 0.4988
+    assert trace.query_quality_score == 0.4123
+    assert trace.domain_support_score == 0.3777
+    assert trace.ontology_alignment_score == 0.6888
+    assert trace.negative_contrast_score == 0.0911
+    assert trace.contrastive_margin == 0.1337
+    assert trace.contrastive_competitor_id == "kb_2"
+    assert trace.contrastive_reason == "positive_vs_negative"

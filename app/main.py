@@ -5,10 +5,12 @@ from fastapi import FastAPI
 from app.core.config import settings
 from app.database.base import Base
 from app.database.engine import engine
+from app.database.schema import ensure_schema
 from app.infrastructure.persistence import models as _persistence_models
 from app.infrastructure.ai.knowledge_base import KnowledgeBase
 from app.infrastructure.ai.llm_client import YandexLLMClient
 from app.infrastructure.intercom.client import IntercomGateway
+from app.infrastructure.telegram.notifier import TelegramNotifier
 from app.application.decision_pipeline import DecisionPipeline
 from app.application.support_service import SupportApplication
 from app.application.event_worker import EventWorker
@@ -23,6 +25,7 @@ logging.basicConfig(
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await ensure_schema(engine)
 
     kb=KnowledgeBase(path=settings.KB_PATH, device=settings.EMBEDDING_DEVICE, use_reranker=settings.USE_RERANKER)
     llm=YandexLLMClient(
@@ -30,13 +33,20 @@ async def lifespan(app: FastAPI):
         folder_id=settings.YANDEX_FOLDER_ID,
         prompt_id=settings.YANDEX_PROMPT_ID,
     )
-    client=httpx.AsyncClient(
+    client = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=5.0),
-        limits=httpx.Limits(max_keepalive_connections=20,max_connections=50),
-        headers={"Authorization":f"Bearer {settings.INTERCOM_TOKEN}","Accept":"application/json","Content-Type":"application/json","Intercom-Version":"2.15"},
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        headers={
+            "Authorization": f"Bearer {settings.INTERCOM_TOKEN}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Intercom-Version": "2.15",
+        },
     )
-    intercom=IntercomGateway(client)
-    application=SupportApplication(DecisionPipeline(kb,llm),intercom)
+    telegram_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
+    intercom = IntercomGateway(client)
+    telegram = TelegramNotifier(telegram_client)
+    application = SupportApplication(DecisionPipeline(kb, llm), intercom, telegram)
     worker=EventWorker(application)
     app.state.application=application
     await worker.start()
@@ -45,6 +55,7 @@ async def lifespan(app: FastAPI):
 
     await worker.stop()
     await client.aclose()
+    await telegram_client.aclose()
     await engine.dispose()
 
 app=FastAPI(title="Terra Intercom AI Support v15 Conservative", lifespan=lifespan)

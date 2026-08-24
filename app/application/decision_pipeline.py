@@ -31,6 +31,14 @@ class DecisionPipeline:
             intent_fit_score=match.intent_fit_score,
             family_fit_score=match.family_fit_score,
             query_quality_score=match.query_quality_score,
+            semantic_score=getattr(match, "semantic_score", 0.0),
+            lexical_score=getattr(match, "lexical_score", 0.0),
+            fuzzy_score=getattr(match, "fuzzy_score", 0.0),
+            evidence_score=getattr(match, "evidence_score", 0.0),
+            real_intent_evidence=getattr(match, "real_intent_evidence", 0.0),
+            domain_support_score=getattr(match, "domain_support_score", 0.0),
+            ontology_alignment_score=getattr(match, "ontology_alignment_score", 0.0),
+            negative_contrast_score=getattr(match, "negative_contrast_score", 0.0),
             decision_reason=match.decision_reason,
         )
 

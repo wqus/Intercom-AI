@@ -44,19 +44,3 @@ class IntercomGateway:
         except httpx.HTTPError as exc:
             logger.warning("Escalation tag request failed: %s", exc)
 
-    async def assign(self, entity_id: str, channel: str) -> None:
-        if settings.DRY_RUN or not settings.INTERCOM_ADMIN_ID:
-            return
-        admin_id=settings.INTERCOM_ADMIN_ID
-        if channel=="ticket":
-            response=await self.client.put(
-                f"{BASE}/tickets/{entity_id}",
-                json={"admin_id":admin_id,"assignee_id":admin_id},
-            )
-        else:
-            response=await self.client.post(
-                f"{BASE}/conversations/{entity_id}/parts",
-                json={"message_type":"assignment","type":"admin","admin_id":admin_id,"assignee_id":admin_id},
-            )
-        response.raise_for_status()
-

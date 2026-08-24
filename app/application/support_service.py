@@ -7,19 +7,45 @@ from app.infrastructure.intercom.client import IntercomGateway
 from app.infrastructure.persistence.repository import StateRepository, InteractionRepository
 from app.infrastructure.persistence.models import InboundEvent
 from app.infrastructure.ai.knowledge_base import MatchMode
+from app.infrastructure.telegram.notifier import TelegramNotifier
 
 logger = logging.getLogger("support_service")
 
 class SupportApplication:
-    def __init__(self, pipeline: DecisionPipeline, intercom: IntercomGateway):
+    def __init__(
+        self,
+        pipeline: DecisionPipeline,
+        intercom: IntercomGateway,
+        telegram: TelegramNotifier | None = None,
+    ):
         self.pipeline = pipeline
         self.intercom = intercom
+        self.telegram = telegram
 
     async def _deliver(self, message: InboundMessage, text: str, escalate: bool) -> None:
+        # Reply delivery is the primary side effect. If it fails, the event must
+        # remain retryable. Secondary escalation side effects are best-effort and
+        # must never make an already delivered customer reply repeat.
         await self.intercom.send_reply(message.entity_id, message.channel.value, text)
-        if escalate:
+        if not escalate:
+            return
+
+        reason = "escalated_to_operator"
+        try:
             await self.intercom.add_escalation_tag(message.entity_id, message.channel.value)
-            await self.intercom.assign(message.entity_id, message.channel.value)
+        except Exception:
+            logger.exception("Escalation tag failed entity=%s", message.entity_id)
+
+        if self.telegram:
+            try:
+                await self.telegram.notify_escalation(
+                    entity_id=message.entity_id,
+                    channel=message.channel.value,
+                    reason=reason,
+                    text=message.text,
+                )
+            except Exception:
+                logger.exception("Operator notification failed entity=%s", message.entity_id)
 
     async def _handle_state(self, session, message: InboundMessage, state) -> bool:
         if state.state == ConversationStateKind.CLARIFYING:

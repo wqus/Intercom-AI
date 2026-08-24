@@ -20,3 +20,19 @@ def test_conversation_event_is_normalized():
 def test_unknown_topic_is_ignored():
     assert parse({"id":"1","topic":"conversation.admin.closed","data":{"item":{"id":"1"}}}) is None
 
+
+
+def test_conversation_user_replied_does_not_fallback_to_admin_source():
+    payload = {
+        "id": "evt-2",
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "conv-2",
+            "updated_at": "123",
+            "source": {"body": "admin reply", "author": {"type": "admin", "name": "Operator"}},
+            "conversation_parts": {"conversation_parts": [
+                {"body": "admin part", "author": {"type": "admin"}},
+            ]},
+        }},
+    }
+    assert parse(payload) is None

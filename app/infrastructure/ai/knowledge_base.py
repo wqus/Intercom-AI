@@ -299,6 +299,10 @@ class MatchResult:
     second_score: float = 0.0
     margin: float = 0.0
     fuzzy_score: float = 0.0
+    semantic_score: float = 0.0
+    lexical_score: float = 0.0
+    evidence_score: float = 0.0
+    real_intent_evidence: float = 0.0
     embedding_score: float = 0.0
     intent_fit_score: float = 0.0
     intent_fit_reason: str = ""
@@ -2545,6 +2549,11 @@ class KnowledgeBase:
             "score": float(item.get("final_score", 0.0)),
             "ranking_score": float(item.get("ranking_score", item.get("final_score", 0.0))),
             "second_score": 0.0,
+            "semantic_score": float(item.get("semantic_score", 0.0)),
+            "lexical_score": float(item.get("lexical_score", 0.0)),
+            "fuzzy_score": float(item.get("fuzzy_phrase_score", 0.0)),
+            "evidence_score": float(item.get("evidence_score", 0.0)),
+            "real_intent_evidence": float(item.get("real_intent_evidence", 0.0)),
             "margin": 0.0,
             "embedding_score": float(item.get("embedding_score", 0.0)),
             "intent_fit_score": float(item.get("intent_fit_score", 0.0)),
@@ -2949,6 +2958,9 @@ class KnowledgeBase:
             return MatchResult(
                 MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
                 second_score=second_score, margin=margin,
+                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                evidence_score=float(top.get("evidence_score", 0.0)),
+                real_intent_evidence=real_evidence,
                 embedding_score=embedding, intent_fit_score=intent_fit,
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
@@ -2966,6 +2978,9 @@ class KnowledgeBase:
             return MatchResult(
                 MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
                 second_score=second_score, margin=margin,
+                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                evidence_score=float(top.get("evidence_score", 0.0)),
+                real_intent_evidence=real_evidence,
                 embedding_score=embedding, intent_fit_score=intent_fit,
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
@@ -3000,6 +3015,9 @@ class KnowledgeBase:
                     MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
                     entry.get("id"), relevant_entries, entry=entry,
                     second_score=second_score, margin=margin,
+                    semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                    evidence_score=float(top.get("evidence_score", 0.0)),
+                    real_intent_evidence=real_evidence,
                     embedding_score=embedding, intent_fit_score=intent_fit,
                     intent_fit_reason=str(top.get("intent_fit_reason", "")),
                     family_fit_score=family_fit, query_quality_score=quality.score,
@@ -3083,6 +3101,9 @@ class KnowledgeBase:
                     MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
                     entry.get("id"), relevant_entries, entry=entry,
                     second_score=second_score, margin=margin,
+                    semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                    evidence_score=float(top.get("evidence_score", 0.0)),
+                    real_intent_evidence=real_evidence,
                     embedding_score=embedding, intent_fit_score=intent_fit,
                     intent_fit_reason=str(top.get("intent_fit_reason", "")),
                     family_fit_score=family_fit, query_quality_score=quality.score,
@@ -3116,6 +3137,9 @@ class KnowledgeBase:
                 MatchMode.LLM, top_score, entry.get("category"), None,
                 entry.get("id"), relevant_entries, entry=entry,
                 second_score=second_score, margin=margin,
+                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                evidence_score=float(top.get("evidence_score", 0.0)),
+                real_intent_evidence=real_evidence,
                 embedding_score=embedding, intent_fit_score=intent_fit,
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
@@ -3143,8 +3167,11 @@ class KnowledgeBase:
 
         return MatchResult(
             MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
-            second_score=second_score, margin=margin, embedding_score=embedding,
-            intent_fit_score=intent_fit,
+            second_score=second_score, margin=margin,
+            semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+            evidence_score=float(top.get("evidence_score", 0.0)),
+            real_intent_evidence=real_evidence,
+            embedding_score=embedding, intent_fit_score=intent_fit,
             intent_fit_reason=str(top.get("intent_fit_reason", "")),
             family_fit_score=family_fit, query_quality_score=quality.score,
             subquestion=question, decision_reason=reason,

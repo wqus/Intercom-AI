@@ -28,6 +28,14 @@ class DecisionTrace:
     intent_fit_score: float = 0.0
     family_fit_score: float = 0.0
     query_quality_score: float = 0.0
+    semantic_score: float = 0.0
+    lexical_score: float = 0.0
+    fuzzy_score: float = 0.0
+    evidence_score: float = 0.0
+    real_intent_evidence: float = 0.0
+    domain_support_score: float = 0.0
+    ontology_alignment_score: float = 0.0
+    negative_contrast_score: float = 0.0
     decision_reason: str = ""
     escalation_reason: EscalationReason | None = None
     llm_used: bool = False
