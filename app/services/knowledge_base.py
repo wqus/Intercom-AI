@@ -30,8 +30,38 @@ EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 RERANKER_MODEL_NAME = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 
 RETRIEVAL_TOP_K = 20
-FINAL_CANDIDATES = 6
+FINAL_CANDIDATES = 8
 LLM_TOP_K = 3
+NEGATIVE_SEMANTIC_WEIGHT = 0.14
+OBJECT_MISMATCH_PENALTY = 0.22
+STATE_MISMATCH_PENALTY = 0.16
+ACTION_MISMATCH_PENALTY = 0.14
+FACET_MISMATCH_PENALTY = 0.12
+HARD_NEGATIVE_MARGIN = 0.02
+
+# Negative/abstention policy. These are deliberately conservative: when the
+# query contains explicit structured meaning that a candidate contradicts,
+# semantic similarity must not be allowed to manufacture an intent.
+ONTOLOGY_ALIGNMENT_MIN = 0.60
+ONTOLOGY_HARD_MISMATCH = 0.25
+NEGATIVE_CONTRAST_MIN = 0.015
+NEGATIVE_CONTRAST_UNSAFE = -0.015
+MIN_EXPLICIT_SUPPORT_FOR_NONHARD = 0.42
+MIN_DOMAIN_SUPPORT_FOR_AUTO = 0.34
+
+# A few high-precision external-target patterns. They are intentionally narrow
+# and are only used in combinations such as "стоимость обучения в <X>" or
+# "курс <X>", never as a general named-entity detector.
+EXTERNAL_TARGET_RE = re.compile(
+    r"\b(?:в|для|у|про|на)\s+(?P<entity>[А-ЯЁ][А-ЯЁа-яё-]{2,})",
+)
+KNOWN_INTERNAL_ENTITIES = {
+    "терра", "терре", "терру", "терры", "terra",
+}
+EXTERNAL_TARGET_CONTEXT = (
+    "обучение", "школ", "курс", "поток", "занят", "обучаться",
+    "учиться", "стоимость", "цена", "записаться", "поступить",
+)
 
 # Relative/ranking signals are more trustworthy than absolute E5 cosine values.
 RRF_K = 60.0
@@ -80,7 +110,7 @@ SEMANTIC_MAX_WEIGHT = 0.34
 SEMANTIC_TOP3_WEIGHT = 0.16
 SEMANTIC_CATEGORY_WEIGHT = 0.10
 LEXICAL_SCORE_WEIGHT = 0.10
-FUZZY_SCORE_WEIGHT = 0.06
+FUZZY_SCORE_WEIGHT = 0.02
 INTENT_FIT_WEIGHT = 0.16
 FAMILY_FIT_WEIGHT = 0.04
 RRF_WEIGHT = 0.04
@@ -238,6 +268,10 @@ class MatchResult:
     choice_candidates: list[dict] | None = None
     query_quality_score: float = 0.0
     family_fit_score: float = 0.0
+    top_candidates: list[dict] | None = None
+    domain_support_score: float = 0.0
+    ontology_alignment_score: float = 0.0
+    negative_contrast_score: float = 0.0
 
 
 @dataclass(slots=True)
@@ -655,6 +689,9 @@ class KnowledgeBase:
         self.phrase_embeddings_matrix = np.empty((0, 0), dtype=np.float32)
         self.category_embeddings: dict[str, np.ndarray] = {}
         self.category_phrase_indices: dict[str, list[int]] = {}
+        self.negative_phrase_records: list[dict[str, Any]] = []
+        self.negative_embeddings_matrix = np.empty((0, 0), dtype=np.float32)
+        self.category_negative_indices: dict[str, list[int]] = {}
         self.family_vocabulary: dict[str, set[str]] = {}
         self.default_answer = "Добрый день!\nУточните, пожалуйста, подробнее ваш вопрос."
         self.model = None
@@ -676,7 +713,7 @@ class KnowledgeBase:
         self._build_indexes()
 
         logger.info(
-            "KB v9 loaded | categories=%d | phrase_records=%d | reranker=%s",
+            "KB v12 loaded | categories=%d | phrase_records=%d | reranker=%s",
             len(self.entries), len(self.phrase_records), self.reranker is not None,
         )
 
@@ -721,6 +758,7 @@ class KnowledgeBase:
                 or str(entry.get("category") or entry_id).strip()
             )
             entry["constraints"] = entry.get("constraints") if isinstance(entry.get("constraints"), dict) else {}
+            entry["ontology"] = self._derive_ontology(entry)
 
             # Keep the original phrases as the canonical retrieval examples.
             positives = entry.get("positive_examples") or entry.get("match_phrases")
@@ -742,7 +780,131 @@ class KnowledgeBase:
             self.entries.append(entry)
             self.entries_by_id[entry_id] = entry
 
+        # Build hard negatives automatically from the KB's own curated
+        # conflict graph. This gives us supervised-looking contrastive evidence
+        # even before a large production dataset exists. Only examples from
+        # explicitly confused intents are used, so unrelated categories cannot
+        # contaminate the negative channel.
+        for entry in self.entries:
+            existing = {normalize_light(x) for x in entry.get("hard_negative_examples", []) if isinstance(x, str)}
+            conflict_ids: list[str] = [str(x) for x in entry.get("conflict_ids", []) if str(x)]
+            confused = entry.get("confused_with", []) or []
+            for item in confused:
+                if isinstance(item, str):
+                    conflict_ids.append(item)
+                elif isinstance(item, dict) and item.get("kb_id"):
+                    conflict_ids.append(str(item["kb_id"]))
+            for conflict_id in dict.fromkeys(conflict_ids):
+                other = self.entries_by_id.get(conflict_id)
+                if not other:
+                    continue
+                # Keep the set deliberately compact: a few high-quality hard
+                # negatives per conflict are more useful than flooding the
+                # semantic negative index with every example in the KB.
+                for phrase in other.get("positive_examples", [])[:5]:
+                    key = normalize_light(phrase)
+                    if key and key not in existing and key not in set(entry.get("_positive_norm", [])):
+                        entry.setdefault("hard_negative_examples", []).append(phrase)
+                        existing.add(key)
+
         self._validate_entries()
+
+    @staticmethod
+    def _derive_ontology(entry: dict) -> dict[str, str | None]:
+        """Derive a stable intent signature from the KB metadata already present."""
+        it = str(entry.get("intent_type") or "").strip()
+        family = str(entry.get("family") or "other").strip()
+        facets = {str(x).strip() for x in entry.get("intent_facets", []) if str(x).strip()}
+        mapping = {
+            "technical_failure": ("app", "use", "failure"),
+            "registration_failure": ("school", "register", "failure"),
+            "school_registration": ("school", "register", "procedure"),
+            "education_entry": ("education", "enter", "procedure"),
+            "missed_event": ("event", "attend", "missed"),
+            "flow_date": ("flow", "ask", "information"),
+            "school_started": ("school", "enter", "already_started"),
+            "personal_mentor": ("mentor", "contact", "current"),
+            "mentor_application": ("mentor_role", "become", "intent"),
+            "mentor_program": ("mentor_program", "learn", "information"),
+            "mentor_application_retry": ("mentor_application", "resubmit", "rejected"),
+            "education_price": ("training", "pay", "information"),
+            "subscription_charge": ("subscription", "pay", "charged"),
+            "rent_payment_issue": ("rent", "pay", "charged"),
+            "account_identity": ("account", "verify", "mismatch"),
+            "phone_verification": ("phone", "verify", "verification"),
+            "telegram_link": ("telegram_chat", "get", "information"),
+            "telegram_membership": ("telegram_chat", "join", "failure"),
+            "invite_code": ("invite_code", "use", "failure"),
+            "qr_code": ("qr_code", "use", "failure"),
+            "access": ("school", "access", "failure"),
+            "voluntary_exit": ("school", "leave", "intent"),
+            "school_transfer": ("school", "transfer", "intent"),
+            "school_restoration": ("school", "restore", "intent"),
+            "involuntary_exclusion": ("school", "restore", "excluded"),
+            "global_exit": ("schools", "leave", "intent"),
+        }
+        obj, action, state = mapping.get(it, (family, None, None))
+        facet = next(iter(sorted(facets)), None)
+        for preferred in ("price", "date", "duration", "age", "registration", "technical_failure", "verification", "access"):
+            if preferred in facets:
+                facet = preferred
+                break
+        return {"domain": family, "object": obj, "action": action, "state": state, "facet": facet}
+
+    @staticmethod
+    def _query_ontology(question: str) -> dict[str, set[str]]:
+        q = normalize_light(question)
+        out = {"domain": set(), "object": set(), "action": set(), "state": set(), "facet": set()}
+        patterns = {
+            "price": ("сколько стоит", "стоимость", "цена", "платно", "платное", "платить", "бесплатно", "обойдется", "обойдётся"),
+            "date": ("когда следующий", "когда новый", "когда старт", "дата старта", "даты потока", "в какой день"),
+            "duration": ("сколько длится", "как долго", "сколько месяцев", "сколько недель", "длительность", "продолжительность"),
+            "age": ("с какого возраста", "со скольки лет", "до какого возраста", "возраст"),
+            "registration": ("записаться", "запись", "регистрация", "зарегистрироваться"),
+            "technical_failure": ("не работает", "не получается", "не могу", "ошибка", "не открывается", "не принимает", "не пускает"),
+            "verification": ("код подтверждения", "подтвердить номер", "не приходит смс"),
+            "access": ("нет доступа", "не вижу", "не пускает", "доступ"),
+            "mentor_application": ("стать наставником", "стать ментором", "хочу преподавать", "хочу быть наставником"),
+            "mentor_program": ("программа наставничества", "что такое наставничество", "как работает наставничество"),
+            "personal_mentor": ("мой наставник", "моего наставника", "кто мой наставник"),
+            "membership": ("вступить в клуб", "вступление в клуб", "членство", "членство в клубе", "участник клуба", "участие в клубе", "стать участником клуба", "клуб"),
+            "training": ("обучение", "учиться", "школа", "поток", "запуск"),
+            "telegram_chat": ("телеграм", "чат", "группа"),
+            "mentor": ("наставник", "ментор", "наставничество"),
+            "app": ("приложение", "приложении"),
+            "invite_code": ("инвайт", "код приглашения"),
+            "qr_code": ("qr", "qr код", "qr-код"),
+            "rent": ("аренда", "аренду"),
+            "subscription": ("подписка", "подписку"),
+        }
+        for key, vals in patterns.items():
+            if any(v in q for v in vals):
+                target = "facet" if key in {"price", "date", "duration", "age", "registration", "technical_failure", "verification", "access"} else "object"
+                out[target].add(key)
+        if out["object"]:
+            out["domain"].add("known")
+        if "technical_failure" in out["facet"]:
+            out["state"].add("failure")
+        if "registration" in out["facet"]:
+            out["action"].add("register")
+        if "mentor_application" in out["object"]:
+            out["action"].add("become")
+            out["state"].add("intent")
+        if "mentor_program" in out["object"]:
+            out["action"].add("learn")
+            out["state"].add("information")
+        if "personal_mentor" in out["object"]:
+            out["action"].add("contact")
+            out["state"].add("current")
+        if any(v in out["object"] for v in {"subscription", "rent"}):
+            out["action"].add("pay")
+        if "membership" in out["object"]:
+            out["action"].add("join")
+            out["state"].add("information")
+        if "training" in out["object"] and "price" in out["facet"]:
+            out["action"].add("pay")
+            out["state"].add("information")
+        return out
 
     def _validate_entries(self) -> None:
         """Fail fast on KB structure errors that would make ranking unreliable."""
@@ -769,22 +931,35 @@ class KnowledgeBase:
     def _build_indexes(self) -> None:
         passages: list[str] = []
         docs: list[list[str]] = []
+        negative_passages: list[str] = []
         self.family_vocabulary = {}
+        self.phrase_records = []
+        self.negative_phrase_records = []
+        self.category_phrase_indices = {}
+        self.category_negative_indices = {}
         for entry in self.entries:
-            idxs: list[int] = []
-            # We intentionally index only positive examples. Negative examples
-            # are used as contradiction evidence, never as retrieval documents.
             for phrase in entry["positive_examples"]:
                 idx = len(passages)
-                self.phrase_records.append({
-                    "entry_id": entry["id"],
-                    "phrase": phrase,
-                    "index": idx,
-                })
+                self.phrase_records.append({"entry_id": entry["id"], "phrase": phrase, "index": idx})
                 self.category_phrase_indices.setdefault(entry["id"], []).append(idx)
                 passages.append(f"passage: {phrase}")
                 docs.append(tokenize(phrase))
-                idxs.append(idx)
+
+            # Negative examples are not retrieval documents. They are a separate
+            # semantic contradiction channel used after candidate generation.
+            negatives = list(entry.get("negative_phrases", [])) + list(entry.get("hard_negative_examples", []))
+            seen_neg: set[str] = set()
+            for phrase in negatives:
+                if not isinstance(phrase, str):
+                    continue
+                key = normalize_light(phrase)
+                if not key or key in seen_neg:
+                    continue
+                seen_neg.add(key)
+                idx = len(negative_passages)
+                self.negative_phrase_records.append({"entry_id": entry["id"], "phrase": phrase, "index": idx})
+                self.category_negative_indices.setdefault(entry["id"], []).append(idx)
+                negative_passages.append(f"passage: {phrase}")
 
             family = str(entry.get("family") or "other")
             vocab = self.family_vocabulary.setdefault(family, set())
@@ -793,32 +968,19 @@ class KnowledgeBase:
             for phrase in (entry.get("intent_signals") or {}).get("positive", [])[:30]:
                 vocab.update(tokenize(str(phrase)))
 
-            # A compact category prototype is also indexed semantically.
             prototype = self._category_prototype(entry)
-            emb = self.model.encode(
-                [f"passage: {prototype}"],
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )[0]
+            emb = self.model.encode([f"passage: {prototype}"], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)[0]
             self.category_embeddings[entry["id"]] = np.asarray(emb, dtype=np.float32)
 
-        if passages:
-            embeddings = self.model.encode(
-                passages,
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-                batch_size=64,
-            )
-            self.phrase_embeddings_matrix = np.asarray(embeddings, dtype=np.float32)
-        else:
-            self.phrase_embeddings_matrix = np.empty((0, 0), dtype=np.float32)
-
-        # One lexical document per intent: all positive examples concatenated.
-        self.intent_docs: list[list[str]] = [
-            tokenize(" ".join(entry["positive_examples"])) for entry in self.entries
-        ]
+        self.phrase_embeddings_matrix = (
+            np.asarray(self.model.encode(passages, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False, batch_size=64), dtype=np.float32)
+            if passages else np.empty((0, 0), dtype=np.float32)
+        )
+        self.negative_embeddings_matrix = (
+            np.asarray(self.model.encode(negative_passages, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False, batch_size=64), dtype=np.float32)
+            if negative_passages else np.empty((0, 0), dtype=np.float32)
+        )
+        self.intent_docs = [tokenize(" ".join(entry["positive_examples"])) for entry in self.entries]
         self.bm25 = BM25Index(self.intent_docs)
         self.intent_index = {entry["id"]: i for i, entry in enumerate(self.entries)}
 
@@ -1105,6 +1267,10 @@ class KnowledgeBase:
         ).astype(np.float32)
 
         phrase_scores = np.dot(self.phrase_embeddings_matrix, query_emb)
+        negative_scores = (
+            np.dot(self.negative_embeddings_matrix, query_emb)
+            if self.negative_embeddings_matrix.size else np.empty((0,), dtype=np.float32)
+        )
         result: dict[str, dict[str, float]] = {}
         for entry in self.entries:
             indices = self.category_phrase_indices.get(entry["id"], [])
@@ -1115,10 +1281,13 @@ class KnowledgeBase:
             top3 = float(np.mean(vals_sorted[: min(3, len(vals_sorted))]))
             max_score = float(vals_sorted[0])
             proto = float(np.dot(self.category_embeddings[entry["id"]], query_emb))
+            neg_indices = self.category_negative_indices.get(entry["id"], [])
+            neg_max = float(max((negative_scores[i] for i in neg_indices), default=0.0))
             result[entry["id"]] = {
                 "max": max_score,
                 "top3": top3,
                 "prototype": proto,
+                "negative_max": neg_max,
             }
         return result
 
@@ -1153,13 +1322,14 @@ class KnowledgeBase:
         result: list[dict] = []
         for i in candidate_indices:
             entry = self.entries[i]
-            sem = semantic.get(entry["id"], {"max": 0.0, "top3": 0.0, "prototype": 0.0})
+            sem = semantic.get(entry["id"], {"max": 0.0, "top3": 0.0, "prototype": 0.0, "negative_max": 0.0})
             phrase_idx = self._best_phrase_index(entry["id"], question)
             result.append({
                 "entry": entry,
                 "embedding_score": float(sem["max"]),
                 "semantic_top3": float(sem["top3"]),
                 "semantic_prototype": float(sem["prototype"]),
+                "negative_semantic_score": float(sem.get("negative_max", 0.0)),
                 "bm25_raw": float(lexical_raw[i]),
                 "bm25_score": float(lexical_norm[i]),
                 "rrf_score": float(fused.get(i, 0.0)),
@@ -1211,25 +1381,160 @@ class KnowledgeBase:
             best = max(best, float(score))
         return best
 
-    def _family_fit(self, question: str, entry: dict) -> float:
-        """Estimate whether the query belongs to the candidate's domain family."""
+    def _domain_support(self, question: str, entry: dict) -> float:
+        """How much concrete, category-relevant support exists in the query.
+
+        This is intentionally different from semantic similarity. It answers
+        whether the query contains any explicit business/domain evidence that
+        can be aligned with the candidate. A high embedding score alone is not
+        domain proof.
+        """
+        qo = self._query_ontology(question)
+        ontology = entry.get("ontology") or self._derive_ontology(entry)
+        q_tokens = set(tokenize(question))
         family = str(entry.get("family") or "other")
         vocab = self.family_vocabulary.get(family, set())
-        if not vocab:
-            return 0.0
 
+        signals = 0.0
+        if qo["object"] and ontology.get("object") in qo["object"]:
+            signals += 0.38
+        if qo["action"] and ontology.get("action") in qo["action"]:
+            signals += 0.22
+        if qo["state"] and ontology.get("state") in qo["state"]:
+            signals += 0.18
+        if qo["facet"] and ontology.get("facet") in qo["facet"]:
+            signals += 0.16
+
+        if vocab and q_tokens:
+            direct = len(q_tokens & vocab)
+            if direct:
+                signals += min(0.22, 0.07 * direct)
+
+        if self._lexical_phrase_hits(question, entry):
+            signals += 0.30
+        if self._required_evidence(question, entry).get("coverage", 0.0) >= 0.50:
+            signals += 0.18
+
+        return float(min(1.0, signals))
+
+    def _ontology_alignment(self, question: str, entry: dict) -> tuple[float, str]:
+        """Compare explicit query meaning with candidate ontology.
+
+        Explicit mismatches are hard evidence against a candidate. Unknown
+        dimensions remain neutral, so recall is preserved for terse queries.
+        """
+        qo = self._query_ontology(question)
+        ontology = entry.get("ontology") or self._derive_ontology(entry)
+        checks: list[tuple[str, float, str]] = []
+
+        dimensions = ("object", "action", "state", "facet")
+        for dim in dimensions:
+            q_values = qo.get(dim) or set()
+            c_value = ontology.get(dim)
+            if not q_values or not c_value:
+                continue
+            if c_value in q_values:
+                checks.append((dim, 1.0, "match"))
+            else:
+                checks.append((dim, 0.0, f"mismatch:{','.join(sorted(q_values))}!=${c_value}"))
+
+        if not checks:
+            return 0.50, "no_explicit_ontology_signal"
+
+        weights = {"object": 0.42, "action": 0.20, "state": 0.18, "facet": 0.20}
+        numerator = sum(weights[d] * v for d, v, _ in checks)
+        denominator = sum(weights[d] for d, _, _ in checks)
+        score = numerator / max(denominator, 1e-9)
+        mismatches = [d for d, v, _ in checks if v == 0.0]
+        if mismatches:
+            return float(score), "ontology_mismatch:" + ",".join(mismatches)
+        return float(score), "ontology_aligned:" + ",".join(d for d, _, _ in checks)
+
+    def _external_target_hint(self, question: str) -> str | None:
+        """Detect only explicit third-party targets in domain-sensitive phrases."""
+        raw = (question or "").strip()
+        q = normalize_light(raw)
+        if not any(ctx in q for ctx in EXTERNAL_TARGET_CONTEXT):
+            return None
+        for match in EXTERNAL_TARGET_RE.finditer(raw):
+            entity = normalize_light(match.group("entity"))
+            if entity and entity not in KNOWN_INTERNAL_ENTITIES:
+                return entity
+        return None
+
+    def _negative_decision_reason(self, question: str, top: dict, ranked: list[dict]) -> str | None:
+        """Return a safe abstention reason when the candidate is contradicted.
+
+        This runs after retrieval/ranking. It does not replace positive intent
+        classification; it prevents semantically-close but structurally-wrong
+        categories from being auto-accepted.
+        """
+        entry = top["entry"]
+        qo = top.get("query_ontology") or self._query_ontology(question)
+        ontology = top.get("ontology") or self._derive_ontology(entry)
+        alignment = float(top.get("ontology_alignment_score", 0.50))
+        domain_support = float(top.get("domain_support_score", 0.0))
+        contrast = float(top.get("negative_contrast_score", 0.0))
+        direct = bool(top.get("direct_support"))
+
+        if top.get("negative_hits") or (top.get("constraint_evidence") or {}).get("forbidden_hits"):
+            return "explicit_candidate_negative"
+
+        if qo.get("object") and alignment <= ONTOLOGY_HARD_MISMATCH:
+            return "unsupported_object" if not any(
+                (item.get("ontology") or {}).get("object") in qo["object"]
+                for item in ranked
+            ) else "object_mismatch"
+
+        if qo.get("facet") and alignment <= ONTOLOGY_HARD_MISMATCH:
+            supported_facets = set()
+            for item in ranked:
+                supported_facets.add((item.get("ontology") or {}).get("facet"))
+            if not any(f in supported_facets for f in qo["facet"]):
+                return "unsupported_facet"
+            return "facet_mismatch"
+
+        if self._external_target_hint(question):
+            # A third-party target is only a hard negative when the query is
+            # otherwise asking for a domain operation where the current KB is
+            # clearly tied to the internal entity.
+            if ontology.get("object") in {"training", "school", "mentor_program"}:
+                return "wrong_entity"
+
+        if contrast <= NEGATIVE_CONTRAST_UNSAFE:
+            return "negative_evidence_dominates"
+
+        if not direct and domain_support < MIN_DOMAIN_SUPPORT_FOR_AUTO and alignment < ONTOLOGY_ALIGNMENT_MIN:
+            return "insufficient_domain_support"
+
+        return None
+
+    def _family_fit(self, question: str, entry: dict) -> float:
+        """Family fit combines lexical family evidence with ontology compatibility."""
+        family = str(entry.get("family") or "other")
+        vocab = self.family_vocabulary.get(family, set())
         q_tokens = set(tokenize(question))
-        q_stems = {light_stem(token) for token in q_tokens}
-        vocab_stems = {light_stem(token) for token in vocab}
-        if not q_tokens:
-            return 0.0
-
-        direct = len(q_tokens & vocab)
-        stemmed = len(q_stems & vocab_stems)
-        # Exact tokens are strongest; light-stem agreement captures Russian
-        # inflection without requiring a heavyweight morphological pipeline.
-        evidence = direct + 0.70 * max(0, stemmed - direct)
-        return float(min(1.0, evidence / max(1.0, min(4.0, len(q_tokens)))))
+        lexical = 0.0
+        if vocab and q_tokens:
+            direct = len(q_tokens & vocab)
+            q_stems = {light_stem(token) for token in q_tokens}
+            vocab_stems = {light_stem(token) for token in vocab}
+            stemmed = len(q_stems & vocab_stems)
+            lexical = min(1.0, (direct + 0.70 * max(0, stemmed - direct)) / max(1.0, min(4.0, len(q_tokens))))
+        qo = self._query_ontology(question)
+        ontology = entry.get("ontology") or self._derive_ontology(entry)
+        obj = ontology.get("object")
+        object_hints = qo["object"]
+        # Strong explicit object evidence should dominate weak family token overlap.
+        object_fit = 0.5
+        if object_hints:
+            if obj in object_hints:
+                object_fit = 1.0
+            elif obj == "training" and "training" in object_hints:
+                object_fit = 1.0
+            elif obj not in object_hints:
+                object_fit = 0.0
+        return float(min(1.0, 0.55 * lexical + 0.45 * object_fit))
 
     # --------------------------------------------------------
     # INTENT FIT / QUESTION-TYPE COMPATIBILITY
@@ -1417,6 +1722,25 @@ class KnowledgeBase:
         else:
             fit = facet_fit
 
+        # Structured intent compatibility catches semantic lookalikes such as
+        # "стоимость вступления в клуб" vs "стоимость обучения".
+        qo = self._query_ontology(question)
+        ontology = entry.get("ontology") or self._derive_ontology(entry)
+        object_hints = qo["object"]
+        candidate_object = ontology.get("object")
+        if object_hints and candidate_object:
+            # Membership/club is a hard object distinction from training.
+            if "membership" in object_hints and candidate_object != "membership":
+                fit = min(fit, 0.28)
+            elif candidate_object == "training" and object_hints & {"membership", "subscription", "rent"}:
+                fit = min(fit, 0.28)
+            elif candidate_object == "school" and "membership" in object_hints:
+                fit = min(fit, 0.28)
+        if "technical_failure" in q_facets and ontology.get("state") == "information":
+            fit = min(fit, 0.30)
+        if "price" in q_facets and entry.get("intent_type") in {"flow_date", "school_started"}:
+            fit = min(fit, 0.25)
+
         # If the KB explicitly declares a single intent type and the query has
         # a strong, incompatible facet, keep the fit conservative.
         intent_type = str(entry.get("intent_type") or "").strip()
@@ -1582,12 +1906,16 @@ class KnowledgeBase:
                 fuzzy_phrase=fuzzy_phrase,
             )
             family_fit = self._family_fit(question, entry)
+            ontology_alignment, ontology_reason = self._ontology_alignment(question, entry)
+            domain_support = self._domain_support(question, entry)
 
             semantic = (
                 SEMANTIC_MAX_WEIGHT * item["embedding_score"]
                 + SEMANTIC_TOP3_WEIGHT * item["semantic_top3"]
                 + SEMANTIC_CATEGORY_WEIGHT * item["semantic_prototype"]
             )
+            negative_semantic = float(item.get("negative_semantic_score", 0.0))
+            hard_negative_gap = float(item["embedding_score"] - negative_semantic)
 
             # Convert BM25 to a stable bounded signal. Do NOT divide by the
             # maximum candidate score: that makes a weak query look "0.95"
@@ -1621,6 +1949,10 @@ class KnowledgeBase:
                 "rrf": RRF_WEIGHT,
                 "rerank": RERANK_WEIGHT if self.reranker is not None else 0.0,
                 "evidence": 0.08,
+                # Structured compatibility is deliberately meaningful but not
+                # dominant: it protects against false semantic matches while
+                # allowing terse queries with no explicit ontology to survive.
+                "ontology": 0.10,
             }
             total_weight = sum(base_weights.values())
             scale = 1.0 / max(total_weight, 1e-9)
@@ -1634,10 +1966,26 @@ class KnowledgeBase:
                 + base_weights["rrf"] * rrf_norm
                 + base_weights["rerank"] * generic
                 + base_weights["evidence"] * evidence
+                + base_weights["ontology"] * ontology_alignment
             ) * scale
 
             if contradiction:
                 score -= 0.20
+            # Semantic hard-negative evidence: a candidate that resembles its own
+            # negative examples almost as much as its positives is unsafe.
+            negative_contrast = float(item["embedding_score"] - negative_semantic) if negative_semantic > 0.0 else 1.0
+            if negative_semantic > 0.0:
+                # Penalize candidates whose own negative examples are as close as
+                # or closer than their positives. This is a contradiction signal,
+                # not a generic score penalty.
+                score -= NEGATIVE_SEMANTIC_WEIGHT * max(0.0, -negative_contrast + NEGATIVE_CONTRAST_MIN)
+
+            qo = self._query_ontology(question)
+            ontology = entry.get("ontology") or self._derive_ontology(entry)
+            if ontology_alignment <= ONTOLOGY_HARD_MISMATCH and qo["object"]:
+                score -= OBJECT_MISMATCH_PENALTY
+            elif ontology_alignment < ONTOLOGY_ALIGNMENT_MIN and any(qo.get(k) for k in ("action", "state", "facet")):
+                score -= 0.08
 
             # Query quality is deliberately NOT used as a ranking cap. A short
             # but valid intent can have almost no question-mark/action-form
@@ -1660,6 +2008,14 @@ class KnowledgeBase:
             ranked_item.update({
                 "rerank_score": generic,
                 "semantic_score": float(semantic),
+                "negative_semantic_score": negative_semantic,
+                "hard_negative_gap": hard_negative_gap,
+                "ontology": ontology,
+                "query_ontology": qo,
+                "ontology_alignment_score": float(ontology_alignment),
+                "ontology_alignment_reason": ontology_reason,
+                "domain_support_score": float(domain_support),
+                "negative_contrast_score": float(negative_contrast),
                 "rrf_normalized": float(rrf_norm),
                 "lexical_score": float(lexical_score),
                 "fuzzy_phrase_score": float(fuzzy_phrase),
@@ -1697,13 +2053,14 @@ class KnowledgeBase:
         family = str(entry.get("family") or "")
         intent_type = str(entry.get("intent_type") or "")
         facets = ", ".join(str(x) for x in entry.get("intent_facets", [])[:8])
+        ontology = entry.get("ontology") or self._derive_ontology(entry)
         definition = str(entry.get("definition") or entry.get("scope") or entry.get("description") or "")
         positives = "; ".join(str(x) for x in entry.get("positive_examples", [])[:8])
         negatives = "; ".join(str(x) for x in entry.get("negative_phrases", [])[:5])
         signal_pos = "; ".join(str(x) for x in (entry.get("intent_signals") or {}).get("positive", [])[:8])
         signal_neg = "; ".join(str(x) for x in (entry.get("intent_signals") or {}).get("negative", [])[:8])
         return (
-            f"Семейство: {family}. Тип интента: {intent_type}. Фасеты: {facets}. "
+            f"Семейство: {family}. Объект: {ontology.get('object')}. Действие: {ontology.get('action')}. Состояние: {ontology.get('state')}. Фасет: {ontology.get('facet')}. Тип интента: {intent_type}. Фасеты: {facets}. "
             f"Категория: {category}. Определение: {definition}. "
             f"Положительные примеры: {positives}. "
             f"Intent-сигналы: {signal_pos}. Не подходит для: {signal_neg}. "
@@ -1743,6 +2100,14 @@ class KnowledgeBase:
                 "_lexical_score": float(item.get("lexical_score", 0.0)),
                 "_rerank_score": float(item["rerank_score"]),
                 "_semantic_score": float(item["semantic_score"]),
+                "_negative_semantic_score": float(item.get("negative_semantic_score", 0.0)),
+                "_hard_negative_gap": float(item.get("hard_negative_gap", 0.0)),
+                "_ontology": item.get("ontology", {}),
+                "_query_ontology": {k: sorted(v) for k, v in (item.get("query_ontology") or {}).items()},
+                "_ontology_alignment_score": float(item.get("ontology_alignment_score", 0.0)),
+                "_ontology_alignment_reason": item.get("ontology_alignment_reason", ""),
+                "_domain_support_score": float(item.get("domain_support_score", 0.0)),
+                "_negative_contrast_score": float(item.get("negative_contrast_score", 0.0)),
                 "_rrf_normalized": float(item.get("rrf_normalized", 0.0)),
                 "_lexical_score": float(item.get("lexical_score", 0.0)),
                 "_family_fit_score": float(item.get("family_fit_score", 0.0)),
@@ -1787,6 +2152,12 @@ class KnowledgeBase:
             "family_fit_score": float(item.get("family_fit_score", 0.0)),
             "query_quality_score": float(item.get("query_quality_score", 0.0)),
             "evidence_score": float(item.get("evidence_score", 0.0)),
+            "negative_semantic_score": float(item.get("negative_semantic_score", 0.0)),
+            "hard_negative_gap": float(item.get("hard_negative_gap", 0.0)),
+            "negative_contrast_score": float(item.get("negative_contrast_score", 0.0)),
+            "ontology_alignment_score": float(item.get("ontology_alignment_score", 0.0)),
+            "domain_support_score": float(item.get("domain_support_score", 0.0)),
+            "ontology": item.get("ontology", {}),
         }
 
     def _force_top_choice_candidates(self, ranked: list[dict], n: int = 3) -> list[dict]:
@@ -1841,6 +2212,12 @@ class KnowledgeBase:
             if fit < CATEGORY_CHOICE_MIN_INTENT_FIT:
                 continue
             if float(item.get("real_intent_evidence", 0.0)) < CATEGORY_CHOICE_MIN_REAL_EVIDENCE:
+                continue
+            if float(item.get("ontology_alignment_score", 0.50)) < ONTOLOGY_ALIGNMENT_MIN:
+                continue
+            if float(item.get("negative_contrast_score", 1.0)) <= NEGATIVE_CONTRAST_UNSAFE:
+                continue
+            if float(item.get("domain_support_score", 0.0)) < MIN_DOMAIN_SUPPORT_FOR_AUTO and not item.get("direct_support"):
                 continue
             # Do not offer categories that only matched via weak facet overlap.
             if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not item.get("direct_support"):
@@ -2117,12 +2494,14 @@ class KnowledgeBase:
             top.get("negative_hits") or
             (top.get("constraint_evidence") or {}).get("forbidden_hits")
         )
+        top_candidates = [self._choice_candidate_payload(item) for item in ranked[:3]]
+        negative_reason = self._negative_decision_reason(question, top, ranked)
         second_id = str(second["entry"]["id"]) if second else None
         conflict_ids = {str(x) for x in entry.get("conflict_ids", [])}
         second_is_conflict = bool(second_id and second_id in conflict_ids)
 
         logger.info(
-            "KB v10 decision | kb_id=%s | final=%.4f | margin=%.4f | emb=%.4f | sem=%.4f | lex=%.4f | fuzzy=%.4f | fit=%.4f | family=%.4f | evidence=%.4f | quality=%.4f | reason=%s",
+            "KB v12 decision | kb_id=%s | final=%.4f | margin=%.4f | emb=%.4f | sem=%.4f | lex=%.4f | fuzzy=%.4f | fit=%.4f | family=%.4f | evidence=%.4f | quality=%.4f | reason=%s",
             entry["id"], top_score, margin, embedding, semantic, lexical,
             fuzzy_score, intent_fit, family_fit, real_evidence,
             quality.score, top.get("intent_fit_reason", ""),
@@ -2136,6 +2515,24 @@ class KnowledgeBase:
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
                 subquestion=question, decision_reason="contradiction",
+                top_candidates=top_candidates,
+                domain_support_score=float(top.get("domain_support_score", 0.0)),
+                ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
+            )
+
+        if negative_reason and negative_reason not in {"explicit_candidate_negative"}:
+            return MatchResult(
+                MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
+                second_score=second_score, margin=margin,
+                embedding_score=embedding, intent_fit_score=intent_fit,
+                intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                family_fit_score=family_fit, query_quality_score=quality.score,
+                subquestion=question, decision_reason=negative_reason,
+                top_candidates=top_candidates,
+                domain_support_score=float(top.get("domain_support_score", 0.0)),
+                ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
             )
 
         # 4. Known ambiguity is a first-class state. If the second candidate is
@@ -2162,7 +2559,10 @@ class KnowledgeBase:
                     intent_fit_reason=str(top.get("intent_fit_reason", "")),
                     family_fit_score=family_fit, query_quality_score=quality.score,
                     subquestion=question, decision_reason="ambiguous_conflict",
-                    choice_candidates=choices,
+                    choice_candidates=choices, top_candidates=top_candidates,
+                    domain_support_score=float(top.get("domain_support_score", 0.0)),
+                    ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+                    negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
                 )
 
         # 5. If the evidence points to a supported intent, allow automatic
@@ -2177,7 +2577,7 @@ class KnowledgeBase:
             and margin >= 0.07
         )
         direct_lexical_support = (
-            (direct_support or lexical >= 0.50 or fuzzy_score >= 0.86)
+            (direct_support or lexical >= 0.50 or fuzzy_score >= 0.92)
             and intent_fit >= 0.58
             and family_fit >= 0.30
             and real_evidence >= 0.38
@@ -2213,6 +2613,10 @@ class KnowledgeBase:
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
                 subquestion=question, decision_reason=reason,
+                top_candidates=top_candidates,
+                domain_support_score=float(top.get("domain_support_score", 0.0)),
+                ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
             )
 
         # 6. If two categories are genuinely plausible, expose that ambiguity.
@@ -2231,7 +2635,10 @@ class KnowledgeBase:
                     intent_fit_reason=str(top.get("intent_fit_reason", "")),
                     family_fit_score=family_fit, query_quality_score=quality.score,
                     subquestion=question, decision_reason="supported_ambiguity",
-                    choice_candidates=supported,
+                    choice_candidates=supported, top_candidates=top_candidates,
+                    domain_support_score=float(top.get("domain_support_score", 0.0)),
+                    ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+                    negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
                 )
 
         # 7. Abstain when evidence is weak. This is preferable to a wrong answer.
@@ -2254,6 +2661,10 @@ class KnowledgeBase:
             family_fit_score=family_fit, query_quality_score=quality.score,
             subquestion=question, decision_reason=reason,
             choice_candidates=None,
+            top_candidates=top_candidates,
+            domain_support_score=float(top.get("domain_support_score", 0.0)),
+            ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+            negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
         )
 
     # --------------------------------------------------------
