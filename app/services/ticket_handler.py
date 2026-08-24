@@ -271,6 +271,7 @@ async def handle_new_ticket(
         answer: str | None = None,
         escalation_reason: EscalationReason | None = None,
         question_text: str | None = None,
+        match: MatchResult | None = None,
     ) -> None:
         await repository.create(
             conversation_id=conversation_id,
@@ -280,6 +281,14 @@ async def handle_new_ticket(
             question=question if question_text is None else question_text,
             answer=answer,
             escalation_reason=escalation_reason,
+            predicted_kb_id=match.kb_id if match else None,
+            subquestion=match.subquestion if match else None,
+            score=match.score if match else None,
+            second_score=match.second_score if match else None,
+            margin=match.margin if match else None,
+            embedding_score=match.embedding_score if match else None,
+            intent_fit_score=match.intent_fit_score if match else None,
+            decision_reason=(match.decision_reason[:100] if match and match.decision_reason else None),
         )
 
     async def escalate(
@@ -287,6 +296,7 @@ async def handle_new_ticket(
         *,
         category: str | None = None,
         question_text: str | None = None,
+        match: MatchResult | None = None,
     ) -> None:
         await escalate_to_operator(
             conversation_id=conversation_id,
@@ -303,6 +313,7 @@ async def handle_new_ticket(
             category=category,
             escalation_reason=reason,
             question_text=question_text,
+            match=match,
         )
 
     try:
@@ -443,6 +454,7 @@ async def _execute_match(
             EscalationReason.USER_REQUESTED_OPERATOR,
             category=match.category,
             question_text=question_for_result,
+            match=match,
         )
         return
 
@@ -471,6 +483,7 @@ async def _execute_match(
             EscalationReason.NO_CATEGORY,
             category=match.category,
             question_text=question_for_result,
+            match=match,
         )
         return
 
@@ -495,6 +508,7 @@ async def _execute_match(
             category=match.category,
             answer=match.template_answer,
             question_text=question_for_result,
+            match=match,
         )
         return
 
@@ -513,6 +527,7 @@ async def _execute_match(
             category=match.category,
             answer=match.template_answer,
             question_text=question_for_result,
+            match=match,
         )
         return
 
@@ -623,6 +638,7 @@ async def _execute_llm(
             category=selected_category,
             answer=result.answer,
             question_text=question,
+            match=match,
         )
         return
 
@@ -664,6 +680,7 @@ async def _execute_llm(
             category=category.get("category") if category else match.category,
             answer=clarification,
             question_text=question,
+            match=match,
         )
         return
 

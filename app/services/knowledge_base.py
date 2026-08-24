@@ -278,6 +278,29 @@ def tokenize(text: str) -> list[str]:
     return [w for w in normalize(text).split() if len(w) > 1]
 
 
+# Lightweight Russian morphology helper used only for deterministic intent
+# signals. It is deliberately conservative: semantic retrieval remains the
+# main generalizer, while this catches common inflection/typo variants.
+_RU_SUFFIXES = (
+    "ами", "ями", "ого", "ему", "ому", "ими", "ыми", "ей", "ов", "ев",
+    "ам", "ям", "ом", "ем", "ым", "им", "ах", "ях", "ами", "ями",
+    "ы", "и", "а", "я", "о", "е", "у", "ю", "ь",
+)
+
+def light_stem(token: str) -> str:
+    t = normalize_light(token)
+    if len(t) <= 4:
+        return t
+    for suffix in _RU_SUFFIXES:
+        if t.endswith(suffix) and len(t) - len(suffix) >= 4:
+            return t[:-len(suffix)]
+    return t
+
+
+def stem_tokens(text: str) -> list[str]:
+    return [light_stem(t) for t in normalize_light(text).split() if len(t) > 1]
+
+
 def contains_operator_request(text: str) -> bool:
     q = normalize_light(text)
     return bool(re.search(
@@ -514,7 +537,8 @@ def _split_conjunctive_question(text: str) -> list[str]:
         r"\s+а\s+также\s+",
         r"\s+и\s+еще\s+",
         r"\s+также\s+",
-        r"\s+и\s+",
+        r"\s+и\s+(?=(?:как|где|когда|можно|хочу|хотел|хотела|что|кто|почему|зачем)\b)",
+        r"\s+а\s+(?=(?:как|где|когда|можно|хочу|хотел|хотела|что|кто|почему|зачем)\b)",
     )
     for pattern in patterns:
         parts = [
@@ -842,11 +866,16 @@ class KnowledgeBase:
         def has_any(*prefixes: str) -> bool:
             return any(token.startswith(prefix) for token in tokens for prefix in prefixes)
 
+        stems = stem_tokens(q)
+
         def has_phrase(*phrases: str) -> bool:
             return any(normalize_light(p) in q for p in phrases)
 
+        def has_stem(*prefixes: str) -> bool:
+            return any(s.startswith(prefixes) for s in stems)
+
         def has_school() -> bool:
-            return any(token.startswith("школ") for token in tokens)
+            return any(token.startswith("школ") or light_stem(token).startswith("школ") for token in tokens)
 
         def has_flow() -> bool:
             return any(token.startswith(("поток", "потоков")) for token in tokens)
@@ -895,31 +924,54 @@ class KnowledgeBase:
         # ----------------------------------------------------
         # Mentor family.
         # ----------------------------------------------------
-        if has_any("стать") and has_any("настав", "ментор") and not has_phrase("мой наставник"):
+        mentor = has_any("настав", "ментор")
+        wants_to_become = (
+            has_any("стать", "хот", "жел", "могу", "готов")
+            or has_stem("стат", "хот", "жел", "готов")
+        )
+        personal_mentor = has_any("мой", "моего", "моему", "мне") and mentor
+        retry_signal = has_any("повтор", "снов", "отказ", "отклон")
+        program_signal = has_any("программ") and mentor
+
+        # This is intentionally before the quality gate in match():
+        # short requests such as "Хочу стать наставником" are valid.
+        if mentor and wants_to_become and not personal_mentor and not program_signal and not retry_signal:
             return "kb_023"
-        if has_any("программ") and has_any("наставнич") and not has_any("мой настав", "ментор"):
+        if program_signal and not wants_to_become and not personal_mentor:
             return "kb_034"
-        if has_any("заявк") and has_any("настав", "ментор") and has_any("повтор", "снов", "отказ", "отклон"):
+        if mentor and retry_signal and not personal_mentor:
             return "kb_025"
-        if has_any("настав", "ментор") and not has_phrase("стать наставником", "стать ментором"):
+        if mentor and not wants_to_become and not personal_mentor:
             return "kb_009"
 
         # ----------------------------------------------------
         # Education entry / school registration / registration failure.
         # ----------------------------------------------------
-        registration_failure = (
-            has_any("запис", "вступ", "попаст") and
-            (has_any("не", "нет") or has_phrase("ошибка при записи", "нет кнопки записи", "не пускает в школу"))
+        registration_terms = has_any("запис", "вступ", "попаст", "оформ", "регистра")
+        failure_terms = has_any("не", "нет", "ошиб", "проблем", "неприн", "отказ")
+        registration_failure = registration_terms and (
+            failure_terms
+            or has_phrase("не пускает в школу", "нет кнопки записи", "кнопки записи нет", "не дает записаться")
         )
-        school_registration = has_school() and has_any("запис", "вступ", "попаст", "выбрат")
-        general_training = has_any("обуч", "учит", "учеб")
-        if registration_failure and school_registration:
+        school_registration = has_school() and has_any("запис", "вступ", "попаст", "выбрат", "оформ")
+        general_training = has_any("обуч", "учит", "учеб", "курс")
+
+        # "Не получается записаться" is a complete supported intent even
+        # without the word "школа"; don't require a noun the user may omit.
+        if registration_failure:
             return "kb_002"
-        if school_registration and not registration_failure:
+        if school_registration:
             return "kb_033"
 
-        # Explicit 'how to start/get into training' must not be stolen by kb_033.
-        if general_training and has_any("попаст", "начат", "старт", "попад", "участв") and not school_registration:
+        # Explicit general training entry.
+        if general_training and has_any("попаст", "начат", "старт", "попад", "участв", "хот", "нуж"):
+            return "kb_035"
+        if general_training and registration_terms and not has_school():
+            return "kb_035"
+
+        # "Хочу попасть/начать" without an explicit school is the broader
+        # education-entry intent, not school registration.
+        if has_any("обуч", "учит", "учеб") and has_any("попаст", "начат", "старт", "попад"):
             return "kb_035"
 
         # ----------------------------------------------------
@@ -938,6 +990,16 @@ class KnowledgeBase:
         )
         if asks_flow_date:
             return "kb_016"
+
+        # ----------------------------------------------------
+        # App/account failure. Prefer this over broad semantic retrieval when
+        # the user explicitly says the application rejects their data or login.
+        # ----------------------------------------------------
+        app_signal = has_any("прилож", "приложен")
+        login_signal = has_any("зайт", "войд", "авториз", "логин")
+        rejected_data = has_any("данн", "информац", "учет") and failure_terms
+        if (app_signal and failure_terms and (login_signal or has_any("данн"))) or rejected_data:
+            return "kb_001"
 
         # ----------------------------------------------------
         # Account / phone verification (before generic "код").
@@ -1157,11 +1219,17 @@ class KnowledgeBase:
             return 0.0
 
         q_tokens = set(tokenize(question))
+        q_stems = {light_stem(token) for token in q_tokens}
+        vocab_stems = {light_stem(token) for token in vocab}
         if not q_tokens:
             return 0.0
 
         direct = len(q_tokens & vocab)
-        return float(min(1.0, direct / max(1.0, min(4.0, len(q_tokens)))))
+        stemmed = len(q_stems & vocab_stems)
+        # Exact tokens are strongest; light-stem agreement captures Russian
+        # inflection without requiring a heavyweight morphological pipeline.
+        evidence = direct + 0.70 * max(0, stemmed - direct)
+        return float(min(1.0, evidence / max(1.0, min(4.0, len(q_tokens)))))
 
     # --------------------------------------------------------
     # INTENT FIT / QUESTION-TYPE COMPATIBILITY
@@ -1179,6 +1247,65 @@ class KnowledgeBase:
         facets: set[str] = set()
 
         patterns: dict[str, tuple[str, ...]] = {
+            "mentor_application": (
+                "хочу стать наставником", "хотел бы стать наставником",
+                "хотела бы стать наставником", "хочу быть наставником",
+                "стать ментором", "хочу преподавать",
+            ),
+            "mentor_program": (
+                "программа наставничества", "как работает наставничество",
+                "что такое наставничество",
+            ),
+            "personal_mentor": (
+                "мой наставник", "моего наставника", "кто мой наставник",
+                "мой ментор", "наставник не отвечает",
+            ),
+            "retry": (
+                "повторно подать", "заново подать", "повторная заявка",
+                "заявку отклонили", "заявка отклонена",
+            ),
+            "school": (
+                "выбрать школу", "в школу", "школу выбрать",
+            ),
+            "registration": (
+                "записаться", "запись", "регистрация", "зарегистрироваться",
+            ),
+            "voluntary_exit": (
+                "выйти из школы", "уйти из школы", "отчислиться из школы",
+                "покинуть школу",
+            ),
+            "school_transfer": (
+                "сменить школу", "перейти в другую школу",
+                "перевестись в другую школу",
+            ),
+            "restoration": (
+                "восстановиться в школе", "вернуться в школу",
+                "восстановить обучение",
+            ),
+            "involuntary_exclusion": (
+                "меня исключили", "меня отчислили", "меня выгнали",
+            ),
+            "telegram_membership": (
+                "добавьте меня в чат", "не добавили в чат",
+                "нет меня в группе", "не добавили в телеграм",
+            ),
+            "telegram_link": (
+                "ссылка на чат", "ссылка на телеграм",
+                "ссылка не открывается",
+            ),
+            "invite_code": (
+                "инвайт код", "инвайт-код", "код приглашения",
+            ),
+            "qr_code": (
+                "qr код", "qr-код", "не сканируется qr",
+            ),
+            "account": (
+                "не принимает данные", "регистрация с разными аккаунтами",
+                "не тот аккаунт",
+            ),
+            "verification": (
+                "код подтверждения", "не приходит смс", "подтвердить номер",
+            ),
             "age": (
                 "с какого возраста", "до какого возраста", "со скольки лет",
                 "с какого лет", "после 50", "после 40", "после 30",
@@ -1512,13 +1639,11 @@ class KnowledgeBase:
             if contradiction:
                 score -= 0.20
 
-            if query_quality.domain_overlap < 0.15 and query_quality.question_signal < 0.30 and query_quality.action_signal < 0.30:
-                # A candidate must not become highly confident only because its
-                # embedding happens to be close to a semantically broad phrase.
-                score *= 0.60
-
-            if not query_quality.valid:
-                score = min(score, 0.45)
+            # Query quality is deliberately NOT used as a ranking cap. A short
+            # but valid intent can have almost no question-mark/action-form
+            # signal (e.g. "Хотел бы стать наставником"). Noise/OOS handling is
+            # performed by the decision layer, while evidence and contradictions
+            # determine whether a candidate may actually be selected.
 
             final_score = float(max(0.0, min(1.0, score)))
 
@@ -1845,6 +1970,16 @@ class KnowledgeBase:
     # --------------------------------------------------------
 
     def match(self, question: str) -> MatchResult:
+        """Classify one user message with an evidence-first policy.
+
+        Key design rules:
+        * deterministic high-precision rules run BEFORE generic quality checks;
+        * quality is a noise signal, never a blanket "not a question" gate;
+        * embeddings generate candidates, they never prove an intent alone;
+        * automatic answers require either deterministic evidence, direct KB
+          evidence, or strong semantic+intent agreement;
+        * ambiguous/unsupported requests abstain instead of inventing a category.
+        """
         question = (question or "").strip()
 
         if not question:
@@ -1871,42 +2006,18 @@ class KnowledgeBase:
                 decision_reason="user_requested_operator",
             )
 
-        quality = _query_quality(question)
-        if not quality.valid:
-            logger.info(
-                "KB v9 quality reject | reason=%s | quality=%.3f | question=%r",
-                quality.reason,
-                quality.score,
-                question,
-            )
-            return MatchResult(
-                MatchMode.NO_MATCH,
-                0.0,
-                None,
-                None,
-                None,
-                [],
-                subquestion=question,
-                decision_reason=f"query_quality_reject:{quality.reason}",
-                query_quality_score=quality.score,
-            )
-
         if not self.entries:
             return MatchResult(
-                MatchMode.NO_MATCH,
-                0.0,
-                None,
-                None,
-                None,
-                [],
+                MatchMode.NO_MATCH, 0.0, None, None, None, [],
                 subquestion=question,
                 decision_reason="empty_knowledge_base",
-                query_quality_score=quality.score,
             )
 
-        # 1. Deterministic business rules. These have the highest precision,
-        # but only after query-quality gating.
+        # 1. Deterministic business rules have the highest precision and must
+        # run before the generic query-quality filter. This fixes valid short
+        # inputs such as "Хочу стать наставником".
         hard_id = self._hard_rule_match(question)
+        quality = _query_quality(question)
         if hard_id:
             entry = self.entries_by_id.get(hard_id)
             if entry and not self._negative_hits(question, entry):
@@ -1914,423 +2025,234 @@ class KnowledgeBase:
                 family_fit = self._family_fit(question, entry)
                 if entry.get("requires_clarification"):
                     return MatchResult(
-                        MatchMode.CLARIFICATION,
-                        0.99,
-                        entry.get("category"),
-                        entry.get("clarification_question"),
-                        hard_id,
-                        [self._clean_entry_for_llm(entry)],
-                        entry=entry,
-                        margin=0.99,
-                        intent_fit_score=fit,
-                        intent_fit_reason=fit_reason,
-                        family_fit_score=family_fit,
-                        query_quality_score=quality.score,
-                        subquestion=question,
-                        decision_reason="hard_rule",
+                        MatchMode.CLARIFICATION, 0.995, entry.get("category"),
+                        entry.get("clarification_question"), hard_id,
+                        [self._clean_entry_for_llm(entry)], entry=entry,
+                        second_score=0.0, margin=0.995, fuzzy_score=1.0,
+                        intent_fit_score=fit, intent_fit_reason=fit_reason,
+                        family_fit_score=family_fit, query_quality_score=quality.score,
+                        subquestion=question, decision_reason="hard_rule",
                     )
                 return MatchResult(
-                    MatchMode.TEMPLATE,
-                    0.99,
-                    entry.get("category"),
+                    MatchMode.TEMPLATE, 0.995, entry.get("category"),
                     (entry.get("template_answer") or "") + OPERATOR_HINT,
-                    hard_id,
-                    [self._clean_entry_for_llm(entry)],
-                    entry=entry,
-                    margin=0.99,
-                    intent_fit_score=fit,
-                    intent_fit_reason=fit_reason,
-                    family_fit_score=family_fit,
+                    hard_id, [self._clean_entry_for_llm(entry)], entry=entry,
+                    second_score=0.0, margin=0.995, fuzzy_score=1.0,
+                    intent_fit_score=max(0.75, fit), intent_fit_reason=fit_reason,
+                    family_fit_score=max(0.60, family_fit),
                     query_quality_score=quality.score,
-                    subquestion=question,
-                    decision_reason="hard_rule",
+                    subquestion=question, decision_reason="hard_rule",
                 )
 
-        # 2. Exact/fuzzy shortcut only for near-duplicate wording.
+        # 2. Obvious non-query/noise is rejected before expensive retrieval.
+        # Short but semantically meaningful messages are not rejected here if
+        # they have a strong fuzzy match.
+        if quality.meta_noise:
+            return MatchResult(
+                MatchMode.NO_MATCH, 0.0, None, None, None, [],
+                subquestion=question,
+                decision_reason=f"noise:{quality.reason}",
+                query_quality_score=quality.score,
+            )
+
         fuzzy = self._fuzzy_candidates(question)
         if fuzzy:
             top_f = fuzzy[0]
             second_f = fuzzy[1]["score"] if len(fuzzy) > 1 else 0.0
             fuzzy_gap = top_f["score"] - second_f
             if (
-                top_f["score"] >= FUZZY_AUTO_MIN
-                and fuzzy_gap >= FUZZY_AUTO_MARGIN
+                top_f["score"] >= 98.0
+                and fuzzy_gap >= 8.0
                 and not top_f["negative_hits"]
             ):
                 entry = top_f["entry"]
                 fit, fit_reason = self._intent_fit(
-                    question,
-                    entry,
-                    fuzzy_phrase=top_f["score"] / 100.0,
+                    question, entry, fuzzy_phrase=top_f["score"] / 100.0,
                 )
                 family_fit = self._family_fit(question, entry)
-                if (
-                    fit >= INTENT_FIT_TEMPLATE_MIN
-                    and family_fit >= MIN_FAMILY_FIT_TEMPLATE
-                    and quality.score >= MIN_QUERY_QUALITY_TEMPLATE
-                ):
-                    mode = (
-                        MatchMode.CLARIFICATION
-                        if entry.get("requires_clarification")
-                        else MatchMode.TEMPLATE
-                    )
-                    answer = (
-                        entry.get("clarification_question")
-                        if mode == MatchMode.CLARIFICATION
-                        else (entry.get("template_answer") or "") + OPERATOR_HINT
-                    )
+                mode = MatchMode.CLARIFICATION if entry.get("requires_clarification") else MatchMode.TEMPLATE
+                answer = (
+                    entry.get("clarification_question")
+                    if mode == MatchMode.CLARIFICATION
+                    else (entry.get("template_answer") or "") + OPERATOR_HINT
+                )
+                if fit >= 0.55 and family_fit >= 0.25 and answer:
                     return MatchResult(
-                        mode,
-                        top_f["score"] / 100.0,
-                        entry.get("category"),
-                        answer,
-                        entry.get("id"),
-                        [self._clean_entry_for_llm(entry)],
-                        entry=entry,
-                        second_score=second_f / 100.0,
-                        margin=fuzzy_gap / 100.0,
+                        mode, top_f["score"] / 100.0, entry.get("category"), answer,
+                        entry.get("id"), [self._clean_entry_for_llm(entry)], entry=entry,
+                        second_score=second_f / 100.0, margin=fuzzy_gap / 100.0,
                         fuzzy_score=top_f["score"] / 100.0,
-                        intent_fit_score=fit,
-                        intent_fit_reason=fit_reason,
+                        intent_fit_score=fit, intent_fit_reason=fit_reason,
                         family_fit_score=family_fit,
                         query_quality_score=quality.score,
-                        subquestion=question,
-                        decision_reason="strong_fuzzy_match",
+                        subquestion=question, decision_reason="near_duplicate_phrase",
                     )
 
-        # 3. Hybrid retrieval and bounded ranking.
+        # 3. Hybrid retrieval + evidence-first ranking.
         candidates = self._retrieve_candidates(question)
         ranked = self._rank_candidates(question, candidates)
         if not ranked:
             return MatchResult(
-                MatchMode.NO_MATCH,
-                0.0,
-                None,
-                None,
-                None,
-                [],
-                subquestion=question,
-                decision_reason="no_candidates",
+                MatchMode.NO_MATCH, 0.0, None, None, None, [],
+                subquestion=question, decision_reason="no_candidates",
                 query_quality_score=quality.score,
             )
 
         top = ranked[0]
         second = ranked[1] if len(ranked) > 1 else None
-        top_score = float(top["final_score"])
-        second_score = float(second["final_score"]) if second else 0.0
+        top_score = float(top.get("final_score", 0.0))
+        second_score = float(second.get("final_score", 0.0)) if second else 0.0
         margin = max(0.0, top_score - second_score)
         relevant_entries = self._build_relevant_entries(ranked)
-
         entry = top["entry"]
         intent_fit = float(top.get("intent_fit_score", 0.0))
-        intent_fit_reason = str(top.get("intent_fit_reason", ""))
         family_fit = float(top.get("family_fit_score", 0.0))
-        second_id = str(second["entry"]["id"]) if second else None
-        conflict_ids = {str(x) for x in entry.get("conflict_ids", [])}
-        second_is_known_conflict = bool(second_id and second_id in conflict_ids)
-        has_lexical = (
-            bool(top["positive_hits"])
-            or float(top.get("lexical_score", 0.0)) >= 0.35
-            or float(top.get("fuzzy_phrase_score", 0.0)) >= 0.88
-        )
-        semantic_gap = (
-            float(top["semantic_score"]) - float(second["semantic_score"])
-            if second else float(top["semantic_score"])
-        )
         real_evidence = float(top.get("real_intent_evidence", 0.0))
         direct_support = bool(top.get("direct_support", False))
+        lexical = float(top.get("lexical_score", 0.0))
+        fuzzy_score = float(top.get("fuzzy_phrase_score", 0.0))
+        embedding = float(top.get("embedding_score", 0.0))
+        semantic = float(top.get("semantic_score", 0.0))
+        contradiction = bool(
+            top.get("negative_hits") or
+            (top.get("constraint_evidence") or {}).get("forbidden_hits")
+        )
+        second_id = str(second["entry"]["id"]) if second else None
+        conflict_ids = {str(x) for x in entry.get("conflict_ids", [])}
+        second_is_conflict = bool(second_id and second_id in conflict_ids)
 
         logger.info(
-            "KB v9 decision | kb_id=%s | final=%.4f | margin=%.4f | emb=%.4f | sem=%.4f | lex=%.4f | rrf=%.4f | rerank=%.4f | fit=%.4f | family=%.4f | quality=%.4f | reason=%s",
-            entry["id"],
-            top_score,
-            margin,
-            top["embedding_score"],
-            top["semantic_score"],
-            top.get("lexical_score", 0.0),
-            top["rrf_score"],
-            top["rerank_score"],
-            intent_fit,
-            family_fit,
-            quality.score,
-            intent_fit_reason,
+            "KB v10 decision | kb_id=%s | final=%.4f | margin=%.4f | emb=%.4f | sem=%.4f | lex=%.4f | fuzzy=%.4f | fit=%.4f | family=%.4f | evidence=%.4f | quality=%.4f | reason=%s",
+            entry["id"], top_score, margin, embedding, semantic, lexical,
+            fuzzy_score, intent_fit, family_fit, real_evidence,
+            quality.score, top.get("intent_fit_reason", ""),
         )
 
-        # Similarity alone can never establish that a real supported intent exists.
-        # Weak facet-only fit without phrase/lexical support = no real category match.
-        weak_facet_only = (
-            str(intent_fit_reason).startswith("facet_overlap")
-            and not top.get("positive_hits")
-            and float(top.get("fuzzy_phrase_score", 0.0)) < 0.90
-        )
-        unsupported_intent = (
-            (
-                real_evidence < MIN_REAL_INTENT_EVIDENCE
-                and intent_fit < MIN_REAL_INTENT_FIT
-                and not direct_support
-            )
-            or (
-                not direct_support
-                and real_evidence < 0.50
-                and weak_facet_only
-            )
-            or (
-                not direct_support
-                and real_evidence < MIN_REAL_INTENT_EVIDENCE
-                and float(top.get("fuzzy_phrase_score", 0.0)) < 0.88
-            )
-        )
-        if unsupported_intent:
+        if contradiction:
             return MatchResult(
                 MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
                 second_score=second_score, margin=margin,
-                embedding_score=float(top["embedding_score"]),
-                intent_fit_score=intent_fit, intent_fit_reason=intent_fit_reason,
+                embedding_score=embedding, intent_fit_score=intent_fit,
+                intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason="no_affirmative_intent_evidence",
+                subquestion=question, decision_reason="contradiction",
             )
 
-        if entry.get("requires_clarification"):
-            return MatchResult(
-                MatchMode.CLARIFICATION,
-                top_score,
-                entry.get("category"),
-                entry.get("clarification_question"),
-                entry.get("id"),
-                relevant_entries,
-                entry=entry,
-                second_score=second_score,
-                margin=margin,
-                embedding_score=float(top["embedding_score"]),
-                intent_fit_score=intent_fit,
-                intent_fit_reason=intent_fit_reason,
-                family_fit_score=family_fit,
-                query_quality_score=quality.score,
-                subquestion=question,
-                decision_reason="kb_requires_clarification",
-            )
-
-        # Hard semantic/intention mismatch: never auto-template, never fake top-3.
-        if intent_fit < INTENT_FIT_HARD_MISMATCH:
-            return MatchResult(
-                MatchMode.NO_MATCH,
-                top_score,
-                None,
-                None,
-                None,
-                relevant_entries,
-                second_score=second_score,
-                margin=margin,
-                embedding_score=float(top["embedding_score"]),
-                intent_fit_score=intent_fit,
-                intent_fit_reason=intent_fit_reason,
-                family_fit_score=family_fit,
-                query_quality_score=quality.score,
-                subquestion=question,
-                decision_reason="hard_intent_mismatch",
-            )
-
-        # Direct contradiction: never auto-template, never fake top-3.
-        contradiction = bool(
-            top["negative_hits"]
-            or top["constraint_evidence"].get("forbidden_hits")
+        # 4. Known ambiguity is a first-class state. If the second candidate is
+        # a declared conflict and both have meaningful evidence, ask the user
+        # instead of guessing.
+        second_real = float(second.get("real_intent_evidence", 0.0)) if second else 0.0
+        second_fit = float(second.get("intent_fit_score", 0.0)) if second else 0.0
+        both_supported = (
+            second is not None
+            and second_is_conflict
+            and second_real >= 0.42
+            and second_fit >= 0.50
+            and real_evidence >= 0.42
+            and top_score < 0.88
         )
-        if contradiction:
-            return MatchResult(
-                MatchMode.NO_MATCH,
-                top_score,
-                None,
-                None,
-                None,
-                relevant_entries,
-                second_score=second_score,
-                margin=margin,
-                embedding_score=float(top["embedding_score"]),
-                intent_fit_score=intent_fit,
-                intent_fit_reason=intent_fit_reason,
-                family_fit_score=family_fit,
-                query_quality_score=quality.score,
-                subquestion=question,
-                decision_reason="contradiction",
-            )
-
-        # ----------------------------------------------------
-        # TEMPLATE (points 3/6): high-confidence path OR strong affirmative evidence.
-        # Ranking score alone is never enough — need evidence + fit + margin safety.
-        # ----------------------------------------------------
-        strong_evidence = self._has_strong_affirmative_evidence(top)
-        competitor_ok = (
-            not second_is_known_conflict
-            or margin >= CONFLICT_COMPETITOR_MARGIN
-        )
-        second_fit_ok = (
-            not second
-            or float(second.get("intent_fit_score", 0.0)) <= intent_fit - 0.04
-            or margin >= AUTO_MARGIN
-        )
-
-        high_confidence_template = (
-            quality.score >= MIN_QUERY_QUALITY_TEMPLATE
-            and top_score >= AUTO_SCORE
-            and margin >= AUTO_MARGIN
-            and intent_fit >= INTENT_FIT_TEMPLATE_MIN
-            and family_fit >= MIN_FAMILY_FIT_TEMPLATE
-            and real_evidence >= MIN_TEMPLATE_EVIDENCE
-            and direct_support
-            and competitor_ok
-            and second_fit_ok
-        )
-
-        # Override: slightly lower score is OK only with strong affirmative evidence.
-        strong_evidence_template = (
-            strong_evidence
-            and quality.score >= MIN_QUERY_QUALITY_TEMPLATE
-            and top_score >= STRONG_EVIDENCE_TEMPLATE_SCORE
-            and margin >= STRONG_EVIDENCE_TEMPLATE_MARGIN
-            and intent_fit >= STRONG_EVIDENCE_TEMPLATE_FIT
-            and family_fit >= STRONG_EVIDENCE_TEMPLATE_FAMILY
-            and real_evidence >= STRONG_EVIDENCE_MIN_REAL
-            and direct_support
-            and competitor_ok
-            and not contradiction
-        )
-
-        if high_confidence_template or strong_evidence_template:
-            return MatchResult(
-                MatchMode.TEMPLATE,
-                top_score,
-                entry.get("category"),
-                (entry.get("template_answer") or "") + OPERATOR_HINT,
-                entry.get("id"),
-                relevant_entries,
-                entry=entry,
-                second_score=second_score,
-                margin=margin,
-                embedding_score=float(top["embedding_score"]),
-                intent_fit_score=intent_fit,
-                intent_fit_reason=intent_fit_reason,
-                family_fit_score=family_fit,
-                query_quality_score=quality.score,
-                subquestion=question,
-                decision_reason=(
-                    "high_confidence_template"
-                    if high_confidence_template
-                    else "strong_evidence_template"
-                ),
-            )
-
-        # ----------------------------------------------------
-        # CATEGORY_CHOICE middle mode (point 7): before LLM.
-        # When TEMPLATE is not safe but 2–3 sensible alternatives exist.
-        # ----------------------------------------------------
-        choice_candidates = self._category_choice_candidates(ranked)
-        if len(choice_candidates) >= CATEGORY_CHOICE_MIN_CANDIDATES:
-            return MatchResult(
-                MatchMode.CATEGORY_CHOICE,
-                top_score,
-                entry.get("category"),
-                None,
-                entry.get("id"),
-                relevant_entries,
-                entry=entry,
-                second_score=second_score,
-                margin=margin,
-                embedding_score=float(top["embedding_score"]),
-                intent_fit_score=intent_fit,
-                intent_fit_reason=intent_fit_reason,
-                family_fit_score=family_fit,
-                query_quality_score=quality.score,
-                subquestion=question,
-                decision_reason="category_choice_middle_mode",
-                choice_candidates=choice_candidates,
-            )
-
-        # ----------------------------------------------------
-        # TEMP: LLM disabled.
-        # Only offer top categories when they have REAL support.
-        # Otherwise NO_MATCH — do not invent a category that does not exist.
-        # ----------------------------------------------------
-        llm_eligible = (
-            quality.score >= MIN_QUERY_QUALITY_LLM
-            and top_score >= LLM_SCORE
-            and intent_fit >= INTENT_FIT_LLM_MIN
-            and real_evidence >= MIN_REAL_INTENT_EVIDENCE
-            and (direct_support or real_evidence >= 0.48)
-            and (
-                margin >= LLM_MARGIN
-                or (
-                    top_score >= HIGH_SCORE_LOW_MARGIN
-                    and (
-                        has_lexical
-                        or semantic_gap >= SEMANTIC_GAP_FOR_LLM
-                    )
-                )
-                or (
-                    second_is_known_conflict
-                    and top_score >= LLM_SCORE
-                )
-                or intent_fit < INTENT_FIT_TEMPLATE_MIN
-            )
-        )
-        if llm_eligible:
-            # Prefer filtered choice candidates; never force unrelated top-3.
-            safe_choices = choice_candidates or self._category_choice_candidates(ranked)
-            if len(safe_choices) >= CATEGORY_CHOICE_MIN_CANDIDATES:
+        if both_supported and margin < 0.08:
+            choices = self._category_choice_candidates(ranked)
+            if len(choices) >= 2:
                 return MatchResult(
-                    MatchMode.CATEGORY_CHOICE,
-                    top_score,
-                    entry.get("category"),
-                    None,
-                    entry.get("id"),
-                    relevant_entries,
-                    entry=entry,
-                    second_score=second_score,
-                    margin=margin,
-                    embedding_score=float(top["embedding_score"]),
-                    intent_fit_score=intent_fit,
-                    intent_fit_reason=intent_fit_reason,
-                    family_fit_score=family_fit,
-                    query_quality_score=quality.score,
-                    subquestion=question,
-                    decision_reason="temp_llm_disabled:safe_category_choice",
-                    choice_candidates=safe_choices,
+                    MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
+                    entry.get("id"), relevant_entries, entry=entry,
+                    second_score=second_score, margin=margin,
+                    embedding_score=embedding, intent_fit_score=intent_fit,
+                    intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                    family_fit_score=family_fit, query_quality_score=quality.score,
+                    subquestion=question, decision_reason="ambiguous_conflict",
+                    choice_candidates=choices,
                 )
-            # No safe alternatives → admit we don't know (orchestrator: rephrase/operator).
+
+        # 5. If the evidence points to a supported intent, allow automatic
+        # routing even when the query itself is short/grammatically rough.
+        # Quality therefore influences OOS/noise detection, not basic intent
+        # classification.
+        direct_semantic_support = (
+            embedding >= 0.84
+            and semantic >= 0.67
+            and intent_fit >= 0.68
+            and family_fit >= 0.45
+            and margin >= 0.07
+        )
+        direct_lexical_support = (
+            (direct_support or lexical >= 0.50 or fuzzy_score >= 0.86)
+            and intent_fit >= 0.58
+            and family_fit >= 0.30
+            and real_evidence >= 0.38
+            and margin >= (0.035 if second_is_conflict else 0.025)
+        )
+        safe_auto = (
+            not second_is_conflict or margin >= 0.075
+        ) and (direct_lexical_support or direct_semantic_support)
+
+        if entry.get("requires_clarification") and safe_auto:
             return MatchResult(
-                MatchMode.NO_MATCH,
-                top_score,
-                None,
-                None,
-                None,
-                relevant_entries,
-                second_score=second_score,
-                margin=margin,
-                embedding_score=float(top["embedding_score"]),
-                intent_fit_score=intent_fit,
-                intent_fit_reason=intent_fit_reason,
-                family_fit_score=family_fit,
-                query_quality_score=quality.score,
-                subquestion=question,
-                decision_reason="temp_llm_disabled:no_safe_category",
+                MatchMode.CLARIFICATION, top_score, entry.get("category"),
+                entry.get("clarification_question"), entry.get("id"), relevant_entries,
+                entry=entry, second_score=second_score, margin=margin,
+                embedding_score=embedding, intent_fit_score=intent_fit,
+                intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                family_fit_score=family_fit, query_quality_score=quality.score,
+                subquestion=question, decision_reason="supported_intent_requires_clarification",
             )
 
-        # Unresolved: orchestrator may REPHRASE / escalate.
+        if safe_auto and entry.get("template_answer"):
+            reason = (
+                "strong_semantic_intent_match"
+                if direct_semantic_support and not direct_lexical_support
+                else "strong_lexical_intent_match"
+            )
+            return MatchResult(
+                MatchMode.TEMPLATE, max(top_score, 0.75), entry.get("category"),
+                (entry.get("template_answer") or "") + OPERATOR_HINT,
+                entry.get("id"), relevant_entries, entry=entry,
+                second_score=second_score, margin=margin, embedding_score=embedding,
+                intent_fit_score=intent_fit,
+                intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                family_fit_score=family_fit, query_quality_score=quality.score,
+                subquestion=question, decision_reason=reason,
+            )
+
+        # 6. If two categories are genuinely plausible, expose that ambiguity.
+        choices = self._category_choice_candidates(ranked)
+        if len(choices) >= 2:
+            supported = [
+                c for c in choices
+                if float(c.get("real_intent_evidence", 0.0)) >= CATEGORY_CHOICE_MIN_REAL_EVIDENCE
+            ]
+            if len(supported) >= 2:
+                return MatchResult(
+                    MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
+                    entry.get("id"), relevant_entries, entry=entry,
+                    second_score=second_score, margin=margin,
+                    embedding_score=embedding, intent_fit_score=intent_fit,
+                    intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                    family_fit_score=family_fit, query_quality_score=quality.score,
+                    subquestion=question, decision_reason="supported_ambiguity",
+                    choice_candidates=supported,
+                )
+
+        # 7. Abstain when evidence is weak. This is preferable to a wrong answer.
+        # Mark the reason explicitly so orchestration can distinguish OOS from
+        # insufficient context from low-confidence known intent.
+        if quality.score < 0.14 and not direct_support:
+            reason = "insufficient_context"
+        elif top_score < 0.50 and not direct_support:
+            reason = "low_confidence"
+        elif family_fit < 0.25 and not direct_support:
+            reason = "oos_or_wrong_family"
+        else:
+            reason = "unsupported_or_ambiguous"
+
         return MatchResult(
-            MatchMode.NO_MATCH,
-            top_score,
-            None,
-            None,
-            None,
-            relevant_entries,
-            second_score=second_score,
-            margin=margin,
-            embedding_score=float(top["embedding_score"]),
+            MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
+            second_score=second_score, margin=margin, embedding_score=embedding,
             intent_fit_score=intent_fit,
-            intent_fit_reason=intent_fit_reason,
-            family_fit_score=family_fit,
-            query_quality_score=quality.score,
-            subquestion=question,
-            decision_reason="insufficient_confidence",
+            intent_fit_reason=str(top.get("intent_fit_reason", "")),
+            family_fit_score=family_fit, query_quality_score=quality.score,
+            subquestion=question, decision_reason=reason,
             choice_candidates=None,
         )
 

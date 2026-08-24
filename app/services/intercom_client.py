@@ -97,17 +97,26 @@ class IntercomClient:
             return False
 
         try:
-            # Помечаем тегом escalated, если нужно
+            # Tagging is auxiliary telemetry. A tag failure must NEVER prevent
+            # the actual customer reply from being delivered.
             if escalate:
-                tag_resp = await self._client.post(
-                    f"{INTERCOM_API_BASE}/conversations/{conversation_id}/tags",
-                    json={
-                        "id": "15975673",
-                        "admin_id": admin_id,
-                    },
-                )
-                tag_resp.raise_for_status()
-                logger.info("Tagged conversation %s as escalated", conversation_id)
+                try:
+                    tag_resp = await self._client.post(
+                        f"{INTERCOM_API_BASE}/conversations/{conversation_id}/tags",
+                        json={
+                            "id": "15975673",
+                            "admin_id": admin_id,
+                        },
+                    )
+                    if tag_resp.is_success:
+                        logger.info("Tagged conversation %s as escalated", conversation_id)
+                    else:
+                        logger.warning(
+                            "Conversation tag failed conv=%s status=%s body=%s",
+                            conversation_id, tag_resp.status_code, tag_resp.text[:250],
+                        )
+                except httpx.HTTPError as tag_error:
+                    logger.warning("Conversation tagging failed conv=%s: %s", conversation_id, tag_error)
 
             # Отправляем ответ
             resp = await self._client.post(
@@ -147,17 +156,26 @@ class IntercomClient:
             return False
 
         try:
-            # Помечаем тегом escalated, если нужно
+            # Tagging is auxiliary telemetry. Intercom may reject tagging for
+            # a ticket without a taggable part; the reply must still be sent.
             if escalate:
-                tag_resp = await self._client.post(
-                    f"{INTERCOM_API_BASE}/tickets/{ticket_id}/tags",
-                    json={
-                        "id": "15975673",
-                        "admin_id": admin_id,
-                    },
-                )
-                tag_resp.raise_for_status()
-                logger.info("Tagged ticket %s as escalated", ticket_id)
+                try:
+                    tag_resp = await self._client.post(
+                        f"{INTERCOM_API_BASE}/tickets/{ticket_id}/tags",
+                        json={
+                            "id": "15975673",
+                            "admin_id": admin_id,
+                        },
+                    )
+                    if tag_resp.is_success:
+                        logger.info("Tagged ticket %s as escalated", ticket_id)
+                    else:
+                        logger.warning(
+                            "Ticket tag failed id=%s status=%s body=%s",
+                            ticket_id, tag_resp.status_code, tag_resp.text[:250],
+                        )
+                except httpx.HTTPError as tag_error:
+                    logger.warning("Ticket tagging failed id=%s: %s", ticket_id, tag_error)
 
             # Отправляем ответ
             resp = await self._client.post(
