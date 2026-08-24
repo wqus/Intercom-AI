@@ -30,12 +30,9 @@ class SupportApplication:
         if not escalate:
             return
 
+        # Escalation deliberately has no Intercom assignment/tag side effects:
+        # the bot only acknowledges the hand-off and notifies operators in Telegram.
         reason = "escalated_to_operator"
-        try:
-            await self.intercom.add_escalation_tag(message.entity_id, message.channel.value)
-        except Exception:
-            logger.exception("Escalation tag failed entity=%s", message.entity_id)
-
         if self.telegram:
             try:
                 await self.telegram.notify_escalation(
@@ -183,7 +180,11 @@ class SupportApplication:
                 await self._deliver(message, action.text, action.escalate)
 
         if result.traces and not any(t.decision in {Decision.CLARIFY, Decision.CHOICE} for t in result.traces):
-            if result.escalated:
+            # ProcessingResult intentionally carries actions, not a separate
+            # `escalated` flag. Derive the state transition from the actual
+            # outbound action that was delivered.
+            escalated = any(action.escalate for action in result.actions)
+            if escalated:
                 await StateRepository(session).replace(message.entity_id, ConversationStateKind.ESCALATED, {
                     "reason": next((t.escalation_reason.value for t in result.traces if t.escalation_reason), "unknown")
                 })
