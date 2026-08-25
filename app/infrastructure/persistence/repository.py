@@ -1,8 +1,15 @@
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.infrastructure.persistence.models import InboundEvent, ConversationState, SupportInteraction
+from app.infrastructure.persistence.models import (
+    InboundEvent,
+    ConversationState,
+    EscalatedConversation,
+    SupportInteraction,
+)
 from app.domain.enums import EventStatus, ConversationStateKind
+
 
 class EventRepository:
     def __init__(self, session: AsyncSession):
@@ -63,11 +70,41 @@ class EventRepository:
             event.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         await self.session.commit()
 
+
 class StateRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get(self, conversation_id: str) -> ConversationState:
+    async def get(self, conversation_id: str, *, for_update: bool = False) -> ConversationState:
+        if for_update:
+            state = await self.session.scalar(
+                select(ConversationState)
+                .where(ConversationState.conversation_id == conversation_id)
+                .with_for_update()
+            )
+            if state:
+                return state
+
+            # The first event for a conversation has no state row yet. Insert it
+            # atomically so two workers cannot race into a duplicate-PK error.
+            await self.session.execute(
+                pg_insert(ConversationState)
+                .values(
+                    conversation_id=conversation_id,
+                    state=ConversationStateKind.IDLE,
+                    data={},
+                )
+                .on_conflict_do_nothing(index_elements=[ConversationState.conversation_id])
+            )
+            state = await self.session.scalar(
+                select(ConversationState)
+                .where(ConversationState.conversation_id == conversation_id)
+                .with_for_update()
+            )
+            if state:
+                return state
+            raise RuntimeError(f"Failed to initialize conversation state: {conversation_id}")
+
         state = await self.session.get(ConversationState, conversation_id)
         if state:
             return state
@@ -81,6 +118,58 @@ class StateRepository:
         current.state = state
         current.data = data
         await self.session.flush()
+
+
+class EscalatedConversationRepository:
+    """Read/write access to the persistent post-escalation blocklist."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get(self, conversation_id: str) -> EscalatedConversation | None:
+        return await self.session.get(EscalatedConversation, conversation_id)
+
+    async def is_escalated(self, conversation_id: str) -> bool:
+        return await self.get(conversation_id) is not None
+
+    async def record(
+        self,
+        *,
+        conversation_id: str,
+        channel: str,
+        reason: str,
+        user_name: str = "",
+        user_email: str = "",
+        last_message_text: str = "",
+        last_message_at: str = "",
+        source_event_id: int | None = None,
+    ) -> EscalatedConversation:
+        existing = await self.get(conversation_id)
+        if existing:
+            # Preserve the original escalation time/reason, but refresh the
+            # diagnostic customer information in case the first payload was sparse.
+            existing.user_name = user_name or existing.user_name
+            existing.user_email = user_email or existing.user_email
+            existing.last_message_text = last_message_text or existing.last_message_text
+            existing.last_message_at = last_message_at or existing.last_message_at
+            existing.source_event_id = source_event_id or existing.source_event_id
+            await self.session.flush()
+            return existing
+
+        row = EscalatedConversation(
+            conversation_id=conversation_id,
+            channel=channel,
+            reason=reason,
+            user_name=user_name,
+            user_email=user_email,
+            last_message_text=last_message_text,
+            last_message_at=last_message_at,
+            source_event_id=source_event_id,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
 
 class InteractionRepository:
     def __init__(self, session: AsyncSession):
@@ -120,4 +209,3 @@ class InteractionRepository:
                 decision_reason=trace.decision_reason,
             ))
         await self.session.flush()
-

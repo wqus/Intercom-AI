@@ -39,7 +39,8 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     text=_strip(part.get("body",""))
     attachments=bool(source.get("attachments")) or any(bool(p.get("attachments")) for p in parts)
     author=part.get("author",{}) or source.get("author",{}) or {}
-    return cid,text,attachments,author.get("name",""),author.get("email",""),str(item.get("updated_at",""))
+    last_message_at = part.get("created_at") or item.get("updated_at") or ""
+    return cid,text,attachments,author.get("name",""),author.get("email",""),str(last_message_at)
 
 def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     item=payload.get("data",{}).get("item",{})
@@ -51,7 +52,8 @@ def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
         text=_strip(part.get("body",""))
         author=part.get("author",{}) or {}
         attachments=bool(part.get("attachments"))
-        return tid,text,attachments,author.get("name",""),author.get("email",""),str(item.get("updated_at",""))
+        last_message_at = part.get("created_at") or item.get("updated_at") or ""
+        return tid,text,attachments,author.get("name",""),author.get("email",""),str(last_message_at)
     tid=str(item.get("id") or "")
     attrs=item.get("ticket_attributes",{}) or {}
     text=_strip(attrs.get("_default_description_",""))

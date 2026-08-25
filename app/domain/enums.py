@@ -34,4 +34,5 @@ class EscalationReason(str, Enum):
     WANTS_NEW_SCHOOL = "wants_new_school"
     ATTACHMENTS = "attachments"
     DELIVERY_FAILURE = "delivery_failure"
+    CLARIFICATION_EXHAUSTED = "clarification_exhausted"
 

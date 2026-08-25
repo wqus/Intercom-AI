@@ -44,7 +44,7 @@ def test_processing_result_escalation_state_is_derived_from_action():
         def __init__(self, session):
             self.state = FakeState()
             self.replaced = []
-        async def get(self, entity_id):
+        async def get(self, entity_id, *, for_update=False):
             return self.state
         async def replace(self, entity_id, state, data):
             self.replaced.append((entity_id, state, data))
@@ -53,7 +53,11 @@ def test_processing_result_escalation_state_is_derived_from_action():
     import app.application.support_service as module
     original_state = module.StateRepository
     original_interaction = module.InteractionRepository
+    original_escalations = module.EscalatedConversationRepository
     module.StateRepository = FakeStates
+    module.EscalatedConversationRepository = lambda session: type(
+        "FakeEscalations", (), {"is_escalated": lambda self, entity_id: asyncio.sleep(0, result=False), "record": lambda self, **kwargs: asyncio.sleep(0, result=kwargs)}
+    )()
     module.InteractionRepository = lambda session: type(
         "FakeInteractionRepo", (), {"add_many": lambda self, *args, **kwargs: asyncio.sleep(0)}
     )()
@@ -68,4 +72,5 @@ def test_processing_result_escalation_state_is_derived_from_action():
         assert intercom.tags == 0
     finally:
         module.StateRepository = original_state
+        module.InteractionRepository = original_escalations
         module.InteractionRepository = original_interaction

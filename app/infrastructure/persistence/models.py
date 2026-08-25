@@ -1,9 +1,10 @@
 from datetime import datetime
 from typing import Any
-from sqlalchemy import DateTime, Integer, String, Text, JSON, Enum as SqlEnum, Boolean, Float, func
+from sqlalchemy import DateTime, Integer, String, Text, JSON, Enum as SqlEnum, Boolean, Float, func, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database.base import Base
 from app.domain.enums import EventStatus, ConversationStateKind
+
 
 class InboundEvent(Base):
     __tablename__ = "inbound_events"
@@ -21,6 +22,7 @@ class InboundEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+
 class ConversationState(Base):
     __tablename__ = "conversation_states"
     conversation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -31,6 +33,33 @@ class ConversationState(Base):
     )
     data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class EscalatedConversation(Base):
+    """Persistent operator hand-off blocklist.
+
+    One active row exists per Intercom conversation/ticket. As soon as an entity
+    is escalated, future inbound events are ignored before the decision pipeline
+    is invoked, so the bot cannot compete with a human operator.
+    """
+
+    __tablename__ = "escalated_conversations"
+
+    conversation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    user_email: Mapped[str] = mapped_column(String(320), default="", nullable=False)
+    last_message_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    last_message_at: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    source_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    escalated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_escalated_conversations_channel_reason", "channel", "reason"),
+    )
+
 
 class SupportInteraction(Base):
     __tablename__ = "support_interactions"
@@ -65,4 +94,3 @@ class SupportInteraction(Base):
     escalation_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     decision_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
