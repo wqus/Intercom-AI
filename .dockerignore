@@ -1,0 +1,28 @@
+# Keep Docker build context small and deterministic
+.git
+.git/**
+.github
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+!.env.example
+
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+node_modules
+
+*.zip
+*.tar
+*.tar.gz
+
+# Documentation is not needed inside the image
+*.md
+scripts/
+tests/

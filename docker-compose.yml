@@ -1,12 +1,8 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:17
-    container_name: intercom_postgres
     restart: unless-stopped
-    env_file:
-      - .env
+    env_file: .env
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -20,30 +16,17 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - intercom-network
 
   intercom-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: intercom_api
+    build: .
     restart: unless-stopped
-    env_file:
-      - .env
+    env_file: .env
     ports:
       - "127.0.0.1:8000:8000"
-    volumes:
-      - ./data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
-    networks:
-      - intercom-network
 
 volumes:
   postgres_data:
 
-networks:
-  intercom-network:
-    driver: bridge
