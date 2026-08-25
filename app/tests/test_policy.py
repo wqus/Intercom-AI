@@ -13,7 +13,7 @@ class FakeLLM: pass
 
 def test_template_decision():
     pipeline=DecisionPipeline(FakeKB(), FakeLLM())
-    msg=InboundMessage("1","k","t","c",Channel.CONVERSATION,"hello")
+    msg=InboundMessage("1","k","t","c",Channel.CONVERSATION,"нужна помощь по обучению")
     result=asyncio.run(pipeline.decide(msg))
     assert result.traces[0].decision==Decision.ANSWER_TEMPLATE
     assert result.actions[0].text=="answer"
@@ -232,3 +232,21 @@ def test_trace_preserves_all_quality_metrics():
     assert trace.contrastive_margin == 0.1337
     assert trace.contrastive_competitor_id == "kb_2"
     assert trace.contrastive_reason == "positive_vs_negative"
+
+
+def test_oos_decision_produces_oos_reply():
+    import asyncio
+    from app.application.decision_pipeline import DecisionPipeline
+    from app.domain.enums import Decision
+    from app.domain.models import InboundMessage
+    from app.domain.enums import Channel
+
+    class FakeKB:
+        def match_many(self, text):
+            from app.infrastructure.ai.knowledge_base import MatchMode, MatchResult
+            return [MatchResult(MatchMode.NO_MATCH, 0.42, None, None, None, [], subquestion=text, decision_reason="oos:no_supported_intent")]
+
+    pipeline = DecisionPipeline(FakeKB(), object())
+    result = asyncio.run(pipeline.decide(InboundMessage("e","k","t","c",Channel.CONVERSATION,"Как оформить налоговый вычет?")))
+    assert result.traces[0].decision == Decision.OOS
+    assert result.actions and "Похоже" in (result.actions[0].text or "")

@@ -2,8 +2,8 @@ import time
 import logging
 from app.domain.enums import Decision, EscalationReason
 from app.domain.models import DecisionTrace, InboundMessage, OutboundAction, ProcessingResult
-from app.domain.policy import choice_prompt, escalation_ack, rephrase_prompt
-from app.infrastructure.ai.knowledge_base import KnowledgeBase, MatchMode, MatchResult, contains_operator_request
+from app.domain.policy import choice_prompt, escalation_ack, rephrase_prompt, oos_response
+from app.infrastructure.ai.knowledge_base import KnowledgeBase, MatchMode, MatchResult, contains_operator_request, is_non_query_message
 from app.infrastructure.ai.llm_client import YandexLLMClient
 from app.core.config import settings
 
@@ -129,6 +129,13 @@ class DecisionPipeline:
             return trace, []
 
         if match.mode == MatchMode.NO_MATCH and match.decision_reason in {
+            "oos", "oos:external_target", "oos:no_domain_support", "oos:no_supported_intent"
+        }:
+            trace.decision = Decision.OOS
+            trace.automated = True
+            return trace, [OutboundAction("reply", oos_response())]
+
+        if match.mode == MatchMode.NO_MATCH and match.decision_reason in {
             "insufficient_context", "low_confidence", "unsupported_or_ambiguous"
         }:
             # Unknown/ambiguous intent is not automatically a human-ticket.
@@ -145,6 +152,19 @@ class DecisionPipeline:
 
     async def decide(self, message: InboundMessage) -> ProcessingResult:
         started = time.perf_counter()
+
+        # Ignore generic acknowledgements/greetings before attachment escalation.
+        # A file does not by itself turn "Спасибо" into a support ticket.
+        if is_non_query_message(message.text):
+            trace = DecisionTrace(
+                decision=Decision.IGNORE,
+                question=message.text,
+                decision_reason="noise:non_query_exact",
+                automated=True,
+            )
+            result = ProcessingResult(traces=[trace], actions=[])
+            result.latency_ms = (time.perf_counter() - started) * 1000
+            return result
 
         if message.has_attachments:
             trace = DecisionTrace(

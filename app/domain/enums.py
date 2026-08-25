@@ -12,6 +12,7 @@ class Decision(str, Enum):
     REPHRASE = "rephrase"
     ESCALATE = "escalate"
     IGNORE = "ignore"
+    OOS = "oos"
 
 class EventStatus(str, Enum):
     NEW = "new"

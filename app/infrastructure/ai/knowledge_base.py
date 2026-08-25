@@ -57,6 +57,10 @@ EXTERNAL_TARGET_RE = re.compile(
 )
 KNOWN_INTERNAL_ENTITIES = {
     "терра", "терре", "терру", "терры", "terra",
+    # Generic modifiers/pronouns are not external entities. Without this guard,
+    # phrases like «в другой школе» can be misread as an external target.
+    "другой", "другая", "другое", "других", "другом", "другую",
+    "своей", "свою", "своей", "нашей", "нашу", "новой", "новую",
 }
 EXTERNAL_TARGET_CONTEXT = (
     "обучение", "школ", "курс", "поток", "занят", "обучаться",
@@ -130,6 +134,18 @@ REPHRASE_SCORE_MAX = 0.50
 REPHRASE_INTENT_FIT_MAX = 0.25
 REPHRASE_QUERY_QUALITY_MAX = 0.50
 
+# Open-set / OOS gate. It is intentionally independent of raw embedding similarity.
+# A coherent message is OOS only when we have both weak supported-domain evidence
+# and no defensible intent evidence. Rare in-domain questions should fall through
+# to REPHRASE/CHOICE rather than being rejected by the scope gate.
+OOS_TOP_SCORE_MAX = 0.56
+OOS_INTENT_FIT_MAX = 0.36
+OOS_REAL_EVIDENCE_MAX = 0.30
+OOS_DOMAIN_SUPPORT_MAX = 0.18
+OOS_QUERY_QUALITY_MIN = 0.34
+OOS_EXTERNAL_TARGET = True
+OOS_MIN_DOMAIN_TERM_HITS = 0
+
 # CATEGORY_CHOICE as a working middle mode (point 7).
 # Only when 2+ candidates have real support — never as a mask for "no category".
 CATEGORY_CHOICE_MIN_SCORE = 0.62
@@ -153,6 +169,11 @@ CONTRASTIVE_SIGNAL_BONUS = 0.16
 CONTRASTIVE_NEGATIVE_BONUS = 0.18
 CONTRASTIVE_ONTOLOGY_BONUS = 0.10
 CONTRASTIVE_FACET_BONUS = 0.10
+
+# Conservative ambiguity guard: a second candidate with real intent evidence
+# must not be ignored merely because it is not declared in conflict_ids.
+SECONDARY_EVIDENCE_MIN = 0.30
+SECONDARY_EVIDENCE_MARGIN = 0.055
 
 # Fuzzy shortcut is intentionally very strict and additionally requires
 # semantic/intention agreement after the exact phrase match.
@@ -391,6 +412,14 @@ def contains_operator_request(text: str) -> bool:
     ))
 
 
+def is_non_query_message(text: str) -> bool:
+    """Exact generic acknowledgements/greetings/noise only."""
+    q = normalize_light(text)
+    if not q:
+        return True
+    return q in _NON_QUERY_EXACT or q in META_NOISE_PATTERNS
+
+
 def _quality_gate(text: str) -> tuple[bool, str]:
     quality = _query_quality(text)
     return quality.valid, quality.reason
@@ -406,6 +435,19 @@ META_NOISE_PATTERNS: tuple[str, ...] = (
     "просто набор слов",
     "набор бессмысленных",
 )
+
+# Exact acknowledgements/greetings are ignored as non-support messages.
+_NON_QUERY_EXACT: set[str] = set()
+try:
+    _non_query_path = Path(__file__).resolve().parents[3] / "data" / "non_query_phrases.json"
+    _non_query_data = json.loads(_non_query_path.read_text(encoding="utf-8"))
+    _NON_QUERY_EXACT = {
+        normalize_light(str(x))
+        for x in (_non_query_data.get("exact_phrases", []) if isinstance(_non_query_data, dict) else [])
+        if isinstance(x, str) and normalize_light(x)
+    }
+except Exception:
+    logger.warning("Could not load data/non_query_phrases.json; using built-in non-query patterns only")
 
 
 QUESTION_WORDS = {
@@ -443,6 +485,13 @@ def _query_quality(text: str, domain_terms: set[str] | None = None) -> QueryQual
     compact = q.replace(" ", "")
     tokens = tokenize(q)
     token_count = len(tokens)
+
+    # Exact generic replies/greetings remain ignorable even when one token.
+    if q in _NON_QUERY_EXACT or q in META_NOISE_PATTERNS:
+        return QueryQuality(
+            0.0, False, "meta_noise", token_count, 0.0, 0.0, 0.0, 1.0,
+            problem_signal=0.0, meta_noise=True,
+        )
 
     if len(q) < MIN_MEANINGFUL_CHARS:
         return QueryQuality(0.0, False, "too_short", token_count, 0.0, 0.0, 0.0, 1.0, 0.0)
@@ -1148,7 +1197,19 @@ class KnowledgeBase:
         # ----------------------------------------------------
         mentor = has_any("настав", "ментор")
         become_stems = {"стат", "хот", "жел", "готов", "мог"}
-        wants_to_become = mentor and (
+        explicit_role_negation = mentor and (
+            has_phrase(
+                "не хочу быть наставником", "не хочу стать наставником",
+                "не хочу быть ментором", "не хочу стать ментором",
+                "не желаю быть наставником", "не желаю стать наставником",
+                "не готов быть наставником", "не готов стать наставником",
+            )
+            or bool(re.search(
+                r"\bне\s+(?:хоч|жел|готов)\w*\s+(?:быть|стать)\s+(?:наставник\w*|ментор\w*)",
+                q,
+            ))
+        )
+        wants_to_become = mentor and not explicit_role_negation and (
             has_any("хот", "жел", "готов", "стат", "мог") and
             has_stem("стат", "хоч", "хот", "жел", "готов", "мог")
             or has_phrase(
@@ -1241,9 +1302,17 @@ class KnowledgeBase:
         # the user explicitly says the application rejects their data or login.
         # ----------------------------------------------------
         app_signal = has_any("прилож", "приложен")
-        login_signal = has_any("зайт", "войд", "авториз", "логин")
+        login_signal = has_any("зайт", "войд", "вход", "авториз", "логин")
         rejected_data = has_any("данн", "информац", "учет") and failure_terms
-        if (app_signal and failure_terms and (login_signal or has_any("данн"))) or rejected_data:
+        explicit_app_login = (
+            app_signal
+            and (
+                has_phrase("не могу войти", "не могу зайти", "не удается войти",
+                           "не удаётся войти", "не могу авторизоваться")
+                or login_signal
+            )
+        )
+        if (explicit_app_login and failure_terms) or rejected_data:
             return "kb_001"
 
         # ----------------------------------------------------
@@ -1317,6 +1386,10 @@ class KnowledgeBase:
         # Fall back to the explicitly curated rules only when exactly one rule fires.
         matches: list[tuple[str, int, int]] = []
         for entry_id, positives, negatives in HARD_INTENT_RULES:
+            # A negated role-change statement such as «не хочу быть наставником»
+            # must never fall through to the generic positive phrase table.
+            if entry_id == "kb_023" and explicit_role_negation:
+                continue
             if not any(normalize_light(p) in q for p in positives):
                 continue
             if any(normalize_light(n) in q for n in negatives):
@@ -1543,6 +1616,110 @@ class KnowledgeBase:
             entity = normalize_light(match.group("entity"))
             if entity and entity not in KNOWN_INTERNAL_ENTITIES:
                 return entity
+        return None
+
+    def _scope_evidence(self, question: str, ranked: list[dict]) -> dict[str, Any]:
+        """Assess whether the message has defensible evidence of belonging to our support domain.
+
+        Scope is deliberately separate from intent ranking. A semantically similar but
+        unsupported message must not be forced into the nearest KB category.
+        """
+        qo = self._query_ontology(question)
+        normalized = normalize_light(question)
+        tokens = set(tokenize(question))
+
+        domain_hits = 0
+        for token in tokens:
+            if any(token.startswith(prefix) for prefix in DOMAIN_TERMS):
+                domain_hits += 1
+
+        direct_supported = False
+        strong_intent_evidence = 0.0
+        best_domain_support = 0.0
+        best_family_fit = 0.0
+        best_score = 0.0
+        best_semantic = 0.0
+        best_ontology = 0.0
+
+        for item in ranked[:8]:
+            best_domain_support = max(best_domain_support, float(item.get("domain_support_score", 0.0)))
+            best_family_fit = max(best_family_fit, float(item.get("family_fit_score", 0.0)))
+            best_score = max(best_score, float(item.get("final_score", 0.0)))
+            best_semantic = max(best_semantic, float(item.get("semantic_score", 0.0)))
+            best_ontology = max(best_ontology, float(item.get("ontology_alignment_score", 0.0)))
+            if item.get("direct_support") or item.get("positive_hits") or item.get("intent_signal_positive_hits"):
+                direct_supported = True
+            strong_intent_evidence = max(strong_intent_evidence, float(item.get("real_intent_evidence", 0.0)))
+
+        external_target = self._external_target_hint(question)
+        known_ontology = any(qo.get(dim) for dim in ("object", "action", "state", "facet"))
+
+        # Explicit internal domain vocabulary is meaningful even when a category is
+        # not identifiable yet. This protects rare/novel but legitimate support queries.
+        in_domain_signal = bool(domain_hits or known_ontology or external_target is None and best_family_fit >= 0.30)
+
+        return {
+            "domain_hits": domain_hits,
+            "known_ontology": known_ontology,
+            "external_target": external_target,
+            "best_domain_support": best_domain_support,
+            "best_family_fit": best_family_fit,
+            "best_score": best_score,
+            "best_semantic": best_semantic,
+            "best_ontology": best_ontology,
+            "strong_intent_evidence": strong_intent_evidence,
+            "direct_supported": direct_supported,
+            "in_domain_signal": in_domain_signal,
+        }
+
+    def _oos_reason(self, question: str, ranked: list[dict], quality: QueryQuality) -> str | None:
+        """Return an OOS reason only for coherent messages with weak supported-domain evidence.
+
+        Priority order:
+        1) explicit third-party target in an otherwise domain-sensitive phrase;
+        2) no domain/ontology evidence and no candidate intent evidence;
+        3) low-score nearest neighbour with no direct support.
+        """
+        if not ranked or quality.meta_noise:
+            return None
+
+        scope = self._scope_evidence(question, ranked)
+        external_target = scope["external_target"]
+
+        if (
+            OOS_EXTERNAL_TARGET
+            and external_target
+            and not scope["direct_supported"]
+            and scope["best_domain_support"] < 0.40
+            and scope["strong_intent_evidence"] < 0.42
+        ):
+            return "oos:external_target"
+
+        # Never call a message OOS when there is any concrete KB evidence.
+        if (
+            scope["direct_supported"]
+            or scope["strong_intent_evidence"] >= 0.34
+            or scope["known_ontology"]
+            or scope["domain_hits"] > OOS_MIN_DOMAIN_TERM_HITS
+            or scope["best_domain_support"] >= OOS_DOMAIN_SUPPORT_MAX
+            or scope["best_family_fit"] >= 0.42
+        ):
+            return None
+
+        coherent_for_oos = (
+            quality.score >= OOS_QUERY_QUALITY_MIN
+            or (quality.tokens >= 3 and quality.question_signal >= 0.35 and not quality.meta_noise)
+        )
+        if (
+            coherent_for_oos
+            and scope["best_score"] <= OOS_TOP_SCORE_MAX
+            and scope["strong_intent_evidence"] <= OOS_REAL_EVIDENCE_MAX
+            and scope["best_domain_support"] <= OOS_DOMAIN_SUPPORT_MAX
+            and scope["best_semantic"] < 0.82
+            and scope["best_ontology"] < 0.62
+        ):
+            return "oos:no_supported_intent"
+
         return None
 
     def _negative_decision_reason(self, question: str, top: dict, ranked: list[dict]) -> str | None:
@@ -2819,11 +2996,19 @@ class KnowledgeBase:
                 q_facets = self._question_facets(question)
                 required_facets = INTENT_REQUIRED_FACETS.get(str(entry.get("intent_type") or ""), set())
                 explicit_facet_ok = (not required_facets) or bool(q_facets & required_facets)
+                hard_rule_type = str(entry.get("intent_type") or "")
+                explicit_positive = bool(
+                    self._lexical_phrase_hits(question, entry)
+                    or self._intent_signal_hits(question, entry)[0]
+                    or (q_facets & required_facets)
+                    or hard_rule_type in {"flow_date", "school_started"}
+                )
                 hard_safe = (
-                    fit >= 0.68
-                    and family_fit >= 0.40
-                    and alignment >= 0.50
+                    fit >= (0.80 if required_facets else 0.72)
+                    and family_fit >= 0.45
+                    and alignment >= (0.65 if required_facets else 0.55)
                     and explicit_facet_ok
+                    and explicit_positive
                 )
                 logger.debug(
                     "hard_rule hypothesis | kb_id=%s | fit=%.3f | family=%.3f | alignment=%.3f | facets=%s | safe=%s | reason=%s",
@@ -2850,8 +3035,8 @@ class KnowledgeBase:
                         (entry.get("template_answer") or "") + OPERATOR_HINT,
                         hard_id, [self._clean_entry_for_llm(entry)], entry=entry,
                         second_score=0.0, margin=0.995, fuzzy_score=1.0,
-                        intent_fit_score=max(0.75, fit), intent_fit_reason=fit_reason,
-                        family_fit_score=max(0.60, family_fit),
+                        intent_fit_score=fit, intent_fit_reason=fit_reason,
+                        family_fit_score=family_fit,
                         query_quality_score=quality.score,
                         subquestion=question, decision_reason="hard_rule",
                     )
@@ -2994,6 +3179,30 @@ class KnowledgeBase:
                 contrastive_reason=str(top.get("contrastive_reason", "")),
             )
 
+        # 3.5 Open-set gate. OOS is only emitted after noise/contradiction checks
+        # and before ambiguity/template/LLM routing, so an unsupported message cannot
+        # inherit a nearby category merely because embeddings are high.
+        oos_reason = self._oos_reason(question, ranked, quality)
+        if oos_reason:
+            return MatchResult(
+                MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
+                second_score=second_score, margin=margin,
+                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                evidence_score=float(top.get("evidence_score", 0.0)),
+                real_intent_evidence=real_evidence,
+                embedding_score=embedding, intent_fit_score=intent_fit,
+                intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                family_fit_score=family_fit, query_quality_score=quality.score,
+                subquestion=question, decision_reason=oos_reason,
+                top_candidates=top_candidates,
+                domain_support_score=float(top.get("domain_support_score", 0.0)),
+                ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
+                contrastive_margin=contrastive_margin,
+                contrastive_competitor_id=top.get("contrastive_competitor_id"),
+                contrastive_reason=str(top.get("contrastive_reason", "")),
+            )
+
         # 4. Known ambiguity is a first-class state. If the second candidate is
         # a declared conflict and both have meaningful evidence, ask the user
         # instead of guessing.
@@ -3031,6 +3240,47 @@ class KnowledgeBase:
                     contrastive_reason=str(top.get("contrastive_reason", "")),
                 )
 
+        # 5.1. Intent-first deterministic override.
+        # Some support queries have a modest aggregate score because several
+        # intents share vocabulary, while their intent contract is explicit.
+        domain_support = float(top.get("domain_support_score", 0.0))
+        ontology_alignment = float(top.get("ontology_alignment_score", 0.0))
+        second_real = float(second.get("real_intent_evidence", 0.0)) if second else 0.0
+        secondary_ambiguity = (
+            second is not None
+            and second_real >= SECONDARY_EVIDENCE_MIN
+            and margin < SECONDARY_EVIDENCE_MARGIN
+        )
+        deterministic_intent_safe = (
+            intent_fit >= 0.90
+            and domain_support >= 0.30
+            and ontology_alignment >= 0.62
+            and real_evidence >= 0.30
+            and not contradiction
+            and not second_is_conflict
+            and not secondary_ambiguity
+            and (direct_support or lexical >= 0.55 or fuzzy_score >= 0.90)
+        )
+        if deterministic_intent_safe and entry.get("template_answer"):
+            return MatchResult(
+                MatchMode.TEMPLATE, max(top_score, 0.76), entry.get("category"),
+                (entry.get("template_answer") or "") + OPERATOR_HINT,
+                entry.get("id"), relevant_entries, entry=entry,
+                second_score=second_score, margin=margin, embedding_score=embedding,
+                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                evidence_score=float(top.get("evidence_score", 0.0)),
+                real_intent_evidence=real_evidence, intent_fit_score=intent_fit,
+                intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                family_fit_score=family_fit, query_quality_score=quality.score,
+                subquestion=question, decision_reason="deterministic_high_intent",
+                top_candidates=top_candidates, domain_support_score=domain_support,
+                ontology_alignment_score=ontology_alignment,
+                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
+                contrastive_margin=contrastive_margin,
+                contrastive_competitor_id=top.get("contrastive_competitor_id"),
+                contrastive_reason=str(top.get("contrastive_reason", "")),
+            )
+
         # 5. If the evidence points to a supported intent, allow automatic
         # routing even when the query itself is short/grammatically rough.
         # Quality therefore influences OOS/noise detection, not basic intent
@@ -3052,6 +3302,7 @@ class KnowledgeBase:
         safe_auto = (
             (not second_is_conflict or margin >= 0.075)
             and (not second_is_conflict or contrastive_margin >= CONTRASTIVE_AUTO_MARGIN)
+            and not secondary_ambiguity
         ) and (direct_lexical_support or direct_semantic_support)
 
         if entry.get("requires_clarification") and safe_auto:
