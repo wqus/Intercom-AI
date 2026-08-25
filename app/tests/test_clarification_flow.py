@@ -50,6 +50,15 @@ class FakeIntercom:
         return True
 
 
+class FakeOutbox:
+    def __init__(self, *args, **kwargs):
+        self.actions = []
+
+    async def enqueue(self, **kwargs):
+        self.actions.append(kwargs)
+        return True
+
+
 class FakePipeline:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -86,6 +95,7 @@ def test_rephrase_asks_twice_then_escalates(monkeypatch):
         FakePipeline([result(Decision.REPHRASE), result(Decision.REPHRASE)]),
         FakeIntercom(),
         None,
+        FakeOutbox(),
     )
     message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "непонятно")
 
@@ -110,6 +120,7 @@ def test_successful_answer_resets_state(monkeypatch):
         ]),
         FakeIntercom(),
         None,
+        FakeOutbox(),
     )
     message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "нормальный вопрос")
 
@@ -130,6 +141,7 @@ def test_initial_rephrase_then_two_requests_then_escalation(monkeypatch):
         ]),
         FakeIntercom(),
         None,
+        FakeOutbox(),
     )
     message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "что-то странное")
 
@@ -165,7 +177,7 @@ def test_escalated_conversation_never_reaches_pipeline(monkeypatch):
             raise AssertionError("pipeline must not run for an escalated conversation")
 
     monkeypatch.setattr(module, "EscalatedConversationRepository", BlockingEscalations)
-    app = SupportApplication(NeverCalledPipeline(), FakeIntercom(), None)
+    app = SupportApplication(NeverCalledPipeline(), FakeIntercom(), None, FakeOutbox())
     message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "новое сообщение")
 
     class Event: id = 1

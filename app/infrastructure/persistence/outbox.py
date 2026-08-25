@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from datetime import datetime, timezone, timedelta
+
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.infrastructure.persistence.models import OutboundAction
+from app.domain.enums import EventStatus
+
+
+class OutboundRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def enqueue(
+        self,
+        *,
+        action_key: str,
+        action_type: str,
+        entity_id: str,
+        channel: str,
+        payload: dict,
+        event_id: int | None = None,
+    ) -> bool:
+        stmt = (
+            pg_insert(OutboundAction)
+            .values(
+                action_key=action_key,
+                action_type=action_type,
+                entity_id=entity_id,
+                channel=channel,
+                payload=payload,
+                event_id=event_id,
+            )
+            .on_conflict_do_nothing(index_elements=[OutboundAction.action_key])
+        )
+        result = await self.session.execute(stmt)
+        return result.rowcount == 1
+
+    async def claim_one(self) -> OutboundAction | None:
+        now = datetime.now(timezone.utc)
+        stale_before = now - timedelta(minutes=15)
+        stmt = (
+            select(OutboundAction)
+            .where(
+                (
+                    (OutboundAction.status == "pending")
+                    & (OutboundAction.available_at <= now)
+                )
+                |
+                (
+                    (OutboundAction.status == "processing")
+                    & (OutboundAction.locked_at <= stale_before)
+                )
+            )
+            .order_by(OutboundAction.created_at)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        action = result.scalar_one_or_none()
+        if action:
+            action.status = "processing"
+            action.attempts += 1
+            action.locked_at = now
+            await self.session.commit()
+        return action
+
+    async def mark_sent(self, action: OutboundAction) -> None:
+        action.status = "sent"
+        action.sent_at = datetime.now(timezone.utc)
+        action.locked_at = None
+        action.last_error = None
+        await self.session.commit()
+
+    async def mark_skipped(self, action: OutboundAction, reason: str) -> None:
+        action.status = "skipped"
+        action.locked_at = None
+        action.last_error = reason[:4000]
+        action.sent_at = datetime.now(timezone.utc)
+        await self.session.commit()
+
+    async def mark_retry(self, action: OutboundAction, error: str) -> None:
+        action.status = "pending" if action.attempts < 5 else "failed"
+        action.locked_at = None
+        action.last_error = error[:4000]
+        if action.status == "pending":
+            delay = min(120, 2 ** max(0, action.attempts - 1))
+            action.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        await self.session.commit()
+
+    async def mark_unknown(self, action: OutboundAction, error: str) -> None:
+        # For timeout/network ambiguity we deliberately do NOT auto-retry an external
+        # write: the provider may already have accepted it. Manual reconciliation is
+        # safer than creating a duplicate customer-facing reply.
+        action.status = "unknown"
+        action.locked_at = None
+        action.last_error = error[:4000]
+        await self.session.commit()

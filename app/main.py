@@ -14,6 +14,7 @@ from app.infrastructure.telegram.notifier import TelegramNotifier
 from app.application.decision_pipeline import DecisionPipeline
 from app.application.support_service import SupportApplication
 from app.application.event_worker import EventWorker
+from app.application.outbox_worker import OutboxWorker
 from app.api.webhook import router as webhook_router
 
 logging.basicConfig(
@@ -48,16 +49,20 @@ async def lifespan(app: FastAPI):
     telegram = TelegramNotifier(telegram_client)
     application = SupportApplication(DecisionPipeline(kb, llm), intercom, telegram)
     worker=EventWorker(application)
+    outbox_worker=OutboxWorker(intercom, telegram)
     app.state.application=application
+    app.state.outbox_worker=outbox_worker
     await worker.start()
+    await outbox_worker.start()
 
     yield
 
     await worker.stop()
+    await outbox_worker.stop()
     await client.aclose()
     await telegram_client.aclose()
     await engine.dispose()
 
-app=FastAPI(title="Terra Intercom AI Support v15 Conservative", lifespan=lifespan)
+app=FastAPI(title="Terra Intercom AI Support v20 Production", lifespan=lifespan)
 app.include_router(webhook_router)
 

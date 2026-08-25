@@ -17,30 +17,35 @@ def _strip(value: str) -> str:
     return re.sub(r"<[^>]+>", "", value or "").strip()
 
 def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
-    item=payload.get("data",{}).get("item",{})
-    cid=str(item.get("id") or "")
-    if not cid: return None
-    source=item.get("source",{}) or {}
+    item = payload.get("data", {}).get("item", {}) or {}
+    cid = str(item.get("id") or "")
+    if not cid:
+        return None
+
+    source = item.get("source", {}) or {}
     parts = item.get("conversation_parts", {}).get("conversation_parts", []) or []
     user_parts = [p for p in parts if (p.get("author", {}) or {}).get("type") == "user"]
+    topic = payload.get("topic", "")
 
-    if payload.get("topic") == "conversation.user.replied":
-        # This webhook is specifically about a customer reply. Never fall back
-        # to an admin/bot source. Some payload shapes omit conversation_parts
-        # and expose the user message directly in source.
-        if user_parts:
-            part = user_parts[-1]
-        elif (source.get("author", {}) or {}).get("type") in {None, "user"}:
-            part = source
-        else:
-            return None
+    # Prefer the message carried by THIS webhook. Do not select the last user
+    # message from conversation history: delayed/replayed events can contain a
+    # newer customer message and would otherwise process the wrong text.
+    if (source.get("author", {}) or {}).get("type") == "user" and source.get("body"):
+        part = source
+    elif user_parts:
+        part = user_parts[-1]
+    elif topic == "conversation.user.replied" and source.get("body") and not (source.get("author", {}) or {}).get("type"):
+        # Compatibility fallback only when author.type is genuinely absent. An
+        # explicit admin/bot author must never be treated as a customer reply.
+        part = source
     else:
-        part = user_parts[-1] if user_parts else source
-    text=_strip(part.get("body",""))
-    attachments=bool(source.get("attachments")) or any(bool(p.get("attachments")) for p in parts)
-    author=part.get("author",{}) or source.get("author",{}) or {}
+        return None
+
+    text = _strip(part.get("body", ""))
+    attachments = bool(part.get("attachments"))
+    author = part.get("author", {}) or {}
     last_message_at = part.get("created_at") or item.get("updated_at") or ""
-    return cid,text,attachments,author.get("name",""),author.get("email",""),str(last_message_at)
+    return cid, text, attachments, author.get("name", ""), author.get("email", ""), str(last_message_at)
 
 def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     item=payload.get("data",{}).get("item",{})

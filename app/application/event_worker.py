@@ -54,11 +54,14 @@ class EventWorker:
                             await self.application.handle(session, event, message)
                             await repo.mark_done(event)
                         except Exception as exc:
+                            attempt_count = int(event.attempts or 0)
                             logger.exception("Event processing failed event=%s", event.id)
                             # Never let partially written conversation state or an
                             # escalation block leak into the retry transaction.
                             await session.rollback()
-                            await repo.mark_failed(event, str(exc), retry=True)
+                            await repo.mark_failed(
+                                event, str(exc), retry=True, attempt_count=attempt_count
+                            )
             except Exception:
                 logger.exception("Worker loop failure")
             if not processed:

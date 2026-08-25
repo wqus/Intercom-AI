@@ -1,5 +1,9 @@
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 from app.infrastructure.ai.knowledge_base import KnowledgeBase
 
 def main():

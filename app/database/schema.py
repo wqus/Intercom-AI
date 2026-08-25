@@ -58,9 +58,41 @@ async def ensure_escalation_blocklist(conn) -> None:
     ))
 
 
+
+async def ensure_outbound_actions(conn) -> None:
+    """Idempotently create the transactional outbox used for external side effects."""
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS outbound_actions (
+            id SERIAL PRIMARY KEY,
+            action_key VARCHAR(255) NOT NULL UNIQUE,
+            action_type VARCHAR(64) NOT NULL,
+            entity_id VARCHAR(128) NOT NULL,
+            channel VARCHAR(32) NOT NULL,
+            event_id INTEGER NULL,
+            payload JSONB NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            available_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            locked_at TIMESTAMPTZ NULL,
+            last_error TEXT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            sent_at TIMESTAMPTZ NULL
+        )
+    """))
+    await conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_outbound_actions_status_available "
+        "ON outbound_actions (status, available_at)"
+    ))
+    await conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_outbound_actions_entity_created "
+        "ON outbound_actions (entity_id, created_at)"
+    ))
+
+
 async def ensure_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await ensure_escalation_blocklist(conn)
+        await ensure_outbound_actions(conn)
         for column, sql_type in SUPPORT_INTERACTION_ANALYTICS_COLUMNS.items():
             await conn.execute(
                 text(

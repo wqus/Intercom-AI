@@ -61,6 +61,37 @@ class EscalatedConversation(Base):
     )
 
 
+class OutboundAction(Base):
+    """Transactional outbox for all external side effects.
+
+    A support decision is committed together with these rows. Delivery happens
+    asynchronously, so an Intercom/Telegram failure cannot cause the classifier
+    to run again and send a second answer.
+    """
+
+    __tablename__ = "outbound_actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    action_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    action_type: Mapped[str] = mapped_column(String(64), index=True)
+    entity_id: Mapped[str] = mapped_column(String(128), index=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_outbound_actions_status_available", "status", "available_at"),
+        Index("ix_outbound_actions_entity_created", "entity_id", "created_at"),
+    )
+
+
 class SupportInteraction(Base):
     __tablename__ = "support_interactions"
     id: Mapped[int] = mapped_column(primary_key=True)

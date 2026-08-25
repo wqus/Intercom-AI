@@ -28,3 +28,13 @@ def test_escalation_blocklist_has_conversation_primary_key_and_indexes():
 
 def test_escalation_table_is_registered_in_metadata():
     assert "escalated_conversations" in Base.metadata.tables
+
+
+def test_outbound_action_table_is_registered_and_unique():
+    from app.database.base import Base
+    table = Base.metadata.tables["outbound_actions"]
+    assert "action_key" in table.c
+    assert table.c.action_key.unique is True
+    assert "status" in table.c
+
+

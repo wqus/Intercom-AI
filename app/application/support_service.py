@@ -13,6 +13,7 @@ from app.infrastructure.persistence.repository import (
     InteractionRepository,
 )
 from app.infrastructure.persistence.models import InboundEvent
+from app.infrastructure.persistence.outbox import OutboundRepository
 from app.infrastructure.telegram.notifier import TelegramNotifier
 
 logger = logging.getLogger("support_service")
@@ -26,46 +27,63 @@ class SupportApplication:
         pipeline: DecisionPipeline,
         intercom: IntercomGateway,
         telegram: TelegramNotifier | None = None,
+        outbox: OutboundRepository | None = None,
     ):
         self.pipeline = pipeline
         self.intercom = intercom
         self.telegram = telegram
+        self.outbox = outbox
 
-    async def _deliver(
+    def _outbox(self, session) -> OutboundRepository:
+        return self.outbox or OutboundRepository(session)
+
+    async def _enqueue_reply(
         self,
+        session,
         message: InboundMessage,
+        event: InboundEvent,
         text: str,
-        escalate: bool,
-        reason: str = "escalated_to_operator",
+        *,
+        suffix: str = "reply",
     ) -> None:
-        """Deliver a reply and optionally send an operator notification.
-
-        Kept as a small side-effect boundary for existing callers/tests; escalation
-        persistence itself is handled by _escalate().
-        """
-        await self.intercom.send_reply(message.entity_id, message.channel.value, text)
-        if not escalate or not self.telegram:
+        if not text:
             return
-        try:
-            await self.telegram.notify_escalation(
-                entity_id=message.entity_id,
-                channel=message.channel.value,
-                reason=reason,
-                text=message.text,
-                user_name=message.user_name,
-                user_email=message.user_email,
-                updated_at=message.updated_at,
-            )
-        except Exception:
-            logger.exception("Operator notification failed entity=%s", message.entity_id)
+        await self._outbox(session).enqueue(
+            action_key=f"event:{event.id}:{suffix}",
+            action_type="intercom_reply",
+            entity_id=message.entity_id,
+            channel=message.channel.value,
+            event_id=event.id,
+            payload={
+                "entity_id": message.entity_id,
+                "channel": message.channel.value,
+                "text": text,
+            },
+        )
 
-    @staticmethod
-    def _attempts_after_failed_clarification(state) -> int:
-        """Return the number of failed user attempts accumulated so far."""
-        try:
-            return max(0, int(state.data.get("attempts", 0)))
-        except (TypeError, ValueError):
-            return 0
+    async def _enqueue_telegram_escalation(
+        self,
+        session,
+        message: InboundMessage,
+        event: InboundEvent,
+        reason: str,
+    ) -> None:
+        await self._outbox(session).enqueue(
+            action_key=f"event:{event.id}:telegram",
+            action_type="telegram_escalation",
+            entity_id=message.entity_id,
+            channel=message.channel.value,
+            event_id=event.id,
+            payload={
+                "entity_id": message.entity_id,
+                "channel": message.channel.value,
+                "reason": reason,
+                "text": message.text,
+                "user_name": message.user_name,
+                "user_email": message.user_email,
+                "updated_at": message.updated_at,
+            },
+        )
 
     async def _escalate(
         self,
@@ -74,13 +92,9 @@ class SupportApplication:
         event: InboundEvent | None,
         reason: EscalationReason,
     ) -> None:
-        """Persist the hand-off and notify the operator after the user ack is delivered.
+        if event is None:
+            raise RuntimeError("Escalation requires an inbound event")
 
-        The DB row is deliberately created in the same transaction as the state change.
-        If reply delivery fails, EventWorker rolls the transaction back, leaving the
-        conversation retryable. After a successful delivery, the row is committed by
-        the normal event completion path and becomes the permanent bot blocklist entry.
-        """
         states = StateRepository(session)
         escalations = EscalatedConversationRepository(session)
 
@@ -95,15 +109,33 @@ class SupportApplication:
             user_email=message.user_email,
             last_message_text=message.text,
             last_message_at=message.updated_at,
-            source_event_id=getattr(event, "id", None),
+            source_event_id=event.id,
         )
 
-        await self._deliver(
-            message,
-            escalation_ack(),
-            True,
-            reason.value,
+        # All external writes are transactional-outbox actions. The escalation
+        # blocklist is committed together with them, so a later retry can never
+        # re-enter the bot pipeline merely because Intercom/Telegram was unavailable.
+        await self._enqueue_reply(session, message, event, escalation_ack(), suffix="escalation_ack")
+        await self._outbox(session).enqueue(
+            action_key=f"event:{event.id}:escalation_tag",
+            action_type="intercom_escalation_tag",
+            entity_id=message.entity_id,
+            channel=message.channel.value,
+            event_id=event.id,
+            payload={
+                "entity_id": message.entity_id,
+                "channel": message.channel.value,
+            },
         )
+        await self._enqueue_telegram_escalation(session, message, event, reason.value)
+
+    @staticmethod
+    def _attempts_after_failed_clarification(state) -> int:
+        """Return the number of failed user attempts accumulated so far."""
+        try:
+            return max(0, int(state.data.get("attempts", 0)))
+        except (TypeError, ValueError):
+            return 0
 
     async def _handle_state(self, session, event: InboundEvent, message: InboundMessage, state) -> bool:
         if state.state in _CLARIFICATION_STATES:
@@ -143,10 +175,12 @@ class SupportApplication:
                 else:
                     state.data["attempts"] = attempts + 1
                     await session.flush()
-                    await self.intercom.send_reply(
-                        message.entity_id,
-                        message.channel.value,
+                    await self._enqueue_reply(
+                        session,
+                        message,
+                        event,
                         "Пожалуйста, укажите номер варианта (например, 1 или 2).",
+                        suffix="choice_retry",
                     )
                 return True
 
@@ -165,10 +199,12 @@ class SupportApplication:
                 )
                 return True
 
-            await self.intercom.send_reply(
-                message.entity_id,
-                message.channel.value,
+            await self._enqueue_reply(
+                session,
+                message,
+                event,
                 "\n\n".join(answers),
+                suffix="choice_answer",
             )
             await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
             return True
@@ -269,9 +305,17 @@ class SupportApplication:
             )
             return
 
+        reply_index = 0
         for action in result.actions:
             if action.kind == "reply" and action.text:
-                await self.intercom.send_reply(message.entity_id, message.channel.value, action.text)
+                reply_index += 1
+                await self._enqueue_reply(
+                    session,
+                    message,
+                    event,
+                    action.text,
+                    suffix=f"reply:{reply_index}",
+                )
 
         # A successful non-clarification outcome ends the clarification flow and
         # therefore resets the persisted attempts counter to zero.

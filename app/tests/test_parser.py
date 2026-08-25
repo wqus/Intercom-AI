@@ -36,3 +36,41 @@ def test_conversation_user_replied_does_not_fallback_to_admin_source():
         }},
     }
     assert parse(payload) is None
+
+
+def test_replayed_conversation_event_does_not_pick_a_newer_user_message():
+    payload = {
+        "id": "evt-old",
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "conv-replay",
+            "source": {"body": "Первое сообщение", "author": {"type": "user", "name": "Ben"}, "created_at": "100"},
+            "conversation_parts": {"conversation_parts": [
+                {"body": "Первое сообщение", "author": {"type": "user"}, "created_at": "100"},
+                {"body": "Более новое сообщение", "author": {"type": "user"}, "created_at": "200"},
+            ]},
+        }},
+    }
+    msg = parse(payload)
+    assert msg is not None
+    assert msg.text == "Первое сообщение"
+    assert msg.updated_at == "100"
+
+
+def test_attachments_belong_only_to_current_source_message():
+    payload = {
+        "id": "evt-new",
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "conv-attachments",
+            "source": {"body": "Спасибо", "author": {"type": "user"}, "created_at": "200", "attachments": []},
+            "conversation_parts": {"conversation_parts": [
+                {"body": "Старое", "author": {"type": "user"}, "created_at": "100", "attachments": [{"id": "a1"}]},
+                {"body": "Спасибо", "author": {"type": "user"}, "created_at": "200", "attachments": []},
+            ]},
+        }},
+    }
+    msg = parse(payload)
+    assert msg is not None
+    assert msg.text == "Спасибо"
+    assert msg.has_attachments is False

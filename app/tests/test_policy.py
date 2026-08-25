@@ -163,28 +163,6 @@ def test_llm_route_falls_back_to_rephrase_when_no_safe_top3(monkeypatch):
     assert actions and "переформулируйте" in actions[0].text
 
 
-def test_escalation_delivery_secondary_failure_does_not_bubble():
-    import asyncio
-    from app.application.support_service import SupportApplication
-    from app.domain.enums import Channel
-    from app.domain.models import InboundMessage
-
-    class FakePipeline: pass
-
-    class FakeIntercom:
-        async def send_reply(self, *args): return True
-        async def add_escalation_tag(self, *args): raise RuntimeError("tag failed")
-
-    class FakeTelegram:
-        async def notify_escalation(self, **kwargs): raise RuntimeError("telegram failed")
-
-    app = SupportApplication(FakePipeline(), FakeIntercom(), FakeTelegram())
-    msg = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "оператор")
-    asyncio.run(app._deliver(msg, "Передаю оператору", True))
-
-
-
-
 def test_trace_preserves_all_quality_metrics():
     from app.application.decision_pipeline import DecisionPipeline
     from app.infrastructure.ai.knowledge_base import MatchMode, MatchResult

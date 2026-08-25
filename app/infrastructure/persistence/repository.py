@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.infrastructure.persistence.models import (
@@ -16,15 +16,20 @@ class EventRepository:
         self.session = session
 
     async def enqueue(self, *, event_key: str, provider_event_id: str, topic: str, entity_id: str, payload: dict) -> bool:
-        existing = await self.session.scalar(select(InboundEvent).where(InboundEvent.event_key == event_key))
-        if existing:
-            return False
-        self.session.add(InboundEvent(
-            event_key=event_key, provider_event_id=provider_event_id,
-            topic=topic, entity_id=entity_id, payload=payload,
-        ))
+        stmt = (
+            pg_insert(InboundEvent)
+            .values(
+                event_key=event_key,
+                provider_event_id=provider_event_id,
+                topic=topic,
+                entity_id=entity_id,
+                payload=payload,
+            )
+            .on_conflict_do_nothing(index_elements=[InboundEvent.event_key])
+        )
+        result = await self.session.execute(stmt)
         await self.session.commit()
-        return True
+        return result.rowcount == 1
 
     async def claim_one(self) -> InboundEvent | None:
         now = datetime.now(timezone.utc)
@@ -61,13 +66,35 @@ class EventRepository:
         event.last_error = None
         await self.session.commit()
 
-    async def mark_failed(self, event: InboundEvent, error: str, retry: bool = True) -> None:
-        event.last_error = error[:4000]
-        event.locked_at = None
-        event.status = EventStatus.NEW if retry and event.attempts < 5 else EventStatus.FAILED
-        if event.status == EventStatus.NEW:
-            delay = min(60, 2 ** max(0, event.attempts - 1))
-            event.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    async def mark_failed(
+        self,
+        event: InboundEvent,
+        error: str,
+        retry: bool = True,
+        *,
+        attempt_count: int | None = None,
+    ) -> None:
+        # Called after a rollback in the worker. Update the row directly so this
+        # method never needs to refresh expired ORM state from the rolled-back session.
+        if attempt_count is None:
+            attempt_count = int(getattr(event, "attempts", 0) or 0)
+        else:
+            attempt_count = int(attempt_count)
+        status = EventStatus.NEW if retry and attempt_count < 5 else EventStatus.FAILED
+        values = {
+            "last_error": error[:4000],
+            "locked_at": None,
+            "status": status,
+        }
+        if status == EventStatus.NEW:
+            values["available_at"] = datetime.now(timezone.utc) + timedelta(
+                seconds=min(60, 2 ** max(0, attempt_count - 1))
+            )
+        await self.session.execute(
+            update(InboundEvent)
+            .where(InboundEvent.id == event.id)
+            .values(**values)
+        )
         await self.session.commit()
 
 

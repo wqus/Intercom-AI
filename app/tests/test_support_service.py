@@ -6,6 +6,11 @@ from app.domain.models import InboundMessage, ProcessingResult, DecisionTrace, O
 
 
 def test_processing_result_escalation_state_is_derived_from_action():
+    import asyncio
+    from app.application.support_service import SupportApplication
+    from app.domain.enums import Channel, Decision, EscalationReason
+    from app.domain.models import InboundMessage, ProcessingResult, DecisionTrace, OutboundAction
+
     class FakePipeline:
         async def decide(self, message):
             return ProcessingResult(
@@ -18,22 +23,6 @@ def test_processing_result_escalation_state_is_derived_from_action():
                 latency_ms=1.0,
             )
 
-    class FakeIntercom:
-        def __init__(self):
-            self.replies = 0
-            self.tags = 0
-        async def send_reply(self, *args):
-            self.replies += 1
-        async def add_escalation_tag(self, *args):
-            self.tags += 1
-
-    class FakeTelegram:
-        def __init__(self):
-            self.notifications = 0
-        async def notify_escalation(self, **kwargs):
-            self.notifications += 1
-            return True
-
     class FakeState:
         def __init__(self):
             from app.domain.enums import ConversationStateKind
@@ -43,34 +32,43 @@ def test_processing_result_escalation_state_is_derived_from_action():
     class FakeStates:
         def __init__(self, session):
             self.state = FakeState()
-            self.replaced = []
         async def get(self, entity_id, *, for_update=False):
             return self.state
         async def replace(self, entity_id, state, data):
-            self.replaced.append((entity_id, state, data))
+            self.state.state = state
+            self.state.data = data
 
-    # Patch the repository classes only inside this regression test.
+    class FakeEscalations:
+        async def is_escalated(self, entity_id):
+            return False
+        async def record(self, **kwargs):
+            return kwargs
+
+    class FakeInteraction:
+        async def add_many(self, *args, **kwargs):
+            return None
+
+    class FakeOutbox:
+        def __init__(self):
+            self.actions = []
+        async def enqueue(self, **kwargs):
+            self.actions.append(kwargs)
+            return True
+
     import app.application.support_service as module
-    original_state = module.StateRepository
-    original_interaction = module.InteractionRepository
-    original_escalations = module.EscalatedConversationRepository
-    module.StateRepository = FakeStates
-    module.EscalatedConversationRepository = lambda session: type(
-        "FakeEscalations", (), {"is_escalated": lambda self, entity_id: asyncio.sleep(0, result=False), "record": lambda self, **kwargs: asyncio.sleep(0, result=kwargs)}
-    )()
-    module.InteractionRepository = lambda session: type(
-        "FakeInteractionRepo", (), {"add_many": lambda self, *args, **kwargs: asyncio.sleep(0)}
-    )()
+    originals = (module.StateRepository, module.InteractionRepository, module.EscalatedConversationRepository)
+    module.StateRepository = lambda session: FakeStates(session)
+    module.InteractionRepository = lambda session: FakeInteraction()
+    module.EscalatedConversationRepository = lambda session: FakeEscalations()
     try:
-        intercom = FakeIntercom()
-        telegram = FakeTelegram()
-        app = SupportApplication(FakePipeline(), intercom, telegram)
+        outbox = FakeOutbox()
+        app = SupportApplication(FakePipeline(), object(), None, outbox)
         message = InboundMessage("evt", "key", "conversation.user.replied", "conv", Channel.CONVERSATION, "оператор")
-        asyncio.run(app.handle(object(), type("Event", (), {"id": 1})(), message))
-        assert intercom.replies == 1
-        assert telegram.notifications == 1
-        assert intercom.tags == 0
+        event = type("Event", (), {"id": 1})()
+        asyncio.run(app.handle(object(), event, message))
+        assert app.outbox is outbox
+        assert app.outbox.actions
+        types = {a["action_type"] for a in app.outbox.actions}
+        assert {"intercom_reply", "intercom_escalation_tag", "telegram_escalation"} == types
     finally:
-        module.StateRepository = original_state
-        module.InteractionRepository = original_escalations
-        module.InteractionRepository = original_interaction
+        module.StateRepository, module.InteractionRepository, module.EscalatedConversationRepository = originals

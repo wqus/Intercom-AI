@@ -44,6 +44,9 @@ class TelegramNotifier:
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
 
+    def is_configured(self) -> bool:
+        return bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_GROUP_ID)
+
     async def notify_escalation(
         self,
         *,
