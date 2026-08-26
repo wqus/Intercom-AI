@@ -96,23 +96,24 @@ GENERIC_RERANK_WEIGHT = 0.10
 # The score is deliberately bounded to [0, 1].
 # v22 STRICT: TEMPLATE is rare — only near-perfect evidence + proven contract.
 # Ambiguous cases go to CATEGORY_CHOICE (Top-3) or escalate/rephrase.
-AUTO_SCORE = 0.90
-AUTO_MARGIN = 0.12
-LLM_SCORE = 0.55
-LLM_MARGIN = 0.035
-HIGH_SCORE_LOW_MARGIN = 0.85
-LEXICAL_EVIDENCE_MIN = 0.30
+# v22.1: TEMPLATE is ultra-niche. Default middle path is CATEGORY_CHOICE (Top-3).
+AUTO_SCORE = 0.92
+AUTO_MARGIN = 0.14
+LLM_SCORE = 0.48
+LLM_MARGIN = 0.030
+HIGH_SCORE_LOW_MARGIN = 0.88
+LEXICAL_EVIDENCE_MIN = 0.32
 SEMANTIC_GAP_FOR_LLM = 0.025
-MIN_REAL_INTENT_EVIDENCE = 0.40
-MIN_REAL_INTENT_FIT = 0.50
-MIN_TEMPLATE_EVIDENCE = 0.55
+MIN_REAL_INTENT_EVIDENCE = 0.36
+MIN_REAL_INTENT_FIT = 0.48
+MIN_TEMPLATE_EVIDENCE = 0.60
 
-# Strong-evidence TEMPLATE override: deliberately tight so TEMPLATE stays rare.
-STRONG_EVIDENCE_TEMPLATE_SCORE = 0.82
-STRONG_EVIDENCE_TEMPLATE_MARGIN = 0.08
-STRONG_EVIDENCE_TEMPLATE_FIT = 0.72
-STRONG_EVIDENCE_TEMPLATE_FAMILY = 0.48
-STRONG_EVIDENCE_MIN_REAL = 0.55
+# Strong-evidence TEMPLATE override: near-duplicate / almost-certain only.
+STRONG_EVIDENCE_TEMPLATE_SCORE = 0.88
+STRONG_EVIDENCE_TEMPLATE_MARGIN = 0.10
+STRONG_EVIDENCE_TEMPLATE_FIT = 0.78
+STRONG_EVIDENCE_TEMPLATE_FAMILY = 0.50
+STRONG_EVIDENCE_MIN_REAL = 0.58
 
 # Retrieval/ranking weights. Kept bounded and re-normalized when reranker is off.
 SEMANTIC_MAX_WEIGHT = 0.34
@@ -125,14 +126,14 @@ FAMILY_FIT_WEIGHT = 0.04
 RRF_WEIGHT = 0.04
 RERANK_WEIGHT = 0.10
 
-# Safety thresholds for automatic actions (v22 STRICT_TEMPLATE).
-INTENT_FIT_TEMPLATE_MIN = 0.72
-INTENT_FIT_LLM_MIN = 0.42
+# Safety thresholds: TEMPLATE ultra-strict; Top-3 deliberately permissive.
+INTENT_FIT_TEMPLATE_MIN = 0.78
+INTENT_FIT_LLM_MIN = 0.38
 INTENT_FIT_HARD_MISMATCH = 0.25
-MIN_QUERY_QUALITY_TEMPLATE = 0.30
-MIN_QUERY_QUALITY_LLM = 0.20
-MIN_QUERY_QUALITY_CHOICE = 0.18
-MIN_FAMILY_FIT_TEMPLATE = 0.45
+MIN_QUERY_QUALITY_TEMPLATE = 0.32
+MIN_QUERY_QUALITY_LLM = 0.18
+MIN_QUERY_QUALITY_CHOICE = 0.12
+MIN_FAMILY_FIT_TEMPLATE = 0.48
 
 # User-facing fallback routing.
 REPHRASE_SCORE_MAX = 0.50
@@ -151,16 +152,16 @@ OOS_QUERY_QUALITY_MIN = 0.34
 OOS_EXTERNAL_TARGET = True
 OOS_MIN_DOMAIN_TERM_HITS = 0
 
-# CATEGORY_CHOICE as a working middle mode (point 7).
-# Only when 2+ candidates have real support — never as a mask for "no category".
-CATEGORY_CHOICE_MIN_SCORE = 0.62
-CATEGORY_CHOICE_MIN_INTENT_FIT = 0.55
-CATEGORY_CHOICE_MAX_MARGIN = 0.12
-CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.06
+# CATEGORY_CHOICE is the primary middle mode (v22.1).
+# Prefer showing 2–3 options over TEMPLATE or empty rephrase.
+CATEGORY_CHOICE_MIN_SCORE = 0.42
+CATEGORY_CHOICE_MIN_INTENT_FIT = 0.40
+CATEGORY_CHOICE_MAX_MARGIN = 0.35
+CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.12
 CATEGORY_CHOICE_MAX_CANDIDATES = 3
 CATEGORY_CHOICE_MIN_CANDIDATES = 2
-CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.40
-CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT = True
+CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.28
+CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT = False
 
 # Contrastive routing: a candidate is not considered safe merely because it
 # scores well; it must also beat its declared/confusable competitors on
@@ -3180,11 +3181,10 @@ class KnowledgeBase:
         return result
 
     def _category_choice_candidates(self, ranked: list[dict]) -> list[dict]:
-        """Working middle mode (point 7): 2–3 plausible alternatives when TEMPLATE
-        is not safe enough but the query is not garbage.
+        """Primary middle mode (v22.1): 2–3 alternatives when TEMPLATE is not safe.
 
-        Filters are intentionally milder than TEMPLATE gates. We still drop
-        contradicted candidates and pure noise.
+        Filters are much milder than TEMPLATE. Only hard negatives/contradictions
+        are dropped so mid-confidence queries get a menu instead of rephrase.
         """
         if not ranked:
             return []
@@ -3195,60 +3195,68 @@ class KnowledgeBase:
         top_margin = top_score - second_score if len(ranked) > 1 else top_score
         quality = float(top.get("query_quality_score", 0.0))
 
-        if quality < MIN_QUERY_QUALITY_CHOICE:
+        if quality < MIN_QUERY_QUALITY_CHOICE and top_score < 0.55:
             return []
         if top_score < CATEGORY_CHOICE_MIN_SCORE:
             return []
-        # If margin is huge, top is already clear — prefer TEMPLATE/LLM, not choice.
-        if top_margin > CATEGORY_CHOICE_MAX_MARGIN:
+        # Huge margin alone does not block Top-3: TEMPLATE still needs AUTO_SCORE.
+        # Only skip choice when margin is extreme AND top is already template-safe.
+        if top_margin > CATEGORY_CHOICE_MAX_MARGIN and top_score >= AUTO_SCORE:
             return []
 
         eligible: list[dict] = []
-        for item in ranked[: max(CATEGORY_CHOICE_MAX_CANDIDATES + 2, 5)]:
+        for item in ranked[: max(CATEGORY_CHOICE_MAX_CANDIDATES + 3, 6)]:
             score = float(item.get("final_score", 0.0))
             fit = float(item.get("intent_fit_score", 0.0))
             constraints = item.get("constraint_evidence", {}) or {}
-            reason = str(item.get("intent_fit_reason", ""))
             contract_status = str(item.get("intent_contract_status", "unknown"))
 
-            # Top-3 is not a "most similar" list. Every candidate must survive
-            # its own evidence contract; otherwise an unresolved query can be
-            # turned into a menu of semantically plausible but unsupported intents.
-            if contract_status in {"insufficient", "contradicted"}:
-                continue
-
-            if score < CATEGORY_CHOICE_MIN_SCORE:
-                continue
-            if fit < CATEGORY_CHOICE_MIN_INTENT_FIT:
-                continue
-            if float(item.get("real_intent_evidence", 0.0)) < CATEGORY_CHOICE_MIN_REAL_EVIDENCE:
-                continue
-            if float(item.get("ontology_alignment_score", 0.50)) < ONTOLOGY_ALIGNMENT_MIN:
-                continue
-            if float(item.get("negative_contrast_score", 1.0)) <= NEGATIVE_CONTRAST_UNSAFE:
-                continue
-            if float(item.get("domain_support_score", 0.0)) < MIN_DOMAIN_SUPPORT_FOR_AUTO and not item.get("direct_support"):
-                continue
-            # Do not offer categories that only matched via weak facet overlap.
-            if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not item.get("direct_support"):
-                continue
-            if reason.startswith("facet_overlap") and not item.get("positive_hits"):
+            # Hard blocks only.
+            if contract_status == "contradicted":
                 continue
             if item.get("negative_hits"):
                 continue
             if constraints.get("forbidden_hits"):
                 continue
-            if top_score - score > CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST * 3.0:
+            if score < CATEGORY_CHOICE_MIN_SCORE * 0.85 and item is not ranked[0]:
+                # keep top even if slightly under threshold when building menu
+                if float(item.get("final_score", 0.0)) < 0.30:
+                    continue
+            if score < 0.30:
+                continue
+            if fit < CATEGORY_CHOICE_MIN_INTENT_FIT and score < 0.50:
+                continue
+            if float(item.get("real_intent_evidence", 0.0)) < CATEGORY_CHOICE_MIN_REAL_EVIDENCE and not item.get("direct_support"):
+                if score < 0.45:
+                    continue
+            if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not item.get("direct_support"):
+                continue
+            if top_score - score > max(0.45, CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST * 4.0):
                 continue
 
             payload = self._choice_candidate_payload(item)
             payload["margin"] = float(top_margin)
             eligible.append(payload)
 
+        # Fallback: if strict filters left <2, take top-3 ranked with any score >= 0.28
+        if len(eligible) < CATEGORY_CHOICE_MIN_CANDIDATES:
+            eligible = []
+            for item in ranked[:CATEGORY_CHOICE_MAX_CANDIDATES + 1]:
+                if item.get("negative_hits"):
+                    continue
+                if (item.get("constraint_evidence") or {}).get("forbidden_hits"):
+                    continue
+                if float(item.get("final_score", 0.0)) < 0.28:
+                    continue
+                payload = self._choice_candidate_payload(item)
+                payload["margin"] = float(top_margin)
+                eligible.append(payload)
+                if len(eligible) >= CATEGORY_CHOICE_MAX_CANDIDATES:
+                    break
+
         if len(eligible) < CATEGORY_CHOICE_MIN_CANDIDATES:
             return []
 
-        # Prefer distinct intent types; keep different intents inside one family.
         unique: list[dict] = []
         seen_ids: set[str] = set()
         seen_intent_types: set[str] = set()
@@ -3732,9 +3740,15 @@ class KnowledgeBase:
             fuzzy_score=fuzzy_score, contrastive_margin=contrastive_margin,
             second_is_conflict=second_is_conflict,
         )
-        if deterministic_intent_safe and deterministic_eligible and entry.get("template_answer"):
+        if (
+            deterministic_intent_safe
+            and deterministic_eligible
+            and entry.get("template_answer")
+            and top_score >= AUTO_SCORE
+            and real_evidence >= MIN_TEMPLATE_EVIDENCE
+        ):
             return MatchResult(
-                MatchMode.TEMPLATE, max(top_score, 0.76), entry.get("category"),
+                MatchMode.TEMPLATE, top_score, entry.get("category"),
                 (entry.get("template_answer") or ""),
                 entry.get("id"), relevant_entries, entry=entry,
                 second_score=second_score, margin=margin, embedding_score=embedding,
@@ -3793,14 +3807,23 @@ class KnowledgeBase:
                 subquestion=question, decision_reason="supported_intent_requires_clarification",
             )
 
-        if safe_auto and safe_template_eligible and entry.get("template_answer"):
+        # TEMPLATE only when aggregate score is near-certain (ultra-niche).
+        if (
+            safe_auto
+            and safe_template_eligible
+            and entry.get("template_answer")
+            and top_score >= AUTO_SCORE
+            and margin >= AUTO_MARGIN * 0.5
+            and intent_fit >= INTENT_FIT_TEMPLATE_MIN
+            and real_evidence >= MIN_TEMPLATE_EVIDENCE
+        ):
             reason = (
                 "strong_semantic_intent_match"
                 if direct_semantic_support and not direct_lexical_support
                 else "strong_lexical_intent_match"
             )
             return MatchResult(
-                MatchMode.TEMPLATE, max(top_score, 0.75), entry.get("category"),
+                MatchMode.TEMPLATE, top_score, entry.get("category"),
                 (entry.get("template_answer") or ""),
                 entry.get("id"), relevant_entries, entry=entry,
                 second_score=second_score, margin=margin, embedding_score=embedding,
@@ -3817,14 +3840,41 @@ class KnowledgeBase:
                 contrastive_reason=str(top.get("contrastive_reason", "")),
             )
 
-        # 6. If two categories are genuinely plausible, expose that ambiguity.
+        # 6. Primary middle path: Top-3 whenever 2+ candidates survive soft filters.
         choices = self._category_choice_candidates(ranked)
         if len(choices) >= 2:
-            supported = [
-                c for c in choices
-                if float(c.get("real_intent_evidence", 0.0)) >= CATEGORY_CHOICE_MIN_REAL_EVIDENCE
-            ]
-            if len(supported) >= 2:
+            return MatchResult(
+                MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
+                entry.get("id"), relevant_entries, entry=entry,
+                second_score=second_score, margin=margin,
+                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                evidence_score=float(top.get("evidence_score", 0.0)),
+                real_intent_evidence=real_evidence,
+                embedding_score=embedding, intent_fit_score=intent_fit,
+                intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                family_fit_score=family_fit, query_quality_score=quality.score,
+                subquestion=question, decision_reason="supported_ambiguity",
+                choice_candidates=choices, top_candidates=top_candidates,
+                domain_support_score=float(top.get("domain_support_score", 0.0)),
+                ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
+            )
+
+        # 6b. Single strong-but-not-template candidate: still try Top-3 from ranked.
+        if top_score >= 0.50 and len(top_candidates) >= 2:
+            soft_choices = []
+            for c in top_candidates[:3]:
+                soft_choices.append(c if isinstance(c, dict) else {"choice_label": str(c), "kb_id": str(c)})
+            # Ensure choice_label present
+            normalized = []
+            for c in soft_choices:
+                if not c:
+                    continue
+                label = c.get("choice_label") or c.get("category") or c.get("kb_id")
+                if not label:
+                    continue
+                normalized.append({**c, "choice_label": label})
+            if len(normalized) >= 2:
                 return MatchResult(
                     MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
                     entry.get("id"), relevant_entries, entry=entry,
@@ -3835,24 +3885,21 @@ class KnowledgeBase:
                     embedding_score=embedding, intent_fit_score=intent_fit,
                     intent_fit_reason=str(top.get("intent_fit_reason", "")),
                     family_fit_score=family_fit, query_quality_score=quality.score,
-                    subquestion=question, decision_reason="supported_ambiguity",
-                    choice_candidates=supported, top_candidates=top_candidates,
+                    subquestion=question, decision_reason="mid_confidence_top3",
+                    choice_candidates=normalized, top_candidates=top_candidates,
                     domain_support_score=float(top.get("domain_support_score", 0.0)),
                     ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
                     negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
                 )
 
-        # 7. If the category is sufficiently supported but not safe for a
-        # deterministic template, hand the final semantic decision to the
-        # constrained LLM. This is intentionally AFTER the ambiguity gate:
-        # a genuinely unresolved pair should produce a user choice, not an
-        # LLM guess.
+        # 7. LLM mode is a last resort signal for orchestration (LLM disabled in live:
+        # pipeline converts this to Top-3 or rephrase). Prefer not to reach here.
         llm_candidate_support = (
             top_score >= LLM_SCORE
             and intent_fit >= INTENT_FIT_LLM_MIN
-            and family_fit >= 0.28
-            and real_evidence >= 0.34
-            and float(top.get("domain_support_score", 0.0)) >= 0.22
+            and family_fit >= 0.25
+            and real_evidence >= 0.28
+            and float(top.get("domain_support_score", 0.0)) >= 0.18
             and not contradiction
         )
         llm_contrast_safe = (
@@ -3872,6 +3919,7 @@ class KnowledgeBase:
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
                 subquestion=question, decision_reason="supported_intent_needs_llm",
+                choice_candidates=choices if len(choices) >= 2 else None,
                 top_candidates=top_candidates,
                 domain_support_score=float(top.get("domain_support_score", 0.0)),
                 ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),

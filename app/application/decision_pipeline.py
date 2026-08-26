@@ -91,12 +91,10 @@ class DecisionPipeline:
             return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
 
         if match.mode == MatchMode.LLM and match.relevant_entries:
-            # CONSERVATIVE PRODUCTION MODE:
-            # Never call the LLM from the live support path. A case that would
-            # normally be delegated to the model is converted into a user-visible
-            # Top-3 choice. This is intentionally conservative: user choice is
-            # safer than a model guess.
+            # LLM disabled in live: always prefer Top-3 over rephrase.
             candidates = list(match.choice_candidates or [])
+            if len(candidates) < 2:
+                candidates = list(getattr(match, "top_candidates", None) or [])
             if len(candidates) < 2:
                 try:
                     candidates = self.kb.get_category_choice_candidates(question, top_n=3)
@@ -108,17 +106,18 @@ class DecisionPipeline:
                 labels = [
                     str(c.get("choice_label") or c.get("category") or c.get("kb_id"))
                     for c in candidates[:3]
+                    if (c.get("choice_label") or c.get("category") or c.get("kb_id"))
                 ]
-                trace.decision = Decision.CHOICE
-                trace.automated = True
-                trace.llm_used = False
-                trace.decision_reason = (
-                    trace.decision_reason or "supported_intent_needs_llm"
-                ) + ";llm_disabled_top3_fallback"
-                return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
+                if len(labels) >= 2:
+                    trace.decision = Decision.CHOICE
+                    trace.automated = True
+                    trace.llm_used = False
+                    trace.decision_reason = (
+                        trace.decision_reason or "supported_intent_needs_llm"
+                    ) + ";llm_disabled_top3_fallback"
+                    return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
 
-            # No safe Top-3 means we still must not call the LLM. Ask for a
-            # better-formed question instead of guessing a category.
+            # Last resort only when we truly have nothing to offer.
             trace.decision = Decision.REPHRASE
             trace.automated = True
             trace.llm_used = False
@@ -152,12 +151,21 @@ class DecisionPipeline:
             return trace, [OutboundAction("reply", ResponseComposer.oos(oos_response()))]
 
         if match.mode == MatchMode.NO_MATCH and match.decision_reason in {
-            "insufficient_context", "low_confidence", "unsupported_or_ambiguous"
+            "insufficient_context", "low_confidence", "unsupported_or_ambiguous",
+            "unsupported_object", "object_mismatch", "facet_mismatch",
         }:
-            # Unknown/ambiguous intent is not automatically a human-ticket.
-            # First try to recover the missing discriminator from the user.
-            # Escalation should be reserved for explicit operator requests,
-            # unsupported/high-risk cases, or a second failed clarification.
+            # Prefer Top-3 over generic rephrase when ranked candidates exist.
+            candidates = list(getattr(match, "top_candidates", None) or [])
+            labels = [
+                str(c.get("choice_label") or c.get("category") or c.get("kb_id"))
+                for c in candidates[:3]
+                if isinstance(c, dict) and (c.get("choice_label") or c.get("category") or c.get("kb_id"))
+            ]
+            if len(labels) >= 2 and float(match.score or 0.0) >= 0.35:
+                trace.decision = Decision.CHOICE
+                trace.automated = True
+                trace.decision_reason = (match.decision_reason or "") + ";top3_from_no_match"
+                return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
             trace.decision = Decision.REPHRASE
             trace.automated = True
             return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
