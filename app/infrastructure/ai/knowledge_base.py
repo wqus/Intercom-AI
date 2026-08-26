@@ -427,6 +427,8 @@ def contains_operator_request(text: str) -> bool:
 
 # High-risk intents: never auto-answer with TEMPLATE. Escalate + collect data.
 # Patterns are deliberately narrow and phrase-oriented to avoid false positives.
+# Patterns are intentionally specific. Prefer false negatives (normal routing)
+# over false positives that escalate "прошу вернуть доступ" as a refund.
 _HIGH_RISK_PATTERNS: dict[str, tuple[str, ...]] = {
     "refund": (
         "вернуть деньги",
@@ -439,8 +441,12 @@ _HIGH_RISK_PATTERNS: dict[str, tuple[str, ...]] = {
         "деньги списали",
         "списали деньги",
         "вернуть оплату",
-        "хочу возврат",
-        "прошу вернуть",
+        "хочу возврат денег",
+        "хочу возврат средств",
+        "прошу вернуть деньги",
+        "прошу вернуть средства",
+        "прошу вернуть оплату",
+        "просьба вернуть деньги",
     ),
     "personal_data": (
         "удалить персональные данные",
@@ -451,6 +457,7 @@ _HIGH_RISK_PATTERNS: dict[str, tuple[str, ...]] = {
         "отзываю согласие",
         "отзыв согласия",
         "удалить мои персональные",
+        "удаление персональных данных",
     ),
     "complaint": (
         "жалоба на",
@@ -460,7 +467,8 @@ _HIGH_RISK_PATTERNS: dict[str, tuple[str, ...]] = {
         "хамит",
         "оскорбил",
         "оскорбила",
-        "примите меры",
+        "примите меры и удалить",
+        "прошу принять меры",
     ),
 }
 

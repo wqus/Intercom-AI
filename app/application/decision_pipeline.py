@@ -56,8 +56,13 @@ class DecisionPipeline:
         # High-risk: refund / personal_data / complaint — escalate with data collection.
         if match.decision_reason.startswith("high_risk:"):
             kind = match.decision_reason.split(":", 1)[-1]
+            reason_map = {
+                "refund": EscalationReason.HIGH_RISK_REFUND,
+                "personal_data": EscalationReason.HIGH_RISK_PERSONAL_DATA,
+                "complaint": EscalationReason.HIGH_RISK_COMPLAINT,
+            }
             trace.decision = Decision.ESCALATE
-            trace.escalation_reason = EscalationReason.NO_CATEGORY
+            trace.escalation_reason = reason_map.get(kind, EscalationReason.NO_CATEGORY)
             trace.decision_reason = match.decision_reason
             reply = high_risk_reply(kind)
             return trace, [OutboundAction("reply", ResponseComposer.escalation_ack(reply), True)]
@@ -79,8 +84,7 @@ class DecisionPipeline:
             ]
             trace.decision = Decision.CHOICE
             trace.automated = True
-            # SAFE ROLLOUT: Top-3/category-choice is intentionally NOT exposed
-            # to the customer while the LLM/routing quality is under validation.
+            # Top-3 is enabled for full traffic when USER_VISIBLE_TOP3=True (v22).
             if not settings.USER_VISIBLE_TOP3:
                 trace.decision_reason = (trace.decision_reason or "") + ";top3_user_output_disabled"
                 return trace, []

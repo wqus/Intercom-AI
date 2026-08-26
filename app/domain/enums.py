@@ -36,4 +36,7 @@ class EscalationReason(str, Enum):
     ATTACHMENTS = "attachments"
     DELIVERY_FAILURE = "delivery_failure"
     CLARIFICATION_EXHAUSTED = "clarification_exhausted"
-
+    # v22 high-risk paths (structured data collection, no TEMPLATE)
+    HIGH_RISK_REFUND = "high_risk_refund"
+    HIGH_RISK_PERSONAL_DATA = "high_risk_personal_data"
+    HIGH_RISK_COMPLAINT = "high_risk_complaint"
