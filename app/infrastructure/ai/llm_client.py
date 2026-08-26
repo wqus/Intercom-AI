@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any
 
 
-from app.domain.policy import OPERATOR_HINT
 
 logger = logging.getLogger("llm_client")
 
@@ -297,7 +296,7 @@ class YandexLLMClient:
 
                 return LLMResult(
                     can_answer=True,
-                    answer=answer + OPERATOR_HINT,
+                    answer=answer,
                     reason=reason,
                     selected_kb_id=selected_kb_id,
                 )

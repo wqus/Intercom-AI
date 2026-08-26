@@ -5,6 +5,7 @@ import logging
 from app.domain.enums import Channel, ConversationStateKind, Decision, EscalationReason
 from app.domain.models import InboundMessage
 from app.domain.policy import escalation_ack
+from app.domain.response_composer import ResponseComposer
 from app.application.decision_pipeline import DecisionPipeline
 from app.infrastructure.intercom.client import IntercomGateway
 from app.infrastructure.persistence.repository import (
@@ -115,7 +116,7 @@ class SupportApplication:
         # All external writes are transactional-outbox actions. The escalation
         # blocklist is committed together with them, so a later retry can never
         # re-enter the bot pipeline merely because Intercom/Telegram was unavailable.
-        await self._enqueue_reply(session, message, event, escalation_ack(), suffix="escalation_ack")
+        await self._enqueue_reply(session, message, event, ResponseComposer.escalation_ack(escalation_ack()), suffix="escalation_ack")
         await self._outbox(session).enqueue(
             action_key=f"event:{event.id}:escalation_tag",
             action_type="intercom_escalation_tag",
@@ -203,7 +204,7 @@ class SupportApplication:
                 session,
                 message,
                 event,
-                "\n\n".join(answers),
+                ResponseComposer.final_answer(answers),
                 suffix="choice_answer",
             )
             await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})

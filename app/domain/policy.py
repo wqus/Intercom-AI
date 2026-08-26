@@ -1,24 +1,20 @@
-OPERATOR_HINT = (
-    "\n\n---\n"
-    "Если этот ответ не помог решить ваш вопрос, просто напишите «оператор». "
-    "Мы повторно рассмотрим ваше обращение и ответим вам в этом чате."
-)
+from __future__ import annotations
+
+from app.domain.response_composer import GREETING, OPERATOR_FOOTER
+
+
 
 def escalation_ack() -> str:
     return "Ваш вопрос принят. Мы обработаем его в ближайшее время и свяжемся с вами."
 
+
 def rephrase_prompt() -> str:
     return "Не удалось точно понять ваш вопрос. Пожалуйста, переформулируйте его немного подробнее."
 
-def choice_prompt(labels: list[str]) -> str:
-    options = "\n".join(f"{i}. {label}" for i, label in enumerate(labels, 1))
-    return (
-        "Чтобы я точно ответил, выберите подходящий вариант:\n"
-        f"{options}\n\n"
-        "Можно указать номер или описать свой вариант. "
-        "Если нужен специалист, напишите «оператор»."
-    )
 
+def choice_prompt(labels: list[str]) -> str:
+    from app.domain.response_composer import ResponseComposer
+    return ResponseComposer.choice(labels)
 
 
 def oos_response() -> str:

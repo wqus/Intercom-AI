@@ -246,3 +246,182 @@ def test_negated_mentor_application_does_not_trigger_kb_023():
         }
     }
     assert kb._hard_rule_match("Не хочу быть наставником") != "kb_023"
+
+
+def test_structured_negation_blocks_auto_answer_for_negated_goal():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries = []
+    kb.family_vocabulary = {"mentor": {"наставник", "стать"}}
+    entry = _entry(
+        kb, "kb_023", "mentor", "mentor_application",
+        ["mentor_application"], ["стать наставником", "хочу стать наставником"],
+    )
+    ok, reason = kb._template_eligibility(
+        "Не хочу стать наставником", entry,
+        intent_fit=0.90, family_fit=0.80, fuzzy_score=0.99,
+    )
+    assert not ok
+    assert reason.startswith("structured_negation:")
+
+
+def test_problem_state_negation_is_not_treated_as_structured_negation():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries = []
+    kb.family_vocabulary = {"education": {"записаться", "школа"}}
+    entry = _entry(
+        kb, "kb_002", "education", "registration_failure",
+        ["technical_failure", "registration"], ["не могу записаться", "ошибка при записи"],
+    )
+    hits = kb._structured_negation_hits("Не могу записаться в школу", entry)
+    assert hits == []
+
+
+def test_hard_rule_is_challenged_by_strong_conflicting_intent():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.family_vocabulary = {
+        "mentor": {"наставник", "программа", "стать"},
+    }
+    target = _entry(
+        kb, "kb_023", "mentor", "mentor_application",
+        ["mentor_application"], ["стать наставником"],
+    )
+    rival = _entry(
+        kb, "kb_034", "mentor", "mentor_program",
+        ["mentor_program"], ["программа наставничества", "что такое наставничество"],
+    )
+    target["conflict_ids"] = ["kb_034"]
+    rival["conflict_ids"] = ["kb_023"]
+    kb.entries = [target, rival]
+    passed, reason = kb._challenge_hard_rule("Что такое программа наставничества?", target)
+    assert not passed
+    assert reason == "hard_rule_challenged_by:kb_034"
+
+
+def test_template_gate_rejects_missing_semantic_precondition():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries = []
+    kb.family_vocabulary = {"mentor": {"наставник", "стать"}}
+    entry = _entry(
+        kb, "kb_023", "mentor", "mentor_application",
+        ["mentor_application"], ["стать наставником"],
+    )
+    ok, reason = kb._template_eligibility(
+        "Расскажите про программу наставничества", entry,
+        intent_fit=0.95, family_fit=0.90,
+    )
+    assert not ok
+    assert reason.startswith("missing_required_intent_facet:")
+
+
+def test_query_understanding_keeps_generic_verification_object_unknown():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    qu = kb._query_understanding("проблема верификации")
+    assert "verification" in qu.facets
+    assert "phone" not in qu.objects
+    assert "income" not in qu.objects
+    assert qu.specificity == "low"
+
+
+def test_income_contract_does_not_accept_generic_verification():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.family_vocabulary = {"income": {"доход", "опора", "уровень"}}
+    entry = _entry(
+        kb, "kb_010", "income", "income_or_support_pillar",
+        ["income", "support"], ["подтвердить доход", "уровень дохода"],
+    )
+    entry["constraints"] = {"must_have_any": [["опор", "доход", "уровень"]]}
+    evidence = kb._intent_contract_evidence("проблема верификации", entry)
+    assert evidence.status == "insufficient"
+    assert "required_constraint_group" in evidence.reason or "defining_evidence" in evidence.reason
+
+
+def test_phone_contract_requires_phone_evidence_not_generic_verification():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.family_vocabulary = {"account": {"телефон", "номер", "смс"}}
+    entry = _entry(
+        kb, "kb_027", "account", "phone_verification",
+        ["verification"], ["не могу подтвердить номер", "не приходит смс"],
+    )
+    entry["constraints"] = {"must_have_any": [["номер", "телефон", "смс", "подтвержден"]]}
+    evidence = kb._intent_contract_evidence("проблема верификации", entry)
+    assert evidence.status == "insufficient"
+    assert evidence.reason.startswith("missing_required_object:phone")
+
+
+def test_phone_contract_is_proven_with_specific_phone_query():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.family_vocabulary = {"account": {"телефон", "номер", "смс"}}
+    entry = _entry(
+        kb, "kb_027", "account", "phone_verification",
+        ["verification"], ["не могу подтвердить номер", "не приходит смс"],
+    )
+    entry["constraints"] = {"must_have_any": [["номер", "телефон", "смс", "подтвержден"]]}
+    evidence = kb._intent_contract_evidence("не приходит смс для подтверждения номера", entry)
+    assert evidence.status == "proven"
+    assert "phone" in evidence.matched_objects
+
+
+def test_template_gate_rejects_semantically_close_unsupported_income_query():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries = []
+    kb.family_vocabulary = {"income": {"доход", "опора", "уровень"}}
+    entry = _entry(
+        kb, "kb_010", "income", "income_or_support_pillar",
+        ["income"], ["подтвердить доход", "уровень дохода"],
+    )
+    entry["constraints"] = {"must_have_any": [["опор", "доход", "уровень"]]}
+    ok, reason = kb._template_eligibility(
+        "проблема верификации", entry,
+        intent_fit=0.95, family_fit=0.90, fuzzy_score=0.88,
+    )
+    assert not ok
+    assert reason in {"missing_semantic_precondition", "intent_contract:missing_required_constraint_group"}
+
+
+def test_llm_validator_cannot_bypass_missing_intent_contract():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries = []
+    kb.entries_by_id = {}
+    kb.family_vocabulary = {"account": {"телефон", "номер", "смс"}}
+    entry = _entry(
+        kb, "kb_027", "account", "phone_verification",
+        ["verification"], ["не могу подтвердить номер"],
+    )
+    entry["constraints"] = {"must_have_any": [["номер", "телефон", "смс", "подтвержден"]]}
+    kb.entries_by_id["kb_027"] = entry
+    ok, reason, _ = kb.validate_llm_selection("проблема верификации", "kb_027")
+    assert not ok
+    assert reason.startswith("llm_selection_contract:")
+
+
+def test_category_choice_candidates_drop_unproven_contracts():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries = []
+    kb.family_vocabulary = {
+        "income": {"доход", "опора", "уровень"},
+        "account": {"телефон", "номер", "смс"},
+    }
+    income = _entry(
+        kb, "kb_010", "income", "income_or_support_pillar",
+        ["income"], ["подтвердить доход"],
+    )
+    income["constraints"] = {"must_have_any": [["опор", "доход", "уровень"]]}
+    phone = _entry(
+        kb, "kb_027", "account", "phone_verification",
+        ["verification"], ["не приходит смс"],
+    )
+    phone["constraints"] = {"must_have_any": [["номер", "телефон", "смс", "подтвержден"]]}
+    kb.entries_by_id = {"kb_010": income, "kb_027": phone}
+    ranked = [
+        {"entry": income, "final_score": .86, "ranking_score": .86,
+         "intent_fit_score": .80, "real_intent_evidence": .60,
+         "family_fit_score": .60, "direct_support": True,
+         "contrastive_margin": .20},
+        {"entry": phone, "final_score": .84, "ranking_score": .84,
+         "intent_fit_score": .78, "real_intent_evidence": .55,
+         "family_fit_score": .55, "direct_support": True,
+         "contrastive_margin": .10},
+    ]
+    # The public selector must never expose a candidate whose own contract is not proven.
+    choices = kb._category_choice_candidates(ranked)
+    assert choices == []

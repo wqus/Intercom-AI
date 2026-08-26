@@ -2,7 +2,8 @@ import time
 import logging
 from app.domain.enums import Decision, EscalationReason
 from app.domain.models import DecisionTrace, InboundMessage, OutboundAction, ProcessingResult
-from app.domain.policy import choice_prompt, escalation_ack, rephrase_prompt, oos_response
+from app.domain.policy import escalation_ack, rephrase_prompt, oos_response
+from app.domain.response_composer import ResponseComposer
 from app.infrastructure.ai.knowledge_base import KnowledgeBase, MatchMode, MatchResult, contains_operator_request, is_non_query_message
 from app.infrastructure.ai.llm_client import YandexLLMClient
 from app.core.config import settings
@@ -53,12 +54,12 @@ class DecisionPipeline:
         if match.mode == MatchMode.TEMPLATE:
             trace.decision = Decision.ANSWER_TEMPLATE
             trace.automated = True
-            return trace, [OutboundAction("reply", match.template_answer)]
+            return trace, [OutboundAction("business_answer", match.template_answer or "")]
 
         if match.mode == MatchMode.CLARIFICATION:
             trace.decision = Decision.CLARIFY
             trace.automated = True
-            return trace, [OutboundAction("reply", match.template_answer)]
+            return trace, [OutboundAction("reply", ResponseComposer.rephrase(match.template_answer or rephrase_prompt()))]
 
         if match.mode == MatchMode.CATEGORY_CHOICE:
             labels = [
@@ -72,7 +73,7 @@ class DecisionPipeline:
             if not settings.USER_VISIBLE_TOP3:
                 trace.decision_reason = (trace.decision_reason or "") + ";top3_user_output_disabled"
                 return trace, []
-            return trace, [OutboundAction("reply", choice_prompt(labels))]
+            return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
 
         if match.mode == MatchMode.LLM and match.relevant_entries:
             # CONSERVATIVE PRODUCTION MODE:
@@ -99,7 +100,7 @@ class DecisionPipeline:
                 trace.decision_reason = (
                     trace.decision_reason or "supported_intent_needs_llm"
                 ) + ";llm_disabled_top3_fallback"
-                return trace, [OutboundAction("reply", choice_prompt(labels))]
+                return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
 
             # No safe Top-3 means we still must not call the LLM. Ask for a
             # better-formed question instead of guessing a category.
@@ -109,7 +110,7 @@ class DecisionPipeline:
             trace.decision_reason = (
                 trace.decision_reason or "supported_intent_needs_llm"
             ) + ";llm_disabled_no_safe_top3"
-            return trace, [OutboundAction("reply", rephrase_prompt())]
+            return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
 
             # FUTURE LLM PATH (intentionally disabled for now):
             # result = await self.llm.classify(question, match.relevant_entries)
@@ -119,7 +120,7 @@ class DecisionPipeline:
         if match.mode == MatchMode.REPHRASE:
             trace.decision = Decision.REPHRASE
             trace.automated = True
-            return trace, [OutboundAction("reply", rephrase_prompt())]
+            return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
 
         if match.mode == MatchMode.NO_MATCH and match.decision_reason.startswith("noise:"):
             # Noise is a routing outcome, not a support failure. Do not send
@@ -133,7 +134,7 @@ class DecisionPipeline:
         }:
             trace.decision = Decision.OOS
             trace.automated = True
-            return trace, [OutboundAction("reply", oos_response())]
+            return trace, [OutboundAction("reply", ResponseComposer.oos(oos_response()))]
 
         if match.mode == MatchMode.NO_MATCH and match.decision_reason in {
             "insufficient_context", "low_confidence", "unsupported_or_ambiguous"
@@ -144,7 +145,7 @@ class DecisionPipeline:
             # unsupported/high-risk cases, or a second failed clarification.
             trace.decision = Decision.REPHRASE
             trace.automated = True
-            return trace, [OutboundAction("reply", rephrase_prompt())]
+            return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
 
         trace.decision = Decision.ESCALATE
         trace.escalation_reason = EscalationReason.NO_CATEGORY
@@ -204,6 +205,10 @@ class DecisionPipeline:
             traces.append(trace)
             raw_actions.extend(actions)
 
+        business_answers = list(dict.fromkeys(
+            action.text for action in raw_actions
+            if action.kind == "business_answer" and action.text
+        ))
         replies = list(dict.fromkeys(
             action.text for action in raw_actions
             if action.kind == "reply" and action.text
@@ -211,10 +216,25 @@ class DecisionPipeline:
         needs_escalation = any(action.escalate for action in raw_actions)
 
         actions: list[OutboundAction] = []
-        if replies:
+        if business_answers and not replies:
+            actions.append(OutboundAction(
+                "reply",
+                ResponseComposer.final_answer(business_answers),
+                needs_escalation,
+            ))
+        elif business_answers:
+            # Mixed multi-intent outcome: keep the business answers together and
+            # do not append the final footer until the interaction itself is over.
+            actions.append(OutboundAction(
+                "reply",
+                ResponseComposer.final_answer(business_answers, include_footer=False),
+                needs_escalation,
+            ))
+            actions.append(OutboundAction("reply", "\n\n".join(replies), needs_escalation))
+        elif replies:
             actions.append(OutboundAction("reply", "\n\n".join(replies), needs_escalation))
         elif needs_escalation:
-            actions.append(OutboundAction("reply", escalation_ack(), True))
+            actions.append(OutboundAction("reply", ResponseComposer.escalation_ack(escalation_ack()), True))
 
         result = ProcessingResult(traces=traces, actions=actions)
         result.latency_ms = (time.perf_counter() - started) * 1000

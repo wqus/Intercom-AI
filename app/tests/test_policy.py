@@ -16,7 +16,9 @@ def test_template_decision():
     msg=InboundMessage("1","k","t","c",Channel.CONVERSATION,"нужна помощь по обучению")
     result=asyncio.run(pipeline.decide(msg))
     assert result.traces[0].decision==Decision.ANSWER_TEMPLATE
-    assert result.actions[0].text=="answer"
+    assert result.actions[0].text.startswith("Добрый день!\n\nanswer")
+    assert result.actions[0].text.count("Добрый день!") == 1
+    assert result.actions[0].text.count("Если этот ответ не помог") == 1
 
 
 

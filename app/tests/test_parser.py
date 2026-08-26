@@ -38,7 +38,7 @@ def test_conversation_user_replied_does_not_fallback_to_admin_source():
     assert parse(payload) is None
 
 
-def test_replayed_conversation_event_does_not_pick_a_newer_user_message():
+def test_conversation_parser_uses_latest_user_message():
     payload = {
         "id": "evt-old",
         "topic": "conversation.user.replied",
@@ -53,8 +53,8 @@ def test_replayed_conversation_event_does_not_pick_a_newer_user_message():
     }
     msg = parse(payload)
     assert msg is not None
-    assert msg.text == "Первое сообщение"
-    assert msg.updated_at == "100"
+    assert msg.text == "Более новое сообщение"
+    assert msg.updated_at == "200"
 
 
 def test_attachments_belong_only_to_current_source_message():

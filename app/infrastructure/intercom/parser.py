@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hashlib, hmac, re
+from datetime import datetime
 from app.core.config import settings
 from app.domain.enums import Channel
 from app.domain.models import InboundMessage
@@ -24,16 +25,36 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
 
     source = item.get("source", {}) or {}
     parts = item.get("conversation_parts", {}).get("conversation_parts", []) or []
-    user_parts = [p for p in parts if (p.get("author", {}) or {}).get("type") == "user"]
     topic = payload.get("topic", "")
 
-    # Prefer the message carried by THIS webhook. Do not select the last user
-    # message from conversation history: delayed/replayed events can contain a
-    # newer customer message and would otherwise process the wrong text.
+    # Intercom exposes the conversation as history, where the first customer
+    # message is still present after later replies arrive. Classification must
+    # operate on the LATEST customer message. Prefer the freshest timestamp
+    # across `source` and `conversation_parts`; when timestamps are missing,
+    # retain payload order and take the last user part.
+    user_parts = [
+        p for p in parts
+        if (p.get("author", {}) or {}).get("type") == "user" and p.get("body")
+    ]
     if (source.get("author", {}) or {}).get("type") == "user" and source.get("body"):
-        part = source
-    elif user_parts:
-        part = user_parts[-1]
+        user_parts.append(source)
+
+    def _timestamp(value: object) -> float:
+        if value in (None, ""):
+            return -1.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                return -1.0
+
+    if user_parts:
+        part = max(
+            enumerate(user_parts),
+            key=lambda pair: (_timestamp(pair[1].get("created_at")), pair[0]),
+        )[1]
     elif topic == "conversation.user.replied" and source.get("body") and not (source.get("author", {}) or {}).get("type"):
         # Compatibility fallback only when author.type is genuinely absent. An
         # explicit admin/bot author must never be treated as a customer reply.

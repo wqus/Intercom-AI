@@ -12,6 +12,11 @@ from typing import Any, Iterable
 import numpy as np
 from rapidfuzz import fuzz
 
+from app.domain.response_composer import clean_business_answer
+from app.domain.intent_contracts import (
+    ContractEvidence, QueryUnderstanding, REQUIRED_OBJECTS, understand_query,
+)
+
 try:
     from sentence_transformers import CrossEncoder, SentenceTransformer
 except ImportError:  # pragma: no cover
@@ -186,6 +191,20 @@ MIN_TOKENS = 2
 MIN_ALNUM_RATIO = 0.45
 MAX_REPEAT_CHAR_RATIO = 0.72
 
+# Structured negation: these operators negate a proposed user goal/choice.
+# Problem-state negations such as "не могу записаться" are deliberately NOT
+# treated as intent contradiction; they describe a failure state instead.
+STRUCTURED_NEGATION_PREFIXES = (
+    "не хочу", "не желаю", "не собираюсь", "не планирую",
+    "не буду", "не готов", "не нужен", "не нужна", "не нужно",
+    "не интересует", "не интересно", "не подходит", "не согласен",
+)
+PROBLEM_STATE_NEGATION_PREFIXES = (
+    "не могу", "не получается", "не работает", "не открывается",
+    "не запускается", "не приходит", "не пускает", "не дает",
+    "не дает", "нет кнопки", "нет доступа",
+)
+
 MAX_SUBQUESTIONS = 5
 
 # Critical intent contracts. These are semantic preconditions for categories
@@ -197,7 +216,7 @@ INTENT_REQUIRED_FACETS: dict[str, set[str]] = {
     "mentor_application": {"mentor_application"},
     "mentor_program": {"mentor_program"},
     "mentor_application_retry": {"retry"},
-    "registration_failure": {"registration", "technical_failure"},
+    "registration_failure": {"registration"},
     "school_registration": {"registration", "school"},
     "education_entry": {"procedure"},
     "school_started": {"current_flow"},
@@ -220,12 +239,6 @@ MIN_ALNUM_RATIO = 0.45
 MAX_REPEAT_CHAR_RATIO = 0.72
 
 MAX_SUBQUESTIONS = 5
-
-OPERATOR_HINT = (
-    "\n\n---\n"
-    "Если этот ответ не помог решить ваш вопрос, просто напишите «оператор». "
-    "Мы повторно рассмотрим ваше обращение и ответим вам в этом чате."
-)
 
 # Only generic function words. Negation and operational words remain.
 STOP_WORDS = {
@@ -788,7 +801,7 @@ class KnowledgeBase:
         self.negative_embeddings_matrix = np.empty((0, 0), dtype=np.float32)
         self.category_negative_indices: dict[str, list[int]] = {}
         self.family_vocabulary: dict[str, set[str]] = {}
-        self.default_answer = "Добрый день!\nУточните, пожалуйста, подробнее ваш вопрос."
+        self.default_answer = "Уточните, пожалуйста, подробнее ваш вопрос."
         self.model = None
         self.reranker = None
 
@@ -831,7 +844,7 @@ class KnowledgeBase:
             if not entry_id:
                 continue
             if entry_id == "default":
-                self.default_answer = str(raw.get("template_answer") or self.default_answer)
+                self.default_answer = clean_business_answer(raw.get("template_answer") or self.default_answer)
                 continue
             if entry_id in self.entries_by_id:
                 raise ValueError(f"Duplicate knowledge-base id: {entry_id}")
@@ -848,6 +861,7 @@ class KnowledgeBase:
             entry["id"] = entry_id
             entry["family"] = entry.get("family") or FAMILIES.get(entry_id, "other")
             entry["priority"] = int(entry.get("priority") or 0)
+            entry["template_answer"] = clean_business_answer(entry.get("template_answer"))
             entry["choice_label"] = (
                 str(entry.get("choice_label") or "").strip()
                 or str(entry.get("category") or entry_id).strip()
@@ -1932,6 +1946,21 @@ class KnowledgeBase:
         if stems & {"наставник", "ментор"} and stems & {"отказ", "отклон", "повтор", "снов"}:
             facets.add("retry")
 
+        # Morphological variants which are common in real support messages but
+        # are not covered by exact phrase lists. These remain intent-specific
+        # and do not classify from a generic topic word alone.
+        if any(stem.startswith("запис") or stem.startswith("регистрац") for stem in stems):
+            facets.add("registration")
+        if any(stem.startswith("ссыл") for stem in stems) and (stems & {"чат", "телеграм", "тг"}):
+            facets.add("telegram_link")
+        if stems & {"наставник", "ментор"} and "mentor_application" not in facets and "mentor_program" not in facets:
+            mentor_text = normalize_light(question)
+            if not any(p in mentor_text for p in (
+                "стать наставником", "стать ментором", "программа наставничества",
+                "как работает наставничество", "что такое наставничество",
+            )):
+                facets.add("personal_mentor")
+
         return facets
 
     @staticmethod
@@ -2067,6 +2096,301 @@ class KnowledgeBase:
         else:
             reason = "no_strong_question_facet"
         return float(fit), reason
+
+    def _structured_negation_hits(self, question: str, entry: dict) -> list[str]:
+        """Detect explicit negation of the candidate's intended user goal.
+
+        This is intentionally separate from `negative_phrases`: those are KB
+        examples, while this detector reasons about *scope* around a matched
+        action phrase. It must not turn failure reports ("не могу записаться")
+        into a contradiction for the registration-failure intent.
+        """
+        q = normalize_light(question)
+        if not q:
+            return []
+
+        positive_phrases: list[str] = []
+        signals = entry.get("intent_signals") or {}
+        positive_phrases.extend(
+            normalize_light(str(x)) for x in signals.get("positive", [])
+            if isinstance(x, str) and normalize_light(str(x))
+        )
+        positive_phrases.extend(
+            normalize_light(str(x)) for x in entry.get("positive_examples", [])[:25]
+            if isinstance(x, str) and normalize_light(str(x))
+        )
+        positive_phrases = list(dict.fromkeys(positive_phrases))
+
+        hits: list[str] = []
+        for phrase in positive_phrases:
+            start = q.find(phrase)
+            if start < 0:
+                continue
+            prefix = q[max(0, start - 40):start].strip()
+            # A problem-state phrase is evidence for failure intents, not a
+            # negation of the action itself.
+            if any(prefix.endswith(p) for p in PROBLEM_STATE_NEGATION_PREFIXES):
+                continue
+            if any(prefix.endswith(p) for p in STRUCTURED_NEGATION_PREFIXES):
+                hits.append(phrase)
+        return list(dict.fromkeys(hits))
+
+    def _semantic_precondition_reason(self, question: str, entry: dict) -> str | None:
+        """Return a conservative precondition failure for auto-answering.
+
+        Critical intents already declare `intent_type`/`intent_facets`. The new
+        guard makes those contracts explicit at the final eligibility boundary,
+        so retrieval similarity cannot bypass them.
+        """
+        intent_type = str(entry.get("intent_type") or "").strip()
+        required_facets = INTENT_REQUIRED_FACETS.get(intent_type, set())
+        q_facets = self._question_facets(question)
+        if required_facets and not (q_facets & required_facets):
+            return f"missing_required_intent_facet:{intent_type}"
+
+        constraints = self._constraint_evidence(question, entry)
+        any_groups = constraints.get("constraint_groups") or []
+        if entry.get("constraints") and any_groups and all(isinstance(g, list) for g in any_groups):
+            # The KB's `must_have_any` groups are intentionally treated as a
+            # soft contract: at least one explicit constraint must be present.
+            # This avoids rejecting natural variants while still blocking pure
+            # topic overlap with no operational evidence.
+            if not any(any(group) for group in any_groups):
+                return "missing_semantic_precondition"
+
+        if constraints.get("forbidden_hits"):
+            return "forbidden_precondition"
+        return None
+
+    def _challenge_hard_rule(self, question: str, entry: dict) -> tuple[bool, str]:
+        """Challenge a deterministic hard rule against close intent rivals.
+
+        Hard rules are high precision hypotheses, not unconditional truth. A
+        rival with a strong positive signal/facet fit can veto the shortcut and
+        send the query through the normal contrastive ranker.
+        """
+        candidate_fit, _ = self._intent_fit(question, entry)
+        candidate_family = self._family_fit(question, entry)
+        candidate_pos, candidate_neg = self._intent_signal_hits(question, entry)
+        candidate_score = (0.55 * candidate_fit) + (0.25 * candidate_family) + (0.20 if candidate_pos else 0.0)
+        if candidate_neg:
+            return False, "hard_rule_candidate_negative"
+
+        conflict_ids = {str(x) for x in (entry.get("conflict_ids") or [])}
+        rivals = [e for e in self.entries if str(e.get("id")) in conflict_ids]
+        for rival in rivals:
+            rival_fit, _ = self._intent_fit(question, rival)
+            rival_family = self._family_fit(question, rival)
+            rival_pos, rival_neg = self._intent_signal_hits(question, rival)
+            if rival_neg:
+                continue
+            rival_score = (0.55 * rival_fit) + (0.25 * rival_family) + (0.20 if rival_pos else 0.0)
+            if rival_score >= 0.66 and rival_score + 0.04 >= candidate_score:
+                return False, f"hard_rule_challenged_by:{rival.get('id')}"
+        return True, "hard_rule_challenge_passed"
+
+    def _query_understanding(self, question: str) -> QueryUnderstanding:
+        """Parse query meaning independently from candidate ranking.
+
+        The parser is intentionally narrower than embeddings: it recognizes
+        discriminating objects/facets, but leaves unknown objects unknown.
+        """
+        normalized = normalize_light(question)
+        return understand_query(
+            normalized,
+            facets=self._question_facets(question),
+            ontology=self._query_ontology(question),
+        )
+
+    def _intent_contract_evidence(self, question: str, entry: dict) -> ContractEvidence:
+        """Verify whether the query proves the defining evidence of an intent.
+
+        Retrieval is allowed to propose a candidate. This method decides whether
+        there is enough deterministic evidence to call that candidate supported.
+        Embedding similarity can never compensate for a missing contract.
+        """
+        intent_type = str(entry.get("intent_type") or "").strip()
+        qu = self._query_understanding(question)
+        constraints = self._constraint_evidence(question, entry)
+        required_facets = frozenset(INTENT_REQUIRED_FACETS.get(intent_type, set()))
+        matched_facets = frozenset(set(required_facets) & set(qu.facets))
+
+        # Candidate-specific object contract. This is the strongest protection
+        # against semantic-neighbour errors such as generic "верификация" being
+        # routed to phone/income verification.
+        required_objects = REQUIRED_OBJECTS.get(intent_type, frozenset())
+        matched_objects = frozenset(set(required_objects) & set(qu.objects)) if required_objects else frozenset(qu.objects)
+
+        positive_hits = self._lexical_phrase_hits(question, entry)
+        signal_pos, signal_neg = self._intent_signal_hits(question, entry)
+        fuzzy = self._best_fuzzy_phrase_score(question, entry)
+
+        if constraints.get("forbidden_hits"):
+            return ContractEvidence(
+                status="contradicted",
+                reason="forbidden_constraint",
+                required_objects=frozenset(required_objects),
+                matched_objects=matched_objects,
+                required_facets=required_facets,
+                matched_facets=matched_facets,
+                contradictions=frozenset(constraints["forbidden_hits"]),
+                strength=0.0,
+            )
+
+        # Explicit KB evidence can prove an intent even when the lightweight
+        # facet parser misses a natural inflection. This prevents architecture
+        # hardening from rejecting known-good production phrases. Generic
+        # semantic similarity still cannot take this escape hatch.
+        explicit_evidence = bool(positive_hits or signal_pos)
+
+        if required_facets and not matched_facets and not explicit_evidence:
+            return ContractEvidence(
+                status="insufficient",
+                reason=f"missing_required_intent_facet:{intent_type}",
+                required_objects=frozenset(required_objects),
+                matched_objects=matched_objects,
+                required_facets=required_facets,
+                matched_facets=matched_facets,
+                missing=required_facets,
+                strength=0.0,
+            )
+
+        if required_objects and not matched_objects and not explicit_evidence:
+            return ContractEvidence(
+                status="insufficient",
+                reason=f"missing_required_object:{intent_type}",
+                required_objects=required_objects,
+                matched_objects=matched_objects,
+                required_facets=required_facets,
+                matched_facets=matched_facets,
+                missing=required_objects,
+                strength=0.0,
+            )
+
+        any_groups = constraints.get("constraint_groups") or []
+        if entry.get("constraints") and any_groups:
+            failed = [i for i, hits in enumerate(any_groups) if not hits]
+            if failed:
+                # Explicit must-have-any constraints are hard evidence contracts.
+                # If a record is legacy and its list contains very generic words,
+                # positive phrase/intent evidence may still rescue it below.
+                positive_hits = self._lexical_phrase_hits(question, entry)
+                signal_pos, _ = self._intent_signal_hits(question, entry)
+                if not positive_hits and not signal_pos:
+                    return ContractEvidence(
+                        status="insufficient",
+                        reason="missing_required_constraint_group",
+                        required_objects=frozenset(required_objects),
+                        matched_objects=matched_objects,
+                        required_facets=required_facets,
+                        matched_facets=matched_facets,
+                        missing=frozenset(str(i) for i in failed),
+                        strength=0.0,
+                    )
+
+        # A high-specificity query with a conflicting defining object should not
+        # be rescued by a broad family match. This catches cross-domain neighbours.
+        candidate_object = str((entry.get("ontology") or self._derive_ontology(entry)).get("object") or "")
+        incompatible_pairs = {
+            "training": {"membership", "subscription", "rent", "phone", "qr_code", "invite_code"},
+            "phone": {"income", "membership", "subscription", "rent", "qr_code", "invite_code"},
+            "income": {"phone", "membership", "subscription", "rent", "qr_code", "invite_code"},
+            "membership": {"training", "phone", "income", "rent", "subscription"},
+        }
+        contradictions = set()
+        for obj in qu.objects:
+            if candidate_object in incompatible_pairs.get(obj, set()):
+                contradictions.add(f"object:{obj}")
+        if contradictions:
+            return ContractEvidence(
+                status="contradicted",
+                reason="incompatible_object",
+                required_objects=frozenset(required_objects),
+                matched_objects=matched_objects,
+                required_facets=required_facets,
+                matched_facets=matched_facets,
+                contradictions=frozenset(contradictions),
+                strength=0.0,
+            )
+
+        # Legacy intents without an explicit contract still need positive
+        # evidence. Pure semantic similarity remains insufficient.
+        if positive_hits or signal_pos or fuzzy >= 0.90:
+            strength = 1.0 if (positive_hits or signal_pos) else 0.75
+            return ContractEvidence(
+                status="proven", reason="explicit_intent_evidence",
+                required_objects=frozenset(required_objects),
+                matched_objects=matched_objects,
+                required_facets=required_facets,
+                matched_facets=matched_facets,
+                strength=strength,
+            )
+
+        # For contract-bearing intents, absence of defining evidence is an
+        # abstention signal. For generic legacy intents we keep status unknown so
+        # rare in-domain queries can still reach clarification/LLM, but not an
+        # unconditional TEMPLATE.
+        if required_objects or required_facets or entry.get("constraints"):
+            return ContractEvidence(
+                status="insufficient", reason="no_defining_evidence",
+                required_objects=frozenset(required_objects),
+                matched_objects=matched_objects,
+                required_facets=required_facets,
+                matched_facets=matched_facets,
+                strength=0.0,
+            )
+        return ContractEvidence(
+            status="unknown", reason="legacy_contract_not_declared",
+            required_objects=frozenset(), matched_objects=matched_objects,
+            required_facets=frozenset(), matched_facets=frozenset(), strength=0.0,
+        )
+
+    def _template_eligibility(
+        self,
+        question: str,
+        entry: dict,
+        *,
+        intent_fit: float,
+        family_fit: float,
+        fuzzy_score: float = 0.0,
+        contrastive_margin: float = 1.0,
+        second_is_conflict: bool = False,
+        hard_rule: bool = False,
+    ) -> tuple[bool, str]:
+        """Single final gate before any automatic answer is exposed."""
+        structured = self._structured_negation_hits(question, entry)
+        if structured:
+            return False, "structured_negation:" + ",".join(structured[:2])
+
+        precondition = self._semantic_precondition_reason(question, entry)
+        if precondition:
+            return False, precondition
+
+        contract = self._intent_contract_evidence(question, entry)
+        if contract.status in {"insufficient", "contradicted"}:
+            return False, f"intent_contract:{contract.reason}"
+
+        negative_hits = self._negative_hits(question, entry)
+        signal_neg = self._intent_signal_hits(question, entry)[1]
+        if negative_hits or signal_neg:
+            return False, "explicit_candidate_negative"
+
+        if hard_rule:
+            passed, reason = self._challenge_hard_rule(question, entry)
+            if not passed:
+                return False, reason
+
+        # Fuzzy safety is stricter than generic semantic auto-routing. A near
+        # duplicate phrase is allowed only when the intent contract and family
+        # also agree.
+        if fuzzy_score >= 0.98:
+            if intent_fit < 0.72 or family_fit < 0.40:
+                return False, "fuzzy_safety_failed"
+
+        if second_is_conflict and contrastive_margin < CONTRASTIVE_AUTO_MARGIN:
+            return False, "contrastive_margin_too_small"
+
+        return True, "eligible"
 
     def _negative_hits(self, question: str, entry: dict) -> list[str]:
         q = normalize_light(question)
@@ -2505,6 +2829,12 @@ class KnowledgeBase:
             # performed by the decision layer, while evidence and contradictions
             # determine whether a candidate may actually be selected.
 
+            contract = self._intent_contract_evidence(question, entry)
+            if contract.status == "contradicted":
+                score -= 0.28
+            elif contract.status == "insufficient":
+                score -= 0.18
+
             final_score = float(max(0.0, min(1.0, score)))
 
             # Ranking score is deliberately distinct from decision score:
@@ -2545,6 +2875,14 @@ class KnowledgeBase:
                 "negative_hits": negatives,
                 "constraint_evidence": constraints,
             })
+            contract = self._intent_contract_evidence(question, entry)
+            ranked_item["intent_contract_status"] = contract.status
+            ranked_item["intent_contract_reason"] = contract.reason
+            ranked_item["intent_contract_strength"] = contract.strength
+            ranked_item["intent_contract_required_objects"] = sorted(contract.required_objects)
+            ranked_item["intent_contract_matched_objects"] = sorted(contract.matched_objects)
+            ranked_item["intent_contract_required_facets"] = sorted(contract.required_facets)
+            ranked_item["intent_contract_matched_facets"] = sorted(contract.matched_facets)
             ranked_item["real_intent_evidence"] = self._real_intent_evidence(ranked_item)
             ranked_item["direct_support"] = self._candidate_has_direct_support(ranked_item)
             ranked.append(ranked_item)
@@ -2792,6 +3130,13 @@ class KnowledgeBase:
             fit = float(item.get("intent_fit_score", 0.0))
             constraints = item.get("constraint_evidence", {}) or {}
             reason = str(item.get("intent_fit_reason", ""))
+            contract_status = str(item.get("intent_contract_status", "unknown"))
+
+            # Top-3 is not a "most similar" list. Every candidate must survive
+            # its own evidence contract; otherwise an unresolved query can be
+            # turned into a menu of semantically plausible but unsupported intents.
+            if contract_status in {"insufficient", "contradicted"}:
+                continue
 
             if score < CATEGORY_CHOICE_MIN_SCORE:
                 continue
@@ -2890,25 +3235,36 @@ class KnowledgeBase:
         *,
         max_index: int,
     ) -> list[int]:
-        """Parse one or several numeric choices: '1', '1,3', '1 и 3', etc.
+        """Parse natural user selections while a CATEGORY_CHOICE is pending.
 
-        Returns unique indices in the order supplied by the user.
-        This parser is intentionally strict and should run only while a
-        CATEGORY_CHOICE state is pending.
+        Supported examples: ``1``, ``1 и 3``, ``вариант 2``,
+        ``мне подходит первый``, ``беру первый и третий``.
+        Numeric parsing remains bounded by max_index, so dates/years cannot
+        accidentally become a valid choice.
         """
         if max_index < 1:
             raise ValueError("max_index must be positive")
 
         normalized = normalize_light(text)
-        normalized = re.sub(r"\b(?:мне нужны|мне нужен|нужны|нужен|выбираю|беру|варианты?)\b", " ", normalized)
-        normalized = normalized.replace("и", ",")
-        raw_numbers = re.findall(r"\d+", normalized)
-
-        if not raw_numbers:
+        if not normalized:
             return []
 
+        ordinals = {
+            "первый": 1, "первая": 1, "первое": 1,
+            "второй": 2, "вторая": 2, "второе": 2,
+            "третий": 3, "третья": 3, "третье": 3,
+        }
         values: list[int] = []
-        for raw in raw_numbers:
+
+        # First parse explicit Russian ordinals.
+        for token in normalized.split():
+            value = ordinals.get(token.strip(".,!?;:"))
+            if value is not None and value <= max_index and value not in values:
+                values.append(value)
+
+        # Then parse explicit numeric choices. Reject out-of-range numbers so
+        # messages such as "поток 2026" never turn into a choice accidentally.
+        for raw in re.findall(r"(?<!\w)([1-9]\d*)(?!\w)", normalized):
             value = int(raw)
             if value < 1 or value > max_index:
                 return []
@@ -3010,6 +3366,13 @@ class KnowledgeBase:
                     and explicit_facet_ok
                     and explicit_positive
                 )
+                if hard_safe:
+                    hard_safe, hard_reason = self._template_eligibility(
+                        question, entry, intent_fit=fit, family_fit=family_fit,
+                        fuzzy_score=hard_fuzzy, hard_rule=True,
+                    )
+                    if not hard_safe:
+                        logger.debug("hard_rule veto | kb_id=%s | reason=%s", hard_id, hard_reason)
                 logger.debug(
                     "hard_rule hypothesis | kb_id=%s | fit=%.3f | family=%.3f | alignment=%.3f | facets=%s | safe=%s | reason=%s",
                     hard_id, fit, family_fit, alignment, sorted(q_facets), hard_safe, fit_reason,
@@ -3032,7 +3395,7 @@ class KnowledgeBase:
                         )
                     return MatchResult(
                         MatchMode.TEMPLATE, 0.995, entry.get("category"),
-                        (entry.get("template_answer") or "") + OPERATOR_HINT,
+                        (entry.get("template_answer") or ""),
                         hard_id, [self._clean_entry_for_llm(entry)], entry=entry,
                         second_score=0.0, margin=0.995, fuzzy_score=1.0,
                         intent_fit_score=fit, intent_fit_reason=fit_reason,
@@ -3070,9 +3433,14 @@ class KnowledgeBase:
                 answer = (
                     entry.get("clarification_question")
                     if mode == MatchMode.CLARIFICATION
-                    else (entry.get("template_answer") or "") + OPERATOR_HINT
+                    else (entry.get("template_answer") or "")
                 )
-                if fit >= 0.55 and family_fit >= 0.25 and answer:
+                eligible, eligibility_reason = self._template_eligibility(
+                    question, entry, intent_fit=fit, family_fit=family_fit,
+                    fuzzy_score=top_f["score"] / 100.0,
+                    hard_rule=False,
+                )
+                if fit >= 0.55 and family_fit >= 0.25 and answer and eligible:
                     return MatchResult(
                         mode, top_f["score"] / 100.0, entry.get("category"), answer,
                         entry.get("id"), [self._clean_entry_for_llm(entry)], entry=entry,
@@ -3261,10 +3629,15 @@ class KnowledgeBase:
             and not secondary_ambiguity
             and (direct_support or lexical >= 0.55 or fuzzy_score >= 0.90)
         )
-        if deterministic_intent_safe and entry.get("template_answer"):
+        deterministic_eligible, deterministic_reason = self._template_eligibility(
+            question, entry, intent_fit=intent_fit, family_fit=family_fit,
+            fuzzy_score=fuzzy_score, contrastive_margin=contrastive_margin,
+            second_is_conflict=second_is_conflict,
+        )
+        if deterministic_intent_safe and deterministic_eligible and entry.get("template_answer"):
             return MatchResult(
                 MatchMode.TEMPLATE, max(top_score, 0.76), entry.get("category"),
-                (entry.get("template_answer") or "") + OPERATOR_HINT,
+                (entry.get("template_answer") or ""),
                 entry.get("id"), relevant_entries, entry=entry,
                 second_score=second_score, margin=margin, embedding_score=embedding,
                 semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
@@ -3305,7 +3678,13 @@ class KnowledgeBase:
             and not secondary_ambiguity
         ) and (direct_lexical_support or direct_semantic_support)
 
-        if entry.get("requires_clarification") and safe_auto:
+        safe_template_eligible, safe_template_reason = self._template_eligibility(
+            question, entry, intent_fit=intent_fit, family_fit=family_fit,
+            fuzzy_score=fuzzy_score, contrastive_margin=contrastive_margin,
+            second_is_conflict=second_is_conflict,
+        )
+
+        if entry.get("requires_clarification") and safe_auto and safe_template_eligible:
             return MatchResult(
                 MatchMode.CLARIFICATION, top_score, entry.get("category"),
                 entry.get("clarification_question"), entry.get("id"), relevant_entries,
@@ -3316,7 +3695,7 @@ class KnowledgeBase:
                 subquestion=question, decision_reason="supported_intent_requires_clarification",
             )
 
-        if safe_auto and entry.get("template_answer"):
+        if safe_auto and safe_template_eligible and entry.get("template_answer"):
             reason = (
                 "strong_semantic_intent_match"
                 if direct_semantic_support and not direct_lexical_support
@@ -3324,7 +3703,7 @@ class KnowledgeBase:
             )
             return MatchResult(
                 MatchMode.TEMPLATE, max(top_score, 0.75), entry.get("category"),
-                (entry.get("template_answer") or "") + OPERATOR_HINT,
+                (entry.get("template_answer") or ""),
                 entry.get("id"), relevant_entries, entry=entry,
                 second_score=second_score, margin=margin, embedding_score=embedding,
                 intent_fit_score=intent_fit,
@@ -3467,6 +3846,16 @@ class KnowledgeBase:
             }
         if alignment <= ONTOLOGY_HARD_MISMATCH and self._query_ontology(question)["object"]:
             return False, "llm_selection_object_mismatch", {
+                "intent_fit": intent_fit,
+                "family_fit": family_fit,
+                "domain_support": domain_support,
+                "ontology_alignment": alignment,
+                "fuzzy": fuzzy,
+            }
+
+        contract = self._intent_contract_evidence(question, entry)
+        if contract.status in {"insufficient", "contradicted"}:
+            return False, f"llm_selection_contract:{contract.reason}", {
                 "intent_fit": intent_fit,
                 "family_fit": family_fit,
                 "domain_support": domain_support,
