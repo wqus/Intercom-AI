@@ -2,9 +2,11 @@ import time
 import logging
 from app.domain.enums import Decision, EscalationReason
 from app.domain.models import DecisionTrace, InboundMessage, OutboundAction, ProcessingResult
-from app.domain.policy import escalation_ack, rephrase_prompt, oos_response
+from app.domain.policy import escalation_ack, rephrase_prompt, oos_response, high_risk_reply
 from app.domain.response_composer import ResponseComposer
-from app.infrastructure.ai.knowledge_base import KnowledgeBase, MatchMode, MatchResult, contains_operator_request, is_non_query_message
+from app.infrastructure.ai.knowledge_base import (
+    KnowledgeBase, MatchMode, MatchResult, contains_operator_request, is_non_query_message,
+)
 from app.infrastructure.ai.llm_client import YandexLLMClient
 from app.core.config import settings
 
@@ -50,6 +52,15 @@ class DecisionPipeline:
             trace.decision = Decision.ESCALATE
             trace.escalation_reason = EscalationReason.USER_REQUESTED_OPERATOR
             return trace, [OutboundAction("reply", escalation_ack(), True)]
+
+        # High-risk: refund / personal_data / complaint — escalate with data collection.
+        if match.decision_reason.startswith("high_risk:"):
+            kind = match.decision_reason.split(":", 1)[-1]
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.NO_CATEGORY
+            trace.decision_reason = match.decision_reason
+            reply = high_risk_reply(kind)
+            return trace, [OutboundAction("reply", ResponseComposer.escalation_ack(reply), True)]
 
         if match.mode == MatchMode.TEMPLATE:
             trace.decision = Decision.ANSWER_TEMPLATE
@@ -154,6 +165,14 @@ class DecisionPipeline:
     async def decide(self, message: InboundMessage) -> ProcessingResult:
         started = time.perf_counter()
 
+        logger.info(
+            "inbound_query | entity_id=%s | event_id=%s | channel=%s | text=%s",
+            getattr(message, "entity_id", None),
+            getattr(message, "event_id", None),
+            getattr(message, "channel", None),
+            (message.text or "")[:2000],
+        )
+
         # Ignore generic acknowledgements/greetings before attachment escalation.
         # A file does not by itself turn "Спасибо" into a support ticket.
         if is_non_query_message(message.text):
@@ -202,6 +221,16 @@ class DecisionPipeline:
         for match in matches[:5]:
             question = match.subquestion or message.text
             trace, actions = await self.decide_match(match, question)
+            logger.info(
+                "routing_decision | question=%s | mode=%s | decision=%s | kb_id=%s | score=%.4f | margin=%.4f | reason=%s",
+                (question or "")[:400],
+                getattr(match.mode, "value", match.mode),
+                getattr(trace.decision, "value", trace.decision),
+                trace.kb_id,
+                float(trace.score or 0.0),
+                float(trace.margin or 0.0),
+                (trace.decision_reason or "")[:200],
+            )
             traces.append(trace)
             raw_actions.extend(actions)
 

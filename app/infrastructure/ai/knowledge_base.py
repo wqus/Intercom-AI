@@ -94,25 +94,25 @@ GENERIC_RERANK_WEIGHT = 0.10
 
 # Decision thresholds. These are routing thresholds, NOT probabilities.
 # The score is deliberately bounded to [0, 1].
-# Calibrated for correct routing: high-confidence TEMPLATE, mid CATEGORY_CHOICE, else LLM/NO_MATCH.
-AUTO_SCORE = 0.86
-AUTO_MARGIN = 0.10
+# v22 STRICT: TEMPLATE is rare — only near-perfect evidence + proven contract.
+# Ambiguous cases go to CATEGORY_CHOICE (Top-3) or escalate/rephrase.
+AUTO_SCORE = 0.90
+AUTO_MARGIN = 0.12
 LLM_SCORE = 0.55
 LLM_MARGIN = 0.035
-HIGH_SCORE_LOW_MARGIN = 0.82
-LEXICAL_EVIDENCE_MIN = 0.28
+HIGH_SCORE_LOW_MARGIN = 0.85
+LEXICAL_EVIDENCE_MIN = 0.30
 SEMANTIC_GAP_FOR_LLM = 0.025
-MIN_REAL_INTENT_EVIDENCE = 0.38
-MIN_REAL_INTENT_FIT = 0.48
-MIN_TEMPLATE_EVIDENCE = 0.46
+MIN_REAL_INTENT_EVIDENCE = 0.40
+MIN_REAL_INTENT_FIT = 0.50
+MIN_TEMPLATE_EVIDENCE = 0.55
 
-# Strong-evidence TEMPLATE override (point 3/6): allows TEMPLATE below AUTO_SCORE
-# only when affirmative lexical/intent evidence is present.
-STRONG_EVIDENCE_TEMPLATE_SCORE = 0.74
-STRONG_EVIDENCE_TEMPLATE_MARGIN = 0.05
-STRONG_EVIDENCE_TEMPLATE_FIT = 0.65
-STRONG_EVIDENCE_TEMPLATE_FAMILY = 0.41
-STRONG_EVIDENCE_MIN_REAL = 0.46
+# Strong-evidence TEMPLATE override: deliberately tight so TEMPLATE stays rare.
+STRONG_EVIDENCE_TEMPLATE_SCORE = 0.82
+STRONG_EVIDENCE_TEMPLATE_MARGIN = 0.08
+STRONG_EVIDENCE_TEMPLATE_FIT = 0.72
+STRONG_EVIDENCE_TEMPLATE_FAMILY = 0.48
+STRONG_EVIDENCE_MIN_REAL = 0.55
 
 # Retrieval/ranking weights. Kept bounded and re-normalized when reranker is off.
 SEMANTIC_MAX_WEIGHT = 0.34
@@ -125,14 +125,14 @@ FAMILY_FIT_WEIGHT = 0.04
 RRF_WEIGHT = 0.04
 RERANK_WEIGHT = 0.10
 
-# Safety thresholds for automatic actions.
-INTENT_FIT_TEMPLATE_MIN = 0.65
+# Safety thresholds for automatic actions (v22 STRICT_TEMPLATE).
+INTENT_FIT_TEMPLATE_MIN = 0.72
 INTENT_FIT_LLM_MIN = 0.42
 INTENT_FIT_HARD_MISMATCH = 0.25
-MIN_QUERY_QUALITY_TEMPLATE = 0.22
+MIN_QUERY_QUALITY_TEMPLATE = 0.30
 MIN_QUERY_QUALITY_LLM = 0.20
 MIN_QUERY_QUALITY_CHOICE = 0.18
-MIN_FAMILY_FIT_TEMPLATE = 0.35
+MIN_FAMILY_FIT_TEMPLATE = 0.45
 
 # User-facing fallback routing.
 REPHRASE_SCORE_MAX = 0.50
@@ -423,6 +423,62 @@ def contains_operator_request(text: str) -> bool:
         r"позовите\s+оператора|нужен\s+оператор",
         q,
     ))
+
+
+# High-risk intents: never auto-answer with TEMPLATE. Escalate + collect data.
+# Patterns are deliberately narrow and phrase-oriented to avoid false positives.
+_HIGH_RISK_PATTERNS: dict[str, tuple[str, ...]] = {
+    "refund": (
+        "вернуть деньги",
+        "вернуть денежные средства",
+        "возврат оплаты",
+        "возврат денег",
+        "вернуть средства",
+        "оплатила и не смогла",
+        "оплатил и не смог",
+        "деньги списали",
+        "списали деньги",
+        "вернуть оплату",
+        "хочу возврат",
+        "прошу вернуть",
+    ),
+    "personal_data": (
+        "удалить персональные данные",
+        "удалить мои данные",
+        "удалить из базы",
+        "удалите мои данные",
+        "удалите персональные",
+        "отзываю согласие",
+        "отзыв согласия",
+        "удалить мои персональные",
+    ),
+    "complaint": (
+        "жалоба на",
+        "подаю жалобу",
+        "хочу пожаловаться",
+        "хамоватая",
+        "хамит",
+        "оскорбил",
+        "оскорбила",
+        "примите меры",
+    ),
+}
+
+
+def detect_high_risk(text: str) -> str | None:
+    """Return high-risk kind (refund / personal_data / complaint) or None.
+
+    These requests must escalate with structured data collection and must never
+    receive an automatic TEMPLATE answer.
+    """
+    q = normalize_light(text or "")
+    if not q:
+        return None
+    for kind, phrases in _HIGH_RISK_PATTERNS.items():
+        for phrase in phrases:
+            if phrase in q:
+                return kind
+    return None
 
 
 def is_non_query_message(text: str) -> bool:
@@ -2390,6 +2446,21 @@ class KnowledgeBase:
         if second_is_conflict and contrastive_margin < CONTRASTIVE_AUTO_MARGIN:
             return False, "contrastive_margin_too_small"
 
+        # v22 STRICT_TEMPLATE: require stronger fit/family when enabled.
+        try:
+            from app.core.config import settings as _settings
+            strict = bool(getattr(_settings, "STRICT_TEMPLATE", True))
+        except Exception:
+            strict = True
+        if strict:
+            if intent_fit < INTENT_FIT_TEMPLATE_MIN:
+                return False, "strict_intent_fit"
+            if family_fit < MIN_FAMILY_FIT_TEMPLATE:
+                return False, "strict_family_fit"
+            # Prefer proven contracts for auto-answer under strict mode.
+            if contract.status not in {"proven", "unknown"}:
+                return False, f"strict_contract:{contract.status}"
+
         return True, "eligible"
 
     def _negative_hits(self, question: str, entry: dict) -> list[str]:
@@ -3323,6 +3394,25 @@ class KnowledgeBase:
                 [],
                 subquestion=question,
                 decision_reason="user_requested_operator",
+            )
+
+        # High-risk: refund / personal data / complaint — never TEMPLATE.
+        high_risk = detect_high_risk(question)
+        if high_risk:
+            logger.info(
+                "high_risk_detected | kind=%s | question=%s",
+                high_risk,
+                question[:300],
+            )
+            return MatchResult(
+                MatchMode.NO_MATCH,
+                1.0,
+                None,
+                None,
+                None,
+                [],
+                subquestion=question,
+                decision_reason=f"high_risk:{high_risk}",
             )
 
         if not self.entries:

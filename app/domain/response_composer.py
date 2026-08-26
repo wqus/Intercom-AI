@@ -51,9 +51,9 @@ class ResponseComposer:
         options = "\n".join(f"{index}. {label}" for index, label in enumerate(labels, 1))
         return (
             f"{GREETING}\n\n"
-            "Чтобы я точно ответил, выберите подходящий вариант:\n"
+            "Похоже, ваш вопрос ближе к одному из вариантов:\n"
             f"{options}\n\n"
-            "Можно указать номер или кратко описать свой вариант."
+            "Напишите номер или кратко уточните свой вопрос."
         )
 
     @staticmethod

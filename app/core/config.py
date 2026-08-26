@@ -20,9 +20,11 @@ class Settings(BaseSettings):
     LLM_ENABLED: bool = False
     # User-facing fallback for ambiguous / LLM-worthy cases.
     USER_VISIBLE_LLM: bool = False
+    # Top-3 category choice is enabled for full traffic (precision-first middle mode).
     USER_VISIBLE_TOP3: bool = True
+    # When True, TEMPLATE requires higher evidence/margin/specificity — rare auto-answers only.
+    STRICT_TEMPLATE: bool = True
     WORKER_POLL_SECONDS: float = 0.5
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
 
 settings = Settings()
-

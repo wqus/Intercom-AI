@@ -92,6 +92,9 @@ REQUIRED_OBJECTS: dict[str, FrozenSet[str]] = {
     "invite_code": frozenset({"invite_code"}),
     "technical_failure": frozenset({"app"}),
     "education_price": frozenset({"school", "training"}),
+    # Mentorship role split: mentee vs mentor must not be confused.
+    "become_mentee": frozenset({"mentor"}),
+    "online_mentorship": frozenset({"mentor"}),
 }
 
 
