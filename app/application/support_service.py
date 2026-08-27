@@ -165,6 +165,22 @@ class SupportApplication:
                 max_index=len(candidate_ids),
             )
             if not indices:
+                # The choice prompt itself invites either a number OR a short
+                # clarification ("Напишите номер или кратко уточните свой
+                # вопрос"). Previously any non-numeric reply here was treated
+                # as an invalid answer and only ever got a "please send a
+                # number" retry (or an escalation) — so the prompt's own
+                # second option never actually worked. Give the normal
+                # pipeline one chance to resolve the free text; only fall
+                # back to the numeric retry/escalation flow if it can't
+                # produce anything actionable either.
+                probe = await self.pipeline.decide(message)
+                if any(
+                    t.decision in {Decision.ANSWER_TEMPLATE, Decision.CHOICE, Decision.CLARIFY}
+                    for t in probe.traces
+                ):
+                    return False
+
                 attempts = self._attempts_after_failed_clarification(state)
                 if attempts >= 2:
                     await self._escalate(
@@ -260,24 +276,33 @@ class SupportApplication:
         current_attempts = self._attempts_after_failed_clarification(state)
 
         # Persist conversational state produced by the policy.
-        for trace in result.traces:
-            if trace.decision in {Decision.REPHRASE, Decision.CLARIFY}:
-                # The first clarification/rephrase response starts the counter at 1.
-                # When this happens while already waiting for clarification, advance
-                # the counter rather than resetting it back to 1.
-                attempts = current_attempts + 1 if current_state in _CLARIFICATION_STATES else 1
-                if trace.decision == Decision.CLARIFY and trace.kb_id:
-                    await states.replace(message.entity_id, ConversationStateKind.CLARIFYING, {
-                        "kb_id": trace.kb_id,
-                        "attempts": attempts,
-                        "original_question": trace.question,
-                    })
-                else:
-                    await states.replace(message.entity_id, ConversationStateKind.REPHRASING, {
-                        "attempts": attempts,
-                        "original_question": trace.question,
-                    })
-            elif trace.decision == Decision.CHOICE:
+        #
+        # A single inbound message can produce several traces (match_many splits
+        # compound questions into independent sub-questions). Only ONE pending
+        # state can be stored per conversation, but all stateful traces still get
+        # their reply text concatenated into the same outgoing message — so if we
+        # naively looped and called states.replace() once per trace, whichever
+        # trace happened to be last would silently overwrite an earlier one.
+        # Concretely: sub-question #1 resolves to CATEGORY_CHOICE (user is shown
+        # a numbered Top-3 menu and CHOOSING/candidate_ids is what must be saved),
+        # sub-question #2 resolves to REPHRASE — last-write-wins replaced CHOOSING
+        # with REPHRASING, the candidate_ids were lost, and the user's next
+        # message ("1") was reprocessed as a brand-new query that matches nothing
+        # and escalates with no_category.
+        #
+        # A CHOICE already made an explicit, numbered promise to the user, so it
+        # must win over a same-turn CLARIFY/REPHRASE from another sub-question.
+        # CLARIFY (tied to a specific kb_id) outranks a generic REPHRASE.
+        _STATE_PRIORITY = {Decision.CHOICE: 3, Decision.CLARIFY: 2, Decision.REPHRASE: 1}
+        stateful_traces = [t for t in result.traces if t.decision in _STATE_PRIORITY]
+        governing_trace = None
+        for trace in stateful_traces:
+            if governing_trace is None or _STATE_PRIORITY[trace.decision] > _STATE_PRIORITY[governing_trace.decision]:
+                governing_trace = trace
+
+        if governing_trace is not None:
+            trace = governing_trace
+            if trace.decision == Decision.CHOICE:
                 try:
                     # MUST persist the same ids that were shown to the user.
                     # Re-running get_category_choice_candidates(question) can return a
@@ -305,6 +330,22 @@ class SupportApplication:
                         )
                 except Exception:
                     logger.exception("Failed to persist category choice state")
+            else:
+                # The first clarification/rephrase response starts the counter at 1.
+                # When this happens while already waiting for clarification, advance
+                # the counter rather than resetting it back to 1.
+                attempts = current_attempts + 1 if current_state in _CLARIFICATION_STATES else 1
+                if trace.decision == Decision.CLARIFY and trace.kb_id:
+                    await states.replace(message.entity_id, ConversationStateKind.CLARIFYING, {
+                        "kb_id": trace.kb_id,
+                        "attempts": attempts,
+                        "original_question": trace.question,
+                    })
+                else:
+                    await states.replace(message.entity_id, ConversationStateKind.REPHRASING, {
+                        "attempts": attempts,
+                        "original_question": trace.question,
+                    })
 
         # Escalation is persisted BEFORE Telegram notification but in the same database
         # transaction. That guarantees future events stop at the blocklist once the

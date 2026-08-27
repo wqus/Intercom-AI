@@ -97,8 +97,11 @@ GENERIC_RERANK_WEIGHT = 0.10
 # v22 STRICT: TEMPLATE is rare — only near-perfect evidence + proven contract.
 # Ambiguous cases go to CATEGORY_CHOICE (Top-3) or escalate/rephrase.
 # v22.1: TEMPLATE is ultra-niche. Default middle path is CATEGORY_CHOICE (Top-3).
-AUTO_SCORE = 0.92
-AUTO_MARGIN = 0.14
+# v22.3: raised further so TEMPLATE fires only on near-certain, well-evidenced
+# matches — anything softer now falls through to Top-3/rephrase instead of
+# auto-answering.
+AUTO_SCORE = 0.94
+AUTO_MARGIN = 0.16
 LLM_SCORE = 0.48
 LLM_MARGIN = 0.030
 HIGH_SCORE_LOW_MARGIN = 0.88
@@ -106,14 +109,7 @@ LEXICAL_EVIDENCE_MIN = 0.32
 SEMANTIC_GAP_FOR_LLM = 0.025
 MIN_REAL_INTENT_EVIDENCE = 0.36
 MIN_REAL_INTENT_FIT = 0.48
-MIN_TEMPLATE_EVIDENCE = 0.60
-
-# Strong-evidence TEMPLATE override: near-duplicate / almost-certain only.
-STRONG_EVIDENCE_TEMPLATE_SCORE = 0.88
-STRONG_EVIDENCE_TEMPLATE_MARGIN = 0.10
-STRONG_EVIDENCE_TEMPLATE_FIT = 0.78
-STRONG_EVIDENCE_TEMPLATE_FAMILY = 0.50
-STRONG_EVIDENCE_MIN_REAL = 0.58
+MIN_TEMPLATE_EVIDENCE = 0.66
 
 # Retrieval/ranking weights. Kept bounded and re-normalized when reranker is off.
 SEMANTIC_MAX_WEIGHT = 0.34
@@ -127,13 +123,13 @@ RRF_WEIGHT = 0.04
 RERANK_WEIGHT = 0.10
 
 # Safety thresholds: TEMPLATE ultra-strict; Top-3 deliberately permissive.
-INTENT_FIT_TEMPLATE_MIN = 0.78
+INTENT_FIT_TEMPLATE_MIN = 0.83
 INTENT_FIT_LLM_MIN = 0.38
 INTENT_FIT_HARD_MISMATCH = 0.25
-MIN_QUERY_QUALITY_TEMPLATE = 0.32
+MIN_QUERY_QUALITY_TEMPLATE = 0.36
 MIN_QUERY_QUALITY_LLM = 0.18
 MIN_QUERY_QUALITY_CHOICE = 0.12
-MIN_FAMILY_FIT_TEMPLATE = 0.48
+MIN_FAMILY_FIT_TEMPLATE = 0.52
 
 # User-facing fallback routing.
 REPHRASE_SCORE_MAX = 0.50
@@ -166,7 +162,7 @@ CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT = False
 # Contrastive routing: a candidate is not considered safe merely because it
 # scores well; it must also beat its declared/confusable competitors on
 # intent-specific evidence. These are routing thresholds, not probabilities.
-CONTRASTIVE_AUTO_MARGIN = 0.10
+CONTRASTIVE_AUTO_MARGIN = 0.12
 CONTRASTIVE_LLM_MARGIN = 0.035
 CONTRASTIVE_AMBIGUITY_MARGIN = 0.055
 CONTRASTIVE_MIN_COMPETITOR_SCORE = 0.50
@@ -3178,7 +3174,6 @@ class KnowledgeBase:
             "intent_fit_reason": str(item.get("intent_fit_reason", "")),
             "family_fit_score": float(item.get("family_fit_score", 0.0)),
             "query_quality_score": float(item.get("query_quality_score", 0.0)),
-            "evidence_score": float(item.get("evidence_score", 0.0)),
             "negative_semantic_score": float(item.get("negative_semantic_score", 0.0)),
             "hard_negative_gap": float(item.get("hard_negative_gap", 0.0)),
             "negative_contrast_score": float(item.get("negative_contrast_score", 0.0)),
@@ -3202,6 +3197,29 @@ class KnowledgeBase:
             payload["margin"] = float(top_margin)
             result.append(payload)
         return result
+
+    @staticmethod
+    def _contract_is_unproven(item: dict) -> bool:
+        """True when the candidate's own declared evidence contract is not proven.
+
+        A KB entry that declares `constraints.must_have_any` groups is asserting
+        "only offer me when the query actually contains one of these terms".
+        Top-3 must honour that even though its other filters are intentionally
+        mild — otherwise the menu can show an option the query gives no support
+        for at all, which just moves the "wrong category" problem one step
+        later instead of preventing it.
+        """
+        entry = item.get("entry") or {}
+        declared_groups = (entry.get("constraints") or {}).get("must_have_any") or []
+        if not declared_groups:
+            return False
+        if str(item.get("intent_contract_status", "unknown")) == "proven":
+            return False
+        constraint_evidence = item.get("constraint_evidence")
+        if not constraint_evidence:
+            # A contract was declared but no evidence was ever computed for it.
+            return True
+        return int(constraint_evidence.get("failed_any_groups", 0) or 0) > 0
 
     def _category_choice_candidates(self, ranked: list[dict]) -> list[dict]:
         """Primary middle mode (v22.1): 2–3 alternatives when TEMPLATE is not safe.
@@ -3237,6 +3255,8 @@ class KnowledgeBase:
             # Hard blocks only.
             if contract_status == "contradicted":
                 continue
+            if self._contract_is_unproven(item):
+                continue
             if item.get("negative_hits"):
                 continue
             if constraints.get("forbidden_hits"):
@@ -3268,6 +3288,8 @@ class KnowledgeBase:
                 if item.get("negative_hits"):
                     continue
                 if (item.get("constraint_evidence") or {}).get("forbidden_hits"):
+                    continue
+                if self._contract_is_unproven(item):
                     continue
                 if float(item.get("final_score", 0.0)) < 0.28:
                     continue
@@ -3750,10 +3772,10 @@ class KnowledgeBase:
             and margin < SECONDARY_EVIDENCE_MARGIN
         )
         deterministic_intent_safe = (
-            intent_fit >= 0.90
-            and domain_support >= 0.30
-            and ontology_alignment >= 0.62
-            and real_evidence >= 0.30
+            intent_fit >= 0.93
+            and domain_support >= 0.34
+            and ontology_alignment >= 0.66
+            and real_evidence >= 0.34
             and not contradiction
             and not second_is_conflict
             and not secondary_ambiguity
@@ -3795,18 +3817,18 @@ class KnowledgeBase:
         # Quality therefore influences OOS/noise detection, not basic intent
         # classification.
         direct_semantic_support = (
-            embedding >= 0.84
-            and semantic >= 0.67
-            and intent_fit >= 0.68
-            and family_fit >= 0.45
-            and margin >= 0.07
+            embedding >= 0.87
+            and semantic >= 0.70
+            and intent_fit >= 0.72
+            and family_fit >= 0.48
+            and margin >= 0.08
         )
         direct_lexical_support = (
-            (direct_support or lexical >= 0.50 or fuzzy_score >= 0.92)
-            and intent_fit >= 0.58
-            and family_fit >= 0.30
-            and real_evidence >= 0.38
-            and margin >= (0.035 if second_is_conflict else 0.025)
+            (direct_support or lexical >= 0.55 or fuzzy_score >= 0.92)
+            and intent_fit >= 0.62
+            and family_fit >= 0.34
+            and real_evidence >= 0.42
+            and margin >= (0.045 if second_is_conflict else 0.03)
         )
         safe_auto = (
             (not second_is_conflict or margin >= 0.075)
