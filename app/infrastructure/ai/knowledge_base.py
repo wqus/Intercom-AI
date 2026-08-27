@@ -4211,17 +4211,48 @@ class KnowledgeBase:
         return True
 
     def match_many(self, question: str) -> list[MatchResult]:
-        """Classify independent intents without blindly splitting on conjunctions."""
+        """Classify a message while preserving full-query context by default.
+
+        Structural punctuation is not, by itself, evidence of multiple intents.
+        We first classify the complete message. Only when that unified result is
+        not sufficiently decisive do we inspect structural fragments. This avoids
+        turning explanatory sentences such as ``"нет кнопки записи"`` into a
+        separate intent and losing the context supplied by the preceding sentence.
+        """
         question = (question or "").strip()
         if not question:
             return [self.match(question)]
 
+        full_result = self.match(question)
+
+        # A strong unified result is preferable to punctuation-driven
+        # decomposition. TEMPLATE is the clearest case; a high-quality result
+        # with a healthy margin is also treated as a coherent single intent.
+        unified_is_strong = (
+            full_result.mode == MatchMode.TEMPLATE
+            or (
+                full_result.kb_id is not None
+                and full_result.score >= HIGH_SCORE_LOW_MARGIN
+                and full_result.margin >= AUTO_MARGIN
+                and full_result.intent_fit_score >= INTENT_FIT_TEMPLATE_MIN
+            )
+        )
+        if unified_is_strong:
+            return [full_result]
+
         structural = split_user_questions(question)
         if len(structural) > 1:
-            return [self.match(part) for part in structural[:MAX_SUBQUESTIONS]]
+            parts = [self.match(part) for part in structural[:MAX_SUBQUESTIONS]]
+            # Do not let decomposition manufacture a worse answer than the
+            # complete query. If all fragments collapse to the same intent, the
+            # original full-query result is the more faithful representation.
+            ids = [part.kb_id for part in parts if part.kb_id]
+            if ids and len(set(ids)) == 1:
+                return [full_result]
+            return parts
 
         conjunction_candidates = _split_conjunctive_question(question)
         if len(conjunction_candidates) == 2 and self._validate_conjunction_split(conjunction_candidates):
             return [self.match(part) for part in conjunction_candidates]
 
-        return [self.match(question)]
+        return [full_result]
