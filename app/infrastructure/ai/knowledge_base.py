@@ -1888,7 +1888,7 @@ class KnowledgeBase:
                 return "unsupported_facet"
             return "facet_mismatch"
 
-        if self._external_target_hint(question) and alignment < ONTOLOGY_ALIGNMENT_MIN:
+        if self._external_target_hint(question):
             # A third-party target is only a hard negative when the query is
             # otherwise asking for a domain operation where the current KB is
             # clearly tied to the internal entity.
