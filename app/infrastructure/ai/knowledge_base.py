@@ -1047,6 +1047,18 @@ class KnowledgeBase:
     @staticmethod
     def _query_ontology(question: str) -> dict[str, set[str]]:
         q = normalize_light(question)
+        # Match against a stemmed projection of the query so that Russian case
+        # inflection ("школа" / "школы" / "школе" / "школу") does not hide an
+        # object/facet from the ontology extractor. Plain substring matching on
+        # `q` previously only matched the nominative singular form, which is
+        # rare in real user messages (most write oblique cases), silently
+        # dropping the "object" signal and causing false ontology mismatches
+        # downstream (object_mismatch / unsupported_object).
+        stemmed_q = " ".join(light_stem(t) for t in q.split())
+
+        def _stem_phrase(phrase: str) -> str:
+            return " ".join(light_stem(t) for t in normalize_light(phrase).split())
+
         out = {"domain": set(), "object": set(), "action": set(), "state": set(), "facet": set()}
         patterns = {
             "price": ("сколько стоит", "стоимость", "цена", "платно", "платное", "платить", "бесплатно", "обойдется", "обойдётся"),
@@ -1081,7 +1093,7 @@ class KnowledgeBase:
             out["state"].add("intent")
 
         for key, vals in patterns.items():
-            if any(v in q for v in vals):
+            if any(v in q or _stem_phrase(v) in stemmed_q for v in vals):
                 target = "facet" if key in {"price", "date", "duration", "age", "registration", "technical_failure", "verification", "access"} else "object"
                 out[target].add(key)
         if out["object"]:
@@ -1681,12 +1693,36 @@ class KnowledgeBase:
         ontology = entry.get("ontology") or self._derive_ontology(entry)
         checks: list[tuple[str, float, str]] = []
 
+        # The entry-side vocabulary (built from `intent_type` via
+        # _derive_ontology) and the query-side vocabulary (built from the
+        # `patterns` dict in _query_ontology) evolved independently and use
+        # different labels for the same underlying concept in a handful of
+        # cases (e.g. entries say "school"/"schools"/"education", the query
+        # extractor says "training"; entries say "mentor_role", the query
+        # extractor says "mentor"/"personal_mentor"). Without normalizing
+        # both sides onto one canonical vocabulary, these dimensions are
+        # compared as a hard mismatch even when they refer to the same thing,
+        # which previously produced false object_mismatch / wrong_entity
+        # rejections for otherwise-correct top candidates.
+        object_aliases = {
+            "school": "training",
+            "schools": "training",
+            "education": "training",
+            "education_admin": "training",
+            "mentor_role": "mentor",
+            "personal_mentor": "mentor",
+        }
+
+        def _canon(dim: str, value: str) -> str:
+            return object_aliases.get(value, value) if dim == "object" else value
+
         dimensions = ("object", "action", "state", "facet")
         for dim in dimensions:
-            q_values = qo.get(dim) or set()
+            q_values = {_canon(dim, v) for v in (qo.get(dim) or set())}
             c_value = ontology.get(dim)
             if not q_values or not c_value:
                 continue
+            c_value = _canon(dim, c_value)
             if c_value in q_values:
                 checks.append((dim, 1.0, "match"))
             else:
@@ -1852,7 +1888,7 @@ class KnowledgeBase:
                 return "unsupported_facet"
             return "facet_mismatch"
 
-        if self._external_target_hint(question):
+        if self._external_target_hint(question) and alignment < ONTOLOGY_ALIGNMENT_MIN:
             # A third-party target is only a hard negative when the query is
             # otherwise asking for a domain operation where the current KB is
             # clearly tied to the internal entity.
