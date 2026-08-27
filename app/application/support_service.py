@@ -279,14 +279,30 @@ class SupportApplication:
                     })
             elif trace.decision == Decision.CHOICE:
                 try:
-                    candidates = self.pipeline.kb.get_category_choice_candidates(trace.question)
-                    ids = [str(x["kb_id"]) for x in candidates]
+                    # MUST persist the same ids that were shown to the user.
+                    # Re-running get_category_choice_candidates(question) can return a
+                    # different set (or empty) and then CHOOSING is never saved —
+                    # user replies "1" and falls through to normal match → escalate.
+                    ids = list(getattr(trace, "choice_candidate_ids", None) or [])
+                    if len(ids) < 2:
+                        candidates = self.pipeline.kb.get_category_choice_candidates(trace.question)
+                        ids = [str(x["kb_id"]) for x in candidates if x.get("kb_id")]
                     if len(ids) >= 2:
                         await states.replace(message.entity_id, ConversationStateKind.CHOOSING, {
                             "candidate_ids": ids,
                             "attempts": 0,
                             "original_question": trace.question,
                         })
+                        logger.info(
+                            "choice_state_saved | entity=%s | candidate_ids=%s",
+                            message.entity_id,
+                            ids,
+                        )
+                    else:
+                        logger.warning(
+                            "choice_state_not_saved | entity=%s | no candidate ids",
+                            message.entity_id,
+                        )
                 except Exception:
                     logger.exception("Failed to persist category choice state")
 

@@ -416,6 +416,29 @@ def stem_tokens(text: str) -> list[str]:
     return [light_stem(t) for t in normalize_light(text).split() if len(t) > 1]
 
 
+_GREETING_PREFIX_RE = re.compile(
+    r"^\s*(?:здравствуйте|здравствуй|добрый\s+день|добрый\s+вечер|доброе\s+утро|"
+    r"привет|приветствую|хай|hello|hi)[\s,!.\-—–]*",
+    re.IGNORECASE,
+)
+
+
+def strip_leading_greeting(text: str) -> str:
+    """Remove a leading greeting so near-duplicate / lexical gates see the real ask."""
+    q = (text or "").strip()
+    if not q:
+        return q
+    cleaned = _GREETING_PREFIX_RE.sub("", q, count=1).strip(" ,!.-—–")
+    # Also strip trailing greeting: "Не работает приложение здравствуйте"
+    cleaned2 = re.sub(
+        r"[\s,!.\-—–]*(?:здравствуйте|здравствуй|добрый\s+день|привет)\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" ,!.-—–")
+    return cleaned2 or q
+
+
 def contains_operator_request(text: str) -> bool:
     q = normalize_light(text)
     return bool(re.search(
@@ -3387,6 +3410,7 @@ class KnowledgeBase:
         * ambiguous/unsupported requests abstain instead of inventing a category.
         """
         question = (question or "").strip()
+        question = strip_leading_greeting(question)
 
         if not question:
             return MatchResult(

@@ -78,16 +78,28 @@ class DecisionPipeline:
             return trace, [OutboundAction("reply", ResponseComposer.rephrase(match.template_answer or rephrase_prompt()))]
 
         if match.mode == MatchMode.CATEGORY_CHOICE:
-            labels = [
-                str(c.get("choice_label") or c.get("category") or c.get("kb_id"))
-                for c in (match.choice_candidates or [])
-            ]
+            cands = list(match.choice_candidates or []) or list(getattr(match, "top_candidates", None) or [])
+            labels = []
+            ids = []
+            for c in cands[:3]:
+                if not isinstance(c, dict):
+                    continue
+                label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "")
+                cid = str(c.get("kb_id") or "")
+                if not label:
+                    continue
+                labels.append(label)
+                if cid:
+                    ids.append(cid)
             trace.decision = Decision.CHOICE
             trace.automated = True
-            # Top-3 is enabled for full traffic when USER_VISIBLE_TOP3=True (v22).
+            trace.choice_candidate_ids = ids if len(ids) >= 2 else None
             if not settings.USER_VISIBLE_TOP3:
                 trace.decision_reason = (trace.decision_reason or "") + ";top3_user_output_disabled"
                 return trace, []
+            if len(labels) < 2:
+                trace.decision = Decision.REPHRASE
+                return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
             return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
 
         if match.mode == MatchMode.LLM and match.relevant_entries:
@@ -103,15 +115,23 @@ class DecisionPipeline:
                     candidates = []
 
             if len(candidates) >= 2:
-                labels = [
-                    str(c.get("choice_label") or c.get("category") or c.get("kb_id"))
-                    for c in candidates[:3]
-                    if (c.get("choice_label") or c.get("category") or c.get("kb_id"))
-                ]
+                labels = []
+                ids = []
+                for c in candidates[:3]:
+                    if not isinstance(c, dict):
+                        continue
+                    label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "")
+                    cid = str(c.get("kb_id") or "")
+                    if not label:
+                        continue
+                    labels.append(label)
+                    if cid:
+                        ids.append(cid)
                 if len(labels) >= 2:
                     trace.decision = Decision.CHOICE
                     trace.automated = True
                     trace.llm_used = False
+                    trace.choice_candidate_ids = ids if len(ids) >= 2 else None
                     trace.decision_reason = (
                         trace.decision_reason or "supported_intent_needs_llm"
                     ) + ";llm_disabled_top3_fallback"
@@ -162,8 +182,14 @@ class DecisionPipeline:
                 if isinstance(c, dict) and (c.get("choice_label") or c.get("category") or c.get("kb_id"))
             ]
             if len(labels) >= 2 and float(match.score or 0.0) >= 0.35:
+                ids = [
+                    str(c.get("kb_id"))
+                    for c in candidates[:3]
+                    if isinstance(c, dict) and c.get("kb_id")
+                ]
                 trace.decision = Decision.CHOICE
                 trace.automated = True
+                trace.choice_candidate_ids = ids if len(ids) >= 2 else None
                 trace.decision_reason = (match.decision_reason or "") + ";top3_from_no_match"
                 return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
             trace.decision = Decision.REPHRASE
