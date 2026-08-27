@@ -16,6 +16,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - intercom_intercom-network
 
   intercom-api:
     build: .
@@ -26,7 +28,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - intercom_intercom-network
+
+networks:
+  intercom_intercom-network:
+    external: true
 
 volumes:
   postgres_data:
-
