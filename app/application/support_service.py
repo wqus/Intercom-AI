@@ -92,6 +92,8 @@ class SupportApplication:
         message: InboundMessage,
         event: InboundEvent | None,
         reason: EscalationReason,
+        *,
+        reply_text: str | None = None,
     ) -> None:
         if event is None:
             raise RuntimeError("Escalation requires an inbound event")
@@ -116,7 +118,13 @@ class SupportApplication:
         # All external writes are transactional-outbox actions. The escalation
         # blocklist is committed together with them, so a later retry can never
         # re-enter the bot pipeline merely because Intercom/Telegram was unavailable.
-        await self._enqueue_reply(session, message, event, ResponseComposer.escalation_ack(escalation_ack()), suffix="escalation_ack")
+        await self._enqueue_reply(
+            session,
+            message,
+            event,
+            reply_text or ResponseComposer.escalation_ack(escalation_ack()),
+            suffix="escalation_ack",
+        )
         await self._outbox(session).enqueue(
             action_key=f"event:{event.id}:escalation_tag",
             action_type="intercom_escalation_tag",
@@ -138,8 +146,58 @@ class SupportApplication:
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _short_reply_token(text: str) -> str:
+        import re
+        value = (text or "").strip().lower().replace("ё", "е")
+        value = re.sub(r"[^a-zа-я0-9\- ]+", " ", value)
+        return " ".join(value.split())
+
+    async def _resolve_short_clarification_reply(
+        self, session, event: InboundEvent, message: InboundMessage, state
+    ) -> bool:
+        if state.state != ConversationStateKind.CLARIFYING:
+            return False
+        token = self._short_reply_token(message.text)
+        if len(token.split()) != 1:
+            return False
+
+        kb_id = state.data.get("kb_id")
+        routes = self.pipeline.kb.get_short_clarification_routes(kb_id)
+        target_id = routes.get(token)
+        if not target_id:
+            return False
+
+        entry = self.pipeline.kb.get_by_id(target_id)
+        answer = str((entry or {}).get("template_answer") or "").strip()
+        if not answer:
+            # A contextual reply is only accepted when the target itself is
+            # routable; otherwise silently leave it for the generic gate.
+            return False
+
+        await self._enqueue_reply(
+            session, message, event, ResponseComposer.final_answer([answer]),
+            suffix="clarification_choice_answer",
+        )
+        await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
+        return True
+
     async def _handle_state(self, session, event: InboundEvent, message: InboundMessage, state) -> bool:
-        if state.state in _CLARIFICATION_STATES:
+        try:
+            normalized_state = ConversationStateKind(state.state)
+        except (TypeError, ValueError):
+            # A state not understood by this deployment is not actionable.
+            # Never route it as a fresh question and never escalate merely
+            # because the state machine has no handler for it.
+            logger.warning(
+                "Ignoring unsupported conversation state entity=%s state=%r",
+                message.entity_id, state.state,
+            )
+            return True
+
+        if normalized_state in _CLARIFICATION_STATES:
+            if await self._resolve_short_clarification_reply(session, event, message, state):
+                return True
             # The initial clarification/rephrase already counts as request #1.
             # Two failed follow-up messages may receive request #2; the next failed
             # message is escalated before the pipeline can produce another reply.
@@ -158,7 +216,7 @@ class SupportApplication:
             # state to IDLE; another clarification increments the counter below.
             return False
 
-        if state.state == ConversationStateKind.CHOOSING:
+        if normalized_state == ConversationStateKind.CHOOSING:
             candidate_ids = state.data.get("candidate_ids", [])
             indices = self.pipeline.kb.parse_category_choice(
                 message.text,
@@ -181,17 +239,21 @@ class SupportApplication:
                 ):
                     return False
 
+                # A non-choice message is not evidence that a human operator is
+                # required. Keep the menu state intact and stay silent rather than
+                # escalating on arbitrary/nearby text. A real free-text question
+                # that the classifier can answer is handled above via `probe`.
                 attempts = self._attempts_after_failed_clarification(state)
                 if attempts >= 2:
-                    await self._escalate(
-                        session,
-                        message,
-                        event,
-                        EscalationReason.NO_CATEGORY,
-                    )
-                else:
-                    state.data["attempts"] = attempts + 1
-                    await session.flush()
+                    # Do not turn repeated non-choice/nearby text into a human
+                    # escalation. The menu has gone stale; silently close this
+                    # transient state so the next message starts cleanly.
+                    await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
+                    return True
+
+                state.data["attempts"] = attempts + 1
+                await session.flush()
+                if attempts == 0:
                     await self._enqueue_reply(
                         session,
                         message,
@@ -201,12 +263,18 @@ class SupportApplication:
                     )
                 return True
 
+            snapshots = list(state.data.get("candidates") or [])
             answers = []
             for idx in indices:
                 if 1 <= idx <= len(candidate_ids):
-                    entry = self.pipeline.kb.get_by_id(candidate_ids[idx - 1])
-                    if entry and entry.get("template_answer"):
-                        answers.append(str(entry["template_answer"]))
+                    answer = ""
+                    if idx <= len(snapshots) and isinstance(snapshots[idx - 1], dict):
+                        answer = str(snapshots[idx - 1].get("answer") or "")
+                    if not answer:
+                        entry = self.pipeline.kb.get_by_id(candidate_ids[idx - 1])
+                        answer = str((entry or {}).get("template_answer") or "")
+                    if answer:
+                        answers.append(answer)
             if not answers:
                 await self._escalate(
                     session,
@@ -226,7 +294,7 @@ class SupportApplication:
             await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
             return True
 
-        if state.state == ConversationStateKind.ESCALATED:
+        if normalized_state == ConversationStateKind.ESCALATED:
             # Operator owns the thread after escalation; do not create a competing bot reply.
             return True
 
@@ -313,11 +381,31 @@ class SupportApplication:
                         candidates = self.pipeline.kb.get_category_choice_candidates(trace.question)
                         ids = [str(x["kb_id"]) for x in candidates if x.get("kb_id")]
                     if len(ids) >= 2:
-                        await states.replace(message.entity_id, ConversationStateKind.CHOOSING, {
-                            "candidate_ids": ids,
-                            "attempts": 0,
-                            "original_question": trace.question,
-                        })
+                        snapshots = []
+                        for cid in ids:
+                            entry = self.pipeline.kb.get_by_id(cid) or {}
+                            snapshots.append({
+                                "kb_id": cid,
+                                "label": str(entry.get("choice_label") or entry.get("category") or cid),
+                                "answer": str(entry.get("template_answer") or ""),
+                            })
+                        if any(not item["answer"] for item in snapshots):
+                            logger.warning(
+                                "choice_state_not_saved | entity=%s | non-routable candidate",
+                                message.entity_id,
+                            )
+                        else:
+                            await states.replace(message.entity_id, ConversationStateKind.CHOOSING, {
+                                "candidate_ids": ids,
+                                "candidates": snapshots,
+                                "attempts": 0,
+                                "original_question": trace.question,
+                            })
+                            logger.info(
+                                "choice_state_saved | entity=%s | candidate_ids=%s",
+                                message.entity_id,
+                                ids,
+                            )
                         logger.info(
                             "choice_state_saved | entity=%s | candidate_ids=%s",
                             message.entity_id,
@@ -355,11 +443,16 @@ class SupportApplication:
             None,
         )
         if any(action.escalate for action in result.actions):
+            escalation_reply = next(
+                (action.text for action in result.actions if action.escalate and action.text),
+                None,
+            )
             await self._escalate(
                 session,
                 message,
                 event,
                 escalation_reason or EscalationReason.NO_CATEGORY,
+                reply_text=escalation_reply,
             )
             return
 

@@ -1,0 +1,2 @@
+Gold CATEGORY exact hard-rule matches: 74/175
+False hard-rule hits on OOS/ESCALATE: 3

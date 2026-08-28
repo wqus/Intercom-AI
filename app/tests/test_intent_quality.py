@@ -127,9 +127,9 @@ def test_exact_one_word_acknowledgement_is_non_query():
     assert q.reason == "meta_noise"
 
 
-def test_one_word_domain_term_is_not_ignored():
+def test_one_word_domain_term_is_ignored():
     from app.infrastructure.ai.knowledge_base import is_non_query_message, _query_quality
-    assert not is_non_query_message("Оплата")
+    assert is_non_query_message("Оплата")
     q = _query_quality("Оплата")
     assert not q.meta_noise
     assert q.reason == "single_word"
@@ -226,12 +226,10 @@ def test_oos_external_target_requires_domain_sensitive_context():
     assert kb._oos_reason(q, ranked, quality) is None or isinstance(kb._oos_reason(q, ranked, quality), str)
 
 
-def test_single_word_known_business_term_can_be_routed():
-    # The filter must not classify a meaningful one-word support term as noise merely
-    # because it has no question word. The exact-match ignore list is the only ignore gate.
+def test_all_standalone_one_word_business_terms_are_ignored():
     from app.infrastructure.ai.knowledge_base import is_non_query_message
     for term in ("Оплата", "Наставник", "Сертификат", "Телеграм"):
-        assert not is_non_query_message(term)
+        assert is_non_query_message(term)
 
 
 def test_negated_mentor_application_does_not_trigger_kb_023():
@@ -449,3 +447,243 @@ def test_content_correction_routes_to_feedback():
     kb = KnowledgeBase.__new__(KnowledgeBase)
     kb.entries_by_id = {"kb_031": {"id": "kb_031", "priority": 90}}
     assert kb._hard_rule_match("Период прохождения школы в описании не верный, внесите корректировку") == "kb_031"
+
+
+def test_legacy_intent_anchors_cover_roles_and_event_operations():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries = []
+    kb.entries_by_id = {
+        "kb_040": {"id": "kb_040", "intent_type": "online_mentorship", "family": "mentor",
+                   "intent_facets": ["online"], "positive_examples": ["онлайн наставничество"]},
+        "kb_041": {"id": "kb_041", "intent_type": "speaker_collaboration", "family": "mentor",
+                   "intent_facets": ["speaker_collaboration"], "positive_examples": ["провести интенсив"]},
+        "kb_042": {"id": "kb_042", "intent_type": "become_mentee", "family": "mentor",
+                   "intent_facets": ["mentor_enrolment"], "positive_examples": ["записаться к наставнику"]},
+        "kb_046": {"id": "kb_046", "intent_type": "record_second_person", "family": "events",
+                   "intent_facets": ["record_second_person"], "positive_examples": ["записать второго человека"]},
+    }
+    for kb_id in ("kb_040", "kb_041", "kb_042", "kb_046"):
+        kb.entries_by_id[kb_id]["constraints"] = {}
+        kb.entries_by_id[kb_id]["intent_signals"] = {}
+    kb.family_vocabulary = {}
+
+    assert kb._hard_rule_match("Хочу наставника онлайн") == "kb_040"
+    assert kb._hard_rule_match("Хочу провести интенсив для предпринимателей") == "kb_041"
+    assert kb._hard_rule_match("Как записаться к наставнику?") == "kb_042"
+    assert kb._hard_rule_match("Хочу записать второго человека на семинар") == "kb_046"
+
+
+def test_query_ontology_distinguishes_event_support_and_repeat_registration():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+
+    q = KnowledgeBase._query_ontology("Хочу записать второго человека на семинар")
+    assert "record_second_person" in q["facet"]
+    assert "register" in q["action"]
+
+    q = KnowledgeBase._query_ontology("Как обратиться к куратору?")
+    assert "support_process" in q["facet"]
+    assert "contact" in q["action"]
+
+    q = KnowledgeBase._query_ontology("Можно ли онлайн работать с наставником?")
+    assert "online" in q["facet"]
+    assert "mentor" in q["object"]
+
+
+def test_mentor_enrolment_does_not_fall_back_to_personal_mentor_facet():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+
+    facets = KnowledgeBase._question_facets("Как записаться к наставнику?")
+    assert "mentor_enrolment" in facets
+    assert "personal_mentor" not in facets
+
+
+def test_supported_alternative_can_rescue_semantic_negative_veto():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+
+    ranked = [
+        {
+            "entry": {"id": "bad"},
+            "negative_contrast_score": -0.04,
+            "negative_hits": [],
+            "constraint_evidence": {},
+            "direct_support": False,
+            "lexical_score": 0.20,
+            "fuzzy_phrase_score": 0.30,
+            "intent_contract_strength": 0.0,
+            "final_score": 0.62,
+        },
+        {
+            "entry": {"id": "good"},
+            "negative_contrast_score": 0.20,
+            "negative_hits": [],
+            "constraint_evidence": {},
+            "direct_support": True,
+            "lexical_score": 0.70,
+            "fuzzy_phrase_score": 0.92,
+            "intent_contract_strength": 1.0,
+            "intent_fit_score": 0.72,
+            "real_intent_evidence": 0.60,
+            "domain_support_score": 0.40,
+            "ontology_alignment_score": 0.80,
+            "intent_contract_status": "proven",
+            "final_score": 0.57,
+        },
+    ]
+    promoted = kb._promote_supported_alternative(ranked)
+    assert promoted[0]["entry"]["id"] == "good"
+
+
+def test_promote_does_not_override_explicit_candidate_negative():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    ranked = [
+        {
+            "entry": {"id": "bad"},
+            "negative_contrast_score": -0.08,
+            "negative_hits": ["explicit negative"],
+            "constraint_evidence": {},
+            "direct_support": False,
+            "lexical_score": 0.20,
+            "fuzzy_phrase_score": 0.20,
+            "intent_contract_strength": 0.0,
+            "final_score": 0.70,
+        },
+        {
+            "entry": {"id": "good"},
+            "negative_contrast_score": 0.10,
+            "negative_hits": [],
+            "constraint_evidence": {},
+            "direct_support": True,
+            "lexical_score": 0.70,
+            "fuzzy_phrase_score": 0.92,
+            "intent_contract_strength": 1.0,
+            "intent_fit_score": 0.72,
+            "real_intent_evidence": 0.60,
+            "domain_support_score": 0.40,
+            "ontology_alignment_score": 0.80,
+            "intent_contract_status": "proven",
+            "final_score": 0.60,
+        },
+    ]
+    promoted = kb._promote_supported_alternative(ranked)
+    assert promoted[0]["entry"]["id"] == "bad"
+
+
+def test_external_target_detector_does_not_misclassify_generic_capitalized_school():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._external_target_hint(
+        "как записаться в Школу по закупкам из Китая"
+    ) is None
+
+
+def test_external_target_detector_still_detects_named_third_party_school():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._external_target_hint(
+        "подскажите стоимость обучения в Академии предпринимателей"
+    ) == "академии"
+
+
+def test_hard_rules_cover_online_mentorship_and_speaker_collaboration():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match("Хочу наставника онлайн") == "kb_040"
+    assert kb._hard_rule_match("Хочу провести лекцию для предпринимателей") == "kb_041"
+
+
+def test_top3_rejects_semantic_near_misses_without_intent_evidence():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries_by_id = {
+        "a": {"id": "a", "intent_type": "school_info", "template_answer": "A", "family": "education"},
+        "b": {"id": "b", "intent_type": "education_entry", "template_answer": "B", "family": "education"},
+    }
+    ranked = [
+        {
+            "entry": kb.entries_by_id["a"], "final_score": 0.61, "intent_fit_score": 0.31,
+            "query_quality_score": 0.42, "real_intent_evidence": 0.22,
+            "domain_support_score": 0.44, "ontology_alignment_score": 0.55,
+            "direct_support": False, "positive_hits": [], "intent_signal_positive_hits": [],
+            "negative_hits": [], "constraint_evidence": {}, "intent_contract_status": "unknown",
+        },
+        {
+            "entry": kb.entries_by_id["b"], "final_score": 0.58, "intent_fit_score": 0.30,
+            "query_quality_score": 0.42, "real_intent_evidence": 0.20,
+            "domain_support_score": 0.40, "ontology_alignment_score": 0.55,
+            "direct_support": False, "positive_hits": [], "intent_signal_positive_hits": [],
+            "negative_hits": [], "constraint_evidence": {}, "intent_contract_status": "unknown",
+        },
+    ]
+    assert kb._category_choice_candidates(ranked) == []
+
+
+def test_top3_requires_routable_entries():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries_by_id = {
+        "a": {"id": "a", "intent_type": "school_info", "family": "education", "template_answer": "A"},
+        "b": {"id": "b", "intent_type": "education_entry", "family": "education"},
+        "c": {"id": "c", "intent_type": "flow_date", "family": "education", "template_answer": "C"},
+    }
+    def item(eid, score):
+        ontology = {
+            "a": {"object": "school", "action": "register", "state": "procedure", "facet": "registration"},
+            "b": {"object": "education", "action": "enter", "state": "procedure", "facet": "registration"},
+            "c": {"object": "flow", "action": "ask", "state": "information", "facet": "date"},
+        }[eid]
+        return {
+            "entry": kb.entries_by_id[eid], "final_score": score, "intent_fit_score": 0.60,
+            "query_quality_score": 0.60, "real_intent_evidence": 0.60,
+            "domain_support_score": 0.60, "ontology_alignment_score": 0.90,
+            "direct_support": True, "positive_hits": ["x"], "intent_signal_positive_hits": ["x"],
+            "negative_hits": [], "constraint_evidence": {}, "intent_contract_status": "proven",
+            "semantic_score": 0.6, "lexical_score": 0.6, "fuzzy_phrase_score": 0.6,
+            "embedding_score": 0.6, "ranking_score": score, "family_fit_score": 0.6,
+            "negative_semantic_score": 0.0, "hard_negative_gap": 0.6, "negative_contrast_score": 0.6,
+            "ontology": ontology,
+        }
+    out = kb._category_choice_candidates([item("a", .60), item("b", .59), item("c", .58)], question="как записаться в школу и когда следующий поток?")
+    assert [x["kb_id"] for x in out] == ["a", "c"]
+
+
+def test_top3_rejects_same_family_when_query_context_is_missing():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries_by_id = {
+        "a": {"id": "a", "intent_type": "school_info", "family": "education", "template_answer": "A"},
+        "b": {"id": "b", "intent_type": "flow_date", "family": "education", "template_answer": "B"},
+    }
+    def item(eid, score):
+        return {
+            "entry": kb.entries_by_id[eid], "final_score": score, "intent_fit_score": 0.62,
+            "query_quality_score": 0.70, "real_intent_evidence": 0.70,
+            "domain_support_score": 0.62, "ontology_alignment_score": 0.85,
+            "direct_support": True, "positive_hits": ["x"], "intent_signal_positive_hits": ["x"],
+            "negative_hits": [], "constraint_evidence": {}, "intent_contract_status": "proven",
+            "family_fit_score": 0.70, "ontology": {"object": "school", "action": "register", "state": "current", "facet": ""},
+        }
+    assert kb._category_choice_candidates([item("a", .60), item("b", .59)], question="хочу узнать что-нибудь про обучение") == []
+
+
+def test_rephrase_prompt_requests_short_problem_focused_question():
+    from app.domain.policy import rephrase_prompt
+    text = rephrase_prompt().lower()
+    assert "короче" in text
+    assert "точнее" in text
+    assert "основную проблему" in text
+
+
+def test_escalation_ack_explains_operator_handoff_and_optional_materials():
+    from app.domain.policy import escalation_ack
+    text = escalation_ack().lower()
+    assert "передан оператору" in text
+    assert "скриншот" in text
+    assert "уточнить суть проблемы" in text

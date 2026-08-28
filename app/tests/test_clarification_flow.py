@@ -183,3 +183,113 @@ def test_escalated_conversation_never_reaches_pipeline(monkeypatch):
     class Event: id = 1
 
     asyncio.run(app.handle(object(), Event(), message))
+
+
+def test_short_one_word_clarification_reply_is_resolved_contextually(monkeypatch):
+    import app.application.support_service as module
+    from app.domain.enums import ConversationStateKind
+
+    install_repos(monkeypatch, (ConversationStateKind.CLARIFYING, {"kb_id": "kb_005", "attempts": 1}))
+
+    class KB:
+        def get_short_clarification_routes(self, kb_id):
+            assert kb_id == "kb_005"
+            return {"уйти": "kb_005", "перейти": "kb_006", "новую": "kb_006"}
+        def get_by_id(self, kb_id):
+            return {"id": kb_id, "template_answer": f"ANSWER:{kb_id}", "choice_label": kb_id}
+
+    class Pipeline:
+        kb = KB()
+        async def decide(self, message):
+            raise AssertionError("single-word contextual reply must not enter generic classifier")
+
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "уйти")
+
+    class Event: id = 99
+
+    asyncio.run(app.handle(object(), Event(), message))
+    assert FakeStates.instances.state == ConversationStateKind.IDLE
+    assert FakeStates.instances.data == {}
+
+
+def test_choice_state_answers_from_persisted_snapshot(monkeypatch):
+    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
+        "candidate_ids": ["kb_005", "kb_006"],
+        "candidates": [
+            {"kb_id": "kb_005", "label": "Выйти", "answer": "SNAPSHOT-EXIT"},
+            {"kb_id": "kb_006", "label": "Перейти", "answer": "SNAPSHOT-TRANSFER"},
+        ],
+        "attempts": 0,
+    }))
+
+    class KB:
+        @staticmethod
+        def parse_category_choice(text, max_index):
+            return [1] if text == "1" and max_index == 2 else []
+        def get_by_id(self, kb_id):
+            # Simulate a KB mutation after the menu was shown. The saved snapshot
+            # must still resolve the user's numbered choice deterministically.
+            return {"id": kb_id, "template_answer": "MUTATED"}
+
+    class Pipeline:
+        kb = KB()
+        async def decide(self, message):
+            raise AssertionError("choice reply must be consumed by CHOOSING state")
+
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "1")
+
+    class Event: id = 100
+
+    asyncio.run(app.handle(object(), Event(), message))
+    assert FakeStates.instances.state == ConversationStateKind.IDLE
+
+
+def test_unknown_conversation_state_is_ignored(monkeypatch):
+    install_repos(monkeypatch, ("future_state_not_implemented", {}))
+
+    class NeverCallPipeline:
+        async def decide(self, message):
+            raise AssertionError("unknown state must not reach classifier")
+
+    app = SupportApplication(NeverCallPipeline(), FakeIntercom(), None, FakeOutbox())
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "нормальный вопрос")
+
+    class Event: id = 101
+
+    # StateRepository in production is enum-backed, but the guard is validated
+    # with a fake legacy/future state value here.
+    asyncio.run(app.handle(object(), Event(), message))
+
+
+def test_choice_invalid_free_text_does_not_auto_escalate(monkeypatch):
+    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
+        "candidate_ids": ["kb_005", "kb_006"],
+        "candidates": [
+            {"kb_id": "kb_005", "label": "Выйти", "answer": "A"},
+            {"kb_id": "kb_006", "label": "Перейти", "answer": "B"},
+        ],
+        "attempts": 2,
+    }))
+    class KB:
+        def parse_category_choice(self, text, max_index):
+            return []
+    class Pipeline:
+        kb = KB()
+        async def decide(self, message):
+            return ProcessingResult(
+                traces=[DecisionTrace(decision=Decision.IGNORE, question=message.text)],
+                actions=[],
+            )
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "это вообще про другое")
+    class Event: id = 100
+
+    class Session:
+        async def flush(self):
+            return None
+    asyncio.run(app.handle(Session(), Event(), message))
+    assert FakeStates.instances.state == ConversationStateKind.IDLE
+    assert FakeStates.instances.data == {}
+

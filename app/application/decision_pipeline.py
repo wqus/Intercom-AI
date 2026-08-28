@@ -19,6 +19,11 @@ class DecisionPipeline:
         self.kb = kb
         self.llm = llm
 
+    @staticmethod
+    def _escalation_reply(text: str | None = None) -> str:
+        """Compose a consistent human-handoff message."""
+        return ResponseComposer.escalation_ack(text or escalation_ack())
+
     def _trace(self, match: MatchResult, question: str) -> DecisionTrace:
         return DecisionTrace(
             decision=Decision.ESCALATE,
@@ -51,7 +56,7 @@ class DecisionPipeline:
         if match.mode == MatchMode.OPERATOR:
             trace.decision = Decision.ESCALATE
             trace.escalation_reason = EscalationReason.USER_REQUESTED_OPERATOR
-            return trace, [OutboundAction("reply", escalation_ack(), True)]
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
         # High-risk: refund / personal_data / complaint — escalate with data collection.
         if match.decision_reason.startswith("high_risk:"):
@@ -65,7 +70,7 @@ class DecisionPipeline:
             trace.escalation_reason = reason_map.get(kind, EscalationReason.NO_CATEGORY)
             trace.decision_reason = match.decision_reason
             reply = high_risk_reply(kind)
-            return trace, [OutboundAction("reply", ResponseComposer.escalation_ack(reply), True)]
+            return trace, [OutboundAction("reply", self._escalation_reply(reply), True)]
 
         if match.mode == MatchMode.TEMPLATE:
             trace.decision = Decision.ANSWER_TEMPLATE
@@ -91,12 +96,19 @@ class DecisionPipeline:
                 labels.append(label)
                 if cid:
                     ids.append(cid)
+            if not settings.USER_VISIBLE_TOP3:
+                # A hidden menu must never create a CHOICE trace/state. The user
+                # cannot select something they were not shown; persisting CHOOSING
+                # here desynchronizes the UI and state machine and makes a later
+                # "1" look like an unrelated fresh query.
+                trace.decision = Decision.IGNORE
+                trace.automated = True
+                trace.choice_candidate_ids = None
+                trace.decision_reason = (trace.decision_reason or "") + ";top3_user_output_disabled_silent_abstain"
+                return trace, []
             trace.decision = Decision.CHOICE
             trace.automated = True
             trace.choice_candidate_ids = ids if len(ids) >= 2 else None
-            if not settings.USER_VISIBLE_TOP3:
-                trace.decision_reason = (trace.decision_reason or "") + ";top3_user_output_disabled"
-                return trace, []
             if len(labels) < 2:
                 trace.decision = Decision.REPHRASE
                 return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
@@ -127,24 +139,26 @@ class DecisionPipeline:
                     labels.append(label)
                     if cid:
                         ids.append(cid)
-                if len(labels) >= 2:
+                if len(labels) >= 2 and settings.USER_VISIBLE_TOP3:
                     trace.decision = Decision.CHOICE
                     trace.automated = True
                     trace.llm_used = False
                     trace.choice_candidate_ids = ids if len(ids) >= 2 else None
                     trace.decision_reason = (
                         trace.decision_reason or "supported_intent_needs_llm"
-                    ) + ";llm_disabled_top3_fallback"
+                    ) + ";llm_disabled_safe_top3"
                     return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
 
-            # Last resort only when we truly have nothing to offer.
-            trace.decision = Decision.REPHRASE
+            # No routable state means there is no safe user-facing action.
+            # Do not manufacture a rephrase/escalation response for an intent
+            # that the system cannot complete deterministically.
+            trace.decision = Decision.IGNORE
             trace.automated = True
             trace.llm_used = False
             trace.decision_reason = (
                 trace.decision_reason or "supported_intent_needs_llm"
-            ) + ";llm_disabled_no_safe_top3"
-            return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
+            ) + ";no_routable_state_silent_abstain"
+            return trace, []
 
             # FUTURE LLM PATH (intentionally disabled for now):
             # result = await self.llm.classify(question, match.relevant_entries)
@@ -163,42 +177,30 @@ class DecisionPipeline:
             trace.automated = True
             return trace, []
 
-        if match.mode == MatchMode.NO_MATCH and match.decision_reason in {
-            "oos", "oos:external_target", "oos:no_domain_support", "oos:no_supported_intent"
-        }:
+        if match.mode == MatchMode.NO_MATCH and (
+            match.decision_reason.startswith("oos:")
+            or match.decision_reason in {"oos", "oos:no_domain_support", "oos:no_supported_intent"}
+        ):
+            # Open-set/OOS is intentionally silent: the bot must not announce
+            # that it can or cannot help with a nearby-but-unsupported topic.
             trace.decision = Decision.OOS
             trace.automated = True
-            return trace, [OutboundAction("reply", ResponseComposer.oos(oos_response()))]
+            trace.decision_reason = (trace.decision_reason or "oos") + ";ignored_out_of_scope"
+            return trace, []
 
-        if match.mode == MatchMode.NO_MATCH and match.decision_reason in {
-            "insufficient_context", "low_confidence", "unsupported_or_ambiguous",
-            "unsupported_object", "object_mismatch", "facet_mismatch",
-        }:
-            # Prefer Top-3 over generic rephrase when ranked candidates exist.
-            candidates = list(getattr(match, "top_candidates", None) or [])
-            labels = [
-                str(c.get("choice_label") or c.get("category") or c.get("kb_id"))
-                for c in candidates[:3]
-                if isinstance(c, dict) and (c.get("choice_label") or c.get("category") or c.get("kb_id"))
-            ]
-            if len(labels) >= 2 and float(match.score or 0.0) >= 0.35:
-                ids = [
-                    str(c.get("kb_id"))
-                    for c in candidates[:3]
-                    if isinstance(c, dict) and c.get("kb_id")
-                ]
-                trace.decision = Decision.CHOICE
-                trace.automated = True
-                trace.choice_candidate_ids = ids if len(ids) >= 2 else None
-                trace.decision_reason = (match.decision_reason or "") + ";top3_from_no_match"
-                return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
-            trace.decision = Decision.REPHRASE
+        if match.mode == MatchMode.NO_MATCH:
+            # NO_MATCH is a silent abstention. We only show Top-3 from explicit
+            # CATEGORY_CHOICE matches, whose options have already passed the
+            # routability/evidence contract. Unknown, nearby or under-specified
+            # requests must not trigger a response or escalation.
+            trace.decision = Decision.IGNORE
             trace.automated = True
-            return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
+            trace.decision_reason = (trace.decision_reason or "no_match") + ";silent_abstain"
+            return trace, []
 
         trace.decision = Decision.ESCALATE
         trace.escalation_reason = EscalationReason.NO_CATEGORY
-        return trace, [OutboundAction("reply", escalation_ack(), True)]
+        return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
     async def decide(self, message: InboundMessage) -> ProcessingResult:
         started = time.perf_counter()
@@ -211,13 +213,30 @@ class DecisionPipeline:
             (message.text or "")[:2000],
         )
 
-        # Ignore generic acknowledgements/greetings before attachment escalation.
-        # A file does not by itself turn "Спасибо" into a support ticket.
+        # Operator request is an explicit user action and must survive the
+        # generic one-word gate (e.g. a standalone "оператор").
+        if contains_operator_request(message.text):
+            trace = DecisionTrace(
+                decision=Decision.ESCALATE,
+                question=message.text,
+                decision_reason="user_requested_operator",
+                escalation_reason=EscalationReason.USER_REQUESTED_OPERATOR,
+            )
+            result = ProcessingResult(
+                traces=[trace],
+                actions=[OutboundAction("reply", self._escalation_reply(), True)],
+            )
+            result.latency_ms = (time.perf_counter() - started) * 1000
+            return result
+
+        # Ignore generic acknowledgements/greetings and standalone one-word
+        # messages before expensive routing. Contextual one-word replies are
+        # consumed by SupportApplication state handlers before this method.
         if is_non_query_message(message.text):
             trace = DecisionTrace(
                 decision=Decision.IGNORE,
                 question=message.text,
-                decision_reason="noise:non_query_exact",
+                decision_reason="noise:non_query_or_single_word",
                 automated=True,
             )
             result = ProcessingResult(traces=[trace], actions=[])
@@ -233,21 +252,7 @@ class DecisionPipeline:
             )
             result = ProcessingResult(
                 traces=[trace],
-                actions=[OutboundAction("reply", escalation_ack(), True)],
-            )
-            result.latency_ms = (time.perf_counter() - started) * 1000
-            return result
-
-        if contains_operator_request(message.text):
-            trace = DecisionTrace(
-                decision=Decision.ESCALATE,
-                question=message.text,
-                decision_reason="user_requested_operator",
-                escalation_reason=EscalationReason.USER_REQUESTED_OPERATOR,
-            )
-            result = ProcessingResult(
-                traces=[trace],
-                actions=[OutboundAction("reply", escalation_ack(), True)],
+                actions=[OutboundAction("reply", self._escalation_reply(), True)],
             )
             result.latency_ms = (time.perf_counter() - started) * 1000
             return result
@@ -301,7 +306,7 @@ class DecisionPipeline:
         elif replies:
             actions.append(OutboundAction("reply", "\n\n".join(replies), needs_escalation))
         elif needs_escalation:
-            actions.append(OutboundAction("reply", ResponseComposer.escalation_ack(escalation_ack()), True))
+            actions.append(OutboundAction("reply", self._escalation_reply(), True))
 
         result = ProcessingResult(traces=traces, actions=actions)
         result.latency_ms = (time.perf_counter() - started) * 1000

@@ -76,7 +76,7 @@ def test_top3_output_is_disabled_by_default(monkeypatch):
         decision_reason="ambiguous", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
-    assert trace.decision.value == 'choice'
+    assert trace.decision.value == 'ignore'
     assert actions == []
 
 
@@ -160,9 +160,9 @@ def test_llm_route_falls_back_to_rephrase_when_no_safe_top3(monkeypatch):
         decision_reason="supported_intent_needs_llm", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
-    assert trace.decision == Decision.REPHRASE
+    assert trace.decision == Decision.IGNORE
     assert trace.llm_used is False
-    assert actions and "переформулируйте" in actions[0].text
+    assert actions == []
 
 
 def test_trace_preserves_all_quality_metrics():
@@ -229,4 +229,24 @@ def test_oos_decision_produces_oos_reply():
     pipeline = DecisionPipeline(FakeKB(), object())
     result = asyncio.run(pipeline.decide(InboundMessage("e","k","t","c",Channel.CONVERSATION,"Как оформить налоговый вычет?")))
     assert result.traces[0].decision == Decision.OOS
-    assert result.actions and "Похоже" in (result.actions[0].text or "")
+    assert result.actions == []
+
+
+def test_standalone_one_word_is_ignored_but_operator_is_not():
+    import asyncio
+    from app.application.decision_pipeline import DecisionPipeline
+    from app.domain.enums import Decision, Channel
+    from app.domain.models import InboundMessage
+
+    class FakeKB:
+        def match_many(self, text):
+            raise AssertionError("KB must not be reached")
+
+    pipeline = DecisionPipeline(FakeKB(), object())
+    one_word = asyncio.run(pipeline.decide(InboundMessage("e","k","t","c",Channel.CONVERSATION,"Телеграм")))
+    assert one_word.traces[0].decision == Decision.IGNORE
+    assert one_word.actions == []
+
+    operator = asyncio.run(pipeline.decide(InboundMessage("e2","k2","t","c2",Channel.CONVERSATION,"оператор")))
+    assert operator.traces[0].decision == Decision.ESCALATE
+    assert operator.actions and operator.actions[0].escalate

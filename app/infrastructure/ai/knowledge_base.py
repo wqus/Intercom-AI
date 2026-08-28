@@ -73,6 +73,10 @@ KNOWN_INTERNAL_ENTITIES = {
     # phrases like «в другой школе» can be misread as an external target.
     "другой", "другая", "другое", "других", "другом", "другую",
     "своей", "свою", "своей", "нашей", "нашу", "новой", "новую",
+    # Generic nouns that may be capitalized in ordinary Russian text.
+    "школа", "школу", "школе", "школой", "школы",
+    "курс", "курса", "курсе", "поток", "потока",
+    "мероприятие", "мероприятия", "семинар", "семинаре",
 }
 EXTERNAL_TARGET_CONTEXT = (
     "обучение", "школ", "курс", "поток", "занят", "обучаться",
@@ -107,8 +111,8 @@ GENERIC_RERANK_WEIGHT = 0.10
 # v22.3: raised further so TEMPLATE fires only on near-certain, well-evidenced
 # matches — anything softer now falls through to Top-3/rephrase instead of
 # auto-answering.
-AUTO_SCORE = 0.94
-AUTO_MARGIN = 0.16
+AUTO_SCORE = 0.97
+AUTO_MARGIN = 0.20
 LLM_SCORE = 0.48
 LLM_MARGIN = 0.030
 HIGH_SCORE_LOW_MARGIN = 0.88
@@ -116,7 +120,7 @@ LEXICAL_EVIDENCE_MIN = 0.32
 SEMANTIC_GAP_FOR_LLM = 0.025
 MIN_REAL_INTENT_EVIDENCE = 0.36
 MIN_REAL_INTENT_FIT = 0.48
-MIN_TEMPLATE_EVIDENCE = 0.66
+MIN_TEMPLATE_EVIDENCE = 0.80
 
 # Retrieval/ranking weights. Kept bounded and re-normalized when reranker is off.
 SEMANTIC_MAX_WEIGHT = 0.34
@@ -129,14 +133,14 @@ FAMILY_FIT_WEIGHT = 0.04
 RRF_WEIGHT = 0.04
 RERANK_WEIGHT = 0.10
 
-# Safety thresholds: TEMPLATE ultra-strict; Top-3 deliberately permissive.
-INTENT_FIT_TEMPLATE_MIN = 0.83
+# Safety thresholds: TEMPLATE ultra-strict; Top-3 is a rare, evidence-backed ambiguity mode.
+INTENT_FIT_TEMPLATE_MIN = 0.90
 INTENT_FIT_LLM_MIN = 0.38
 INTENT_FIT_HARD_MISMATCH = 0.25
 MIN_QUERY_QUALITY_TEMPLATE = 0.36
 MIN_QUERY_QUALITY_LLM = 0.18
 MIN_QUERY_QUALITY_CHOICE = 0.12
-MIN_FAMILY_FIT_TEMPLATE = 0.52
+MIN_FAMILY_FIT_TEMPLATE = 0.58
 
 # User-facing fallback routing.
 REPHRASE_SCORE_MAX = 0.50
@@ -155,16 +159,18 @@ OOS_QUERY_QUALITY_MIN = 0.34
 OOS_EXTERNAL_TARGET = True
 OOS_MIN_DOMAIN_TERM_HITS = 0
 
-# CATEGORY_CHOICE is the primary middle mode (v22.1).
-# Prefer showing 2–3 options over TEMPLATE or empty rephrase.
+# CATEGORY_CHOICE is a rare ambiguity mode, not a generic low-confidence fallback.
 CATEGORY_CHOICE_MIN_SCORE = 0.42
 CATEGORY_CHOICE_MIN_INTENT_FIT = 0.40
-CATEGORY_CHOICE_MAX_MARGIN = 0.35
-CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.12
+CATEGORY_CHOICE_MAX_MARGIN = 0.16
+CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.14
 CATEGORY_CHOICE_MAX_CANDIDATES = 3
 CATEGORY_CHOICE_MIN_CANDIDATES = 2
-CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.28
-CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT = False
+CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.42
+CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT = True
+# A Top-3 option is a promise: the next user reply must be resolvable locally.
+# Entries without a terminal answer/clarification are therefore never shown.
+CATEGORY_CHOICE_REQUIRE_ROUTABLE_ENTRY = True
 
 # Contrastive routing: a candidate is not considered safe merely because it
 # scores well; it must also beat its declared/confusable competitors on
@@ -231,6 +237,14 @@ INTENT_REQUIRED_FACETS: dict[str, set[str]] = {
     "telegram_membership": {"telegram_membership"},
     "invite_code": {"invite_code"},
     "qr_code": {"qr_code"},
+    "become_mentee": {"mentor_enrolment"},
+    "online_mentorship": {"online"},
+    "speaker_collaboration": {"speaker_collaboration"},
+    "event_access": {"event_access"},
+    "record_second_person": {"record_second_person"},
+    "support_process": {"support_process"},
+    "feedback": {"feedback"},
+    "repeat_registration": {"repeat_registration"},
 }
 
 # Some high-signal facets need morphology-aware detection instead of exact
@@ -517,11 +531,20 @@ def detect_high_risk(text: str) -> str | None:
 
 
 def is_non_query_message(text: str) -> bool:
-    """Exact generic acknowledgements/greetings/noise only."""
+    """Return True for non-support input, including standalone one-word messages.
+
+    One-word input is not sufficient evidence for a KB intent. Contextual
+    exceptions (Top-3 numeric choices and known clarification replies) are
+    handled by the state/orchestration layer before this gate is reached.
+    """
     q = normalize_light(text)
     if not q:
         return True
-    return q in _NON_QUERY_EXACT or q in META_NOISE_PATTERNS
+    if q in _NON_QUERY_EXACT or q in META_NOISE_PATTERNS:
+        return True
+    if len(tokenize(q)) == 1:
+        return True
+    return False
 
 
 def _quality_gate(text: str) -> tuple[bool, str]:
@@ -1042,6 +1065,16 @@ class KnowledgeBase:
             "school_restoration": ("school", "restore", "intent"),
             "involuntary_exclusion": ("school", "restore", "excluded"),
             "global_exit": ("schools", "leave", "intent"),
+            "become_mentee": ("mentor", "join", "intent"),
+            "online_mentorship": ("mentor", "learn", "online"),
+            "speaker_collaboration": ("collaboration", "offer", "intent"),
+            "event_access": ("event", "access", "information"),
+            "record_second_person": ("event", "register", "second_person"),
+            "support_process": ("support", "contact", "information"),
+            "feedback": ("content", "improve", "intent"),
+            "repeat_registration": ("flow", "register", "repeat"),
+            "school_info": ("school", "learn", "information"),
+            "facility_access": ("facility", "access", "information"),
         }
         obj, action, state = mapping.get(it, (family, None, None))
         facet = next(iter(sorted(facets)), None)
@@ -1076,6 +1109,18 @@ class KnowledgeBase:
             "qr_code": ("qr", "qr код", "qr-код"),
             "rent": ("аренда", "аренду"),
             "subscription": ("подписка", "подписку"),
+            "online": ("онлайн", "удаленно", "удалённо", "дистанционно", "remote"),
+            "event_access": ("кто может прийти", "любой может прийти", "только для членов", "гость на мероприятие", "кто допускается", "можно ли гостю"),
+            "record_second_person": ("второго человека", "другого человека", "партнера", "партнёра", "друга"),
+            "speaker_collaboration": ("стать спикером", "провести интенсив", "выступить", "провести лекцию", "сотрудничество", "образовательное сотрудничество", "партнерское предложение", "партнёрское предложение"),
+            "support_process": ("как обратиться к куратору", "как обратиться в поддержку", "где найти куратора", "куда писать в поддержку", "создать тикет", "форма обращения", "куратор уже знает"),
+            "feedback": ("обратная связь", "предложение по улучшению", "предложить идею", "улучшить приложение", "исправить описание", "неверное описание", "ошибка в видео", "исправление контента"),
+            "repeat_registration": ("повторная запись", "записаться повторно", "уже был на запуске", "уже была на запуске", "проходил обучение раньше", "проходила обучение раньше", "повторный поток"),
+            "event": ("мероприятие", "событие", "семинар", "встреча", "занятие"),
+            "facility": ("калитка", "дверь", "домофон", "помещение", "зал", "дом терры"),
+            "support": ("поддержка", "куратор", "тикет", "обращение"),
+            "feedback_object": ("обратная связь", "предложение", "улучшение"),
+            "person": ("второго человека", "другого человека", "партнера", "партнёра", "друга"),
         }
         stems = set(stem_tokens(question))
         if stems & {"наставник", "ментор"} and (stems & {"хоч", "хочу", "жел", "готов", "мог"}) and "стат" in stems:
@@ -1089,7 +1134,12 @@ class KnowledgeBase:
 
         for key, vals in patterns.items():
             if any(v in q for v in vals):
-                target = "facet" if key in {"price", "date", "duration", "age", "registration", "technical_failure", "verification", "access"} else "object"
+                target = "facet" if key in {
+                    "price", "date", "duration", "age", "registration",
+                    "technical_failure", "verification", "access", "online",
+                    "event_access", "record_second_person", "speaker_collaboration",
+                    "support_process", "feedback", "repeat_registration",
+                } else "object"
                 out[target].add(key)
         if out["object"]:
             out["domain"].add("known")
@@ -1097,6 +1147,28 @@ class KnowledgeBase:
             out["state"].add("failure")
         if "registration" in out["facet"]:
             out["action"].add("register")
+        if "online" in out["facet"]:
+            out["state"].add("online")
+        if "event" in out["object"]:
+            out["state"].add("event")
+        if "event_access" in out["facet"]:
+            out["action"].add("access")
+            out["state"].add("information")
+        if "record_second_person" in out["facet"] or "person" in out["object"]:
+            out["action"].add("register")
+            out["state"].add("second_person")
+        if "speaker_collaboration" in out["facet"]:
+            out["action"].add("offer")
+            out["state"].add("intent")
+        if "support_process" in out["facet"] or "support" in out["object"]:
+            out["action"].add("contact")
+            out["state"].add("information")
+        if "feedback" in out["facet"] or "feedback_object" in out["object"]:
+            out["action"].add("improve")
+            out["state"].add("intent")
+        if "repeat_registration" in out["facet"]:
+            out["action"].add("register")
+            out["state"].add("repeat")
         if "mentor_application" in out["object"]:
             out["action"].add("become")
             out["state"].add("intent")
@@ -1110,6 +1182,34 @@ class KnowledgeBase:
             out["action"].add("pay")
         if "membership" in out["object"]:
             out["action"].add("join")
+            out["state"].add("information")
+        if "mentor" in out["object"] and "mentor_application" in out["facet"]:
+            out["action"].add("join")
+            out["state"].add("intent")
+        if "online" in out["facet"]:
+            out["state"].add("online")
+        if "event" in out["object"]:
+            out["state"].add("event")
+        if "event_access" in out["facet"]:
+            out["action"].add("access")
+            out["state"].add("information")
+        if "record_second_person" in out["facet"] or "person" in out["object"]:
+            out["action"].add("register")
+            out["state"].add("second_person")
+        if "speaker_collaboration" in out["facet"]:
+            out["action"].add("offer")
+            out["state"].add("intent")
+        if "support_process" in out["facet"] or "support" in out["object"]:
+            out["action"].add("contact")
+            out["state"].add("information")
+        if "feedback" in out["facet"] or "feedback_object" in out["object"]:
+            out["action"].add("improve")
+            out["state"].add("intent")
+        if "repeat_registration" in out["facet"]:
+            out["action"].add("register")
+            out["state"].add("repeat")
+        if "facility" in out["object"]:
+            out["action"].add("access")
             out["state"].add("information")
         if "training" in out["object"] and "price" in out["facet"]:
             out["action"].add("pay")
@@ -1264,6 +1364,37 @@ class KnowledgeBase:
         if recurring_charge and not has_any("аренд", "обучен"):
             return "kb_011"
 
+        # Explicit support/process requests outrank generic education/topic matches.
+        support_process = (
+            has_phrase(
+                "где найти куратора", "как обратиться к куратору",
+                "как обратиться в поддержку", "куда писать в поддержку",
+                "создать тикет", "форма обращения", "куратор уже знает",
+            )
+            or (
+                has_any("куратор", "поддержк", "тикет")
+                and has_any("куда", "как", "где", "обращ", "напис", "созда")
+            )
+        )
+        if support_process:
+            return "kb_022"
+
+        # Content/reporting feedback is different from a product failure.
+        feedback_signal = (
+            has_any("исправ", "корректиров", "неверн", "ошибк", "предлож", "улучш")
+            and has_any("описани", "информац", "видео", "контент", "прилож", "иде")
+        )
+        if feedback_signal:
+            return "kb_031"
+
+        # Registering another person is a distinct event operation.
+        if has_phrase(
+            "записать второго человека", "записать другого человека",
+            "записать партнера", "записать партнёра",
+            "зарегистрировать друга", "как записать другого человека",
+        ):
+            return "kb_046"
+
         # Support-process questions are about how/where to contact a curator or
         # how support should perform an already-requested administrative action.
         support_process = (
@@ -1285,6 +1416,23 @@ class KnowledgeBase:
         )
         if feedback_signal:
             return "kb_031"
+
+        # Online mentorship is distinct from both the general mentorship
+        # programme and the user's own assigned mentor.
+        if (
+            has_any("настав", "ментор")
+            and has_any("онлайн", "удален", "удалён", "дистанцион")
+            and not has_any("стать", "спикер", "программ")
+        ):
+            return "kb_040"
+
+        # Speaking/intensive/collaboration requests are a separate role from
+        # becoming a mentor or joining mentorship as a student.
+        if (
+            has_any("спикер", "интенсив", "лекц", "сотруднич", "коллаборац")
+            and not has_any("ученик", "наставничеств")
+        ):
+            return "kb_041"
 
         # Explicit event attendance/access questions should not be pulled into
         # generic school/registration intents.
@@ -1340,6 +1488,37 @@ class KnowledgeBase:
             return "kb_007"
         if voluntary_exit and not explicit_transfer and not explicit_return:
             return "kb_005"
+
+        # Support process should win over generic school/topic matches when
+        # the user explicitly asks how to involve a curator/support.
+        support_rule = (
+            has_phrase(
+                "как обратиться к куратору", "где найти куратора",
+                "как обратиться к поддержке", "куда писать в поддержку",
+                "создать тикет", "форма обращения", "куратор уже знает",
+                "куратор сказал обратиться в поддержку",
+            )
+            or (has_any("куратор", "поддержк") and has_any("куда", "как", "где", "обращ", "напис"))
+        )
+        if support_rule:
+            return "kb_022"
+
+        feedback_rule = (
+            has_any("исправ", "корректиров", "предлож", "улучш", "обратн")
+            and has_any("описани", "информац", "видео", "контент", "прилож", "иде")
+        )
+        if feedback_rule:
+            return "kb_031"
+
+        second_person_rule = (
+            has_phrase(
+                "записать второго человека", "записать другого человека",
+                "записать партнера", "записать партнёра",
+                "зарегистрировать друга", "как записать другого человека",
+            )
+        )
+        if second_person_rule:
+            return "kb_046"
 
         # ----------------------------------------------------
         # Mentor family.
@@ -1890,6 +2069,75 @@ class KnowledgeBase:
 
         return None
 
+    @staticmethod
+    def _has_strong_candidate_evidence(item: dict) -> bool:
+        """Return True when a candidate has evidence independent of raw similarity."""
+        if item.get("negative_hits"):
+            return False
+        constraints = item.get("constraint_evidence") or {}
+        if constraints.get("forbidden_hits"):
+            return False
+        if str(item.get("intent_contract_status", "unknown")) == "contradicted":
+            return False
+        return bool(
+            item.get("direct_support")
+            or float(item.get("lexical_score", 0.0)) >= 0.55
+            or float(item.get("fuzzy_phrase_score", 0.0)) >= 0.90
+            or float(item.get("intent_contract_strength", 0.0)) >= 0.75
+        )
+
+    def _promote_supported_alternative(self, ranked: list[dict]) -> list[dict]:
+        """Recover from semantic-negative false vetoes without relaxing explicit negatives.
+
+        A common failure pattern is: candidate A ranks first, but its embedding is
+        closer to a negative example than to A's positive evidence; candidate B has
+        direct/contract evidence but was ranked slightly lower. In that case A must
+        not be allowed to produce NO_MATCH. We only promote B when it is still
+        close in score and independently supported.
+        """
+        if len(ranked) < 2:
+            return ranked
+        top = ranked[0]
+        negative_contrast = float(top.get("negative_contrast_score", 1.0))
+        if negative_contrast > NEGATIVE_CONTRAST_UNSAFE:
+            return ranked
+        if top.get("negative_hits") or (top.get("constraint_evidence") or {}).get("forbidden_hits"):
+            return ranked
+        if self._has_strong_candidate_evidence(top):
+            return ranked
+
+        top_score = float(top.get("final_score", 0.0))
+        best_idx = None
+        best_value = None
+        for idx, candidate in enumerate(ranked[1:], start=1):
+            if not self._has_strong_candidate_evidence(candidate):
+                continue
+            fit = float(candidate.get("intent_fit_score", 0.0))
+            real_ev = float(candidate.get("real_intent_evidence", 0.0))
+            domain = float(candidate.get("domain_support_score", 0.0))
+            alignment = float(candidate.get("ontology_alignment_score", 0.0))
+            score = float(candidate.get("final_score", 0.0))
+            contract_status = str(candidate.get("intent_contract_status", "unknown"))
+            if fit < 0.58 or real_ev < 0.34 or domain < 0.16 or alignment < 0.42:
+                continue
+            if score < max(0.40, top_score - 0.12):
+                continue
+            if contract_status == "insufficient" and not candidate.get("direct_support"):
+                continue
+            value = (score, fit, real_ev)
+            if best_value is None or value > best_value:
+                best_idx, best_value = idx, value
+
+        if best_idx is None:
+            return ranked
+        promoted = [ranked[best_idx], ranked[0], *ranked[1:best_idx], *ranked[best_idx + 1:]]
+        logger.info(
+            "semantic_negative_rescue | promoted=%s displaced=%s | top_score=%.3f promoted_score=%.3f",
+            promoted[0]["entry"]["id"], top["entry"]["id"], top_score,
+            float(promoted[0].get("final_score", 0.0)),
+        )
+        return promoted
+
     def _negative_decision_reason(self, question: str, top: dict, ranked: list[dict]) -> str | None:
         """Return a safe abstention reason when the candidate is contradicted.
 
@@ -2095,6 +2343,39 @@ class KnowledgeBase:
             "access": (
                 "нет доступа", "не пускает", "не вижу", "закрыт доступ", "как получить доступ",
             ),
+            "online": (
+                "онлайн", "удаленно", "удалённо", "дистанционно",
+            ),
+            "event_access": (
+                "кто может прийти", "любой может прийти", "только для членов",
+                "можно ли гостю", "гость на мероприятие", "кто может участвовать",
+            ),
+            "record_second_person": (
+                "второго человека", "другого человека", "записать партнера",
+                "записать партнёра", "зарегистрировать друга",
+            ),
+            "speaker_collaboration": (
+                "стать спикером", "провести интенсив", "хочу выступить",
+                "провести лекцию", "образовательное сотрудничество",
+                "партнерское предложение", "партнёрское предложение",
+            ),
+            "support_process": (
+                "как обратиться к куратору", "где найти куратора",
+                "как обратиться в поддержку", "куда писать в поддержку",
+                "создать тикет", "форма обращения",
+            ),
+            "feedback": (
+                "обратная связь", "предложение по улучшению", "предложить идею",
+                "улучшить приложение", "исправить описание", "неверное описание",
+            ),
+            "repeat_registration": (
+                "повторная запись", "записаться повторно", "уже был на запуске",
+                "уже была на запуске", "проходил обучение раньше", "проходила обучение раньше",
+            ),
+            "current_flow": (
+                "текущий поток", "уже идет поток", "уже идёт поток",
+                "опоздал на поток", "уже началась школа",
+            ),
         }
         for facet, phrases in patterns.items():
             if any(p in q for p in phrases):
@@ -2109,6 +2390,26 @@ class KnowledgeBase:
         if stems & {"наставник", "ментор"} and stems & {"отказ", "отклон", "повтор", "снов"}:
             facets.add("retry")
 
+        # Role/action facets for legacy intents with sparse exact phrases.
+        if stems & {"куратор", "поддержк", "тикет", "обращен"}:
+            facets.add("support_process")
+        if stems & {"спикер", "интенсив", "лекц", "сотруднич"}:
+            facets.add("speaker_collaboration")
+        if stems & {"мероприят", "семинар", "встреч", "занят"}:
+            if any(p in normalize_light(question) for p in (
+                "кто может прийти", "любой может", "только для членов",
+                "можно ли гостю", "только участникам", "гость",
+            )):
+                facets.add("event_access")
+        if stems & {"втор", "друг", "партнер", "партнер", "партнер"} and (
+            "запис" in " ".join(stems) or "регистр" in " ".join(stems)
+        ):
+            facets.add("record_second_person")
+        if stems & {"повтор", "снов"} and stems & {"запис", "обуч", "поток"}:
+            facets.add("repeat_registration")
+        if stems & {"исправ", "улучш", "предлож", "иде", "ошибк"} and stems & {"описан", "контент", "прилож", "виде", "информац"}:
+            facets.add("feedback")
+
         # Morphological variants which are common in real support messages but
         # are not covered by exact phrase lists. These remain intent-specific
         # and do not classify from a generic topic word alone.
@@ -2116,13 +2417,24 @@ class KnowledgeBase:
             facets.add("registration")
         if any(stem.startswith("ссыл") for stem in stems) and (stems & {"чат", "телеграм", "тг"}):
             facets.add("telegram_link")
-        if stems & {"наставник", "ментор"} and "mentor_application" not in facets and "mentor_program" not in facets:
+        if stems & {"наставник", "ментор"}:
             mentor_text = normalize_light(question)
-            if not any(p in mentor_text for p in (
-                "стать наставником", "стать ментором", "программа наставничества",
-                "как работает наставничество", "что такое наставничество",
-            )):
-                facets.add("personal_mentor")
+            mentor_enrolment = (
+                ("запис" in " ".join(stems) or "попаст" in " ".join(stems) or "заявк" in " ".join(stems))
+                and not any(p in mentor_text for p in (
+                    "стать наставником", "стать ментором", "хочу быть наставником",
+                    "хочу быть ментором", "программа наставничества",
+                    "как работает наставничество", "что такое наставничество",
+                ))
+            )
+            if mentor_enrolment:
+                facets.add("mentor_enrolment")
+            elif "mentor_application" not in facets and "mentor_program" not in facets:
+                if not any(p in mentor_text for p in (
+                    "стать наставником", "стать ментором", "программа наставничества",
+                    "как работает наставничество", "что такое наставничество",
+                )):
+                    facets.add("personal_mentor")
 
         return facets
 
@@ -3073,7 +3385,8 @@ class KnowledgeBase:
             ),
             reverse=True,
         )
-        return self._apply_contrastive_scores(question, ranked[:FINAL_CANDIDATES])
+        ranked = self._apply_contrastive_scores(question, ranked[:FINAL_CANDIDATES])
+        return self._promote_supported_alternative(ranked)
 
     @staticmethod
     def _reranker_text(entry: dict, best_phrase: str) -> str:
@@ -3259,6 +3572,8 @@ class KnowledgeBase:
             "ontology_alignment_score": float(item.get("ontology_alignment_score", 0.0)),
             "domain_support_score": float(item.get("domain_support_score", 0.0)),
             "ontology": item.get("ontology", {}),
+            "family": str(entry.get("family") or "other"),
+            "intent_type": str(entry.get("intent_type") or ""),
         }
 
     def _force_top_choice_candidates(self, ranked: list[dict], n: int = 3) -> list[dict]:
@@ -3300,11 +3615,13 @@ class KnowledgeBase:
             return True
         return int(constraint_evidence.get("failed_any_groups", 0) or 0) > 0
 
-    def _category_choice_candidates(self, ranked: list[dict]) -> list[dict]:
-        """Primary middle mode (v22.1): 2–3 alternatives when TEMPLATE is not safe.
+    def _category_choice_candidates(self, ranked: list[dict], question: str | None = None) -> list[dict]:
+        """Build a small, semantically coherent user-facing choice set.
 
-        Filters are much milder than TEMPLATE. Only hard negatives/contradictions
-        are dropped so mid-confidence queries get a menu instead of rephrase.
+        Top-3 is intentionally *rarer* than ordinary retrieval ambiguity. Every
+        visible option must have its own intent evidence, be routable, be close
+        enough to the leader, and share a meaningful query context (family or
+        ontology object). A nearest-neighbour list is never a valid menu.
         """
         if not ranked:
             return []
@@ -3315,74 +3632,88 @@ class KnowledgeBase:
         top_margin = top_score - second_score if len(ranked) > 1 else top_score
         quality = float(top.get("query_quality_score", 0.0))
 
-        if quality < MIN_QUERY_QUALITY_CHOICE and top_score < 0.55:
+        if quality < MIN_QUERY_QUALITY_CHOICE and top_score < 0.60:
             return []
-        if top_score < CATEGORY_CHOICE_MIN_SCORE:
+        if top_score < 0.48:
             return []
-        # Huge margin alone does not block Top-3: TEMPLATE still needs AUTO_SCORE.
-        # Only skip choice when margin is extreme AND top is already template-safe.
-        if top_margin > CATEGORY_CHOICE_MAX_MARGIN and top_score >= AUTO_SCORE:
+        # Top-3 is for genuine ambiguity, not for a clear winner.
+        if top_margin > CATEGORY_CHOICE_MAX_MARGIN:
             return []
+
+        query_text = str(question or top.get("question") or "")
+        qo = self._query_ontology(query_text) if query_text else {}
+        query_facets = self._question_facets(query_text) if query_text else set()
+        top_entry = top.get("entry") or {}
+        top_family = str(top_entry.get("family") or "other")
+        top_ontology = top.get("ontology") or {}
+        query_object = qo.get("object") if isinstance(qo, dict) else None
+        query_action = qo.get("action") if isinstance(qo, dict) else None
+        query_state = qo.get("state") if isinstance(qo, dict) else None
 
         eligible: list[dict] = []
-        for item in ranked[: max(CATEGORY_CHOICE_MAX_CANDIDATES + 3, 6)]:
+        for item in ranked[: max(CATEGORY_CHOICE_MAX_CANDIDATES + 4, 7)]:
             score = float(item.get("final_score", 0.0))
             fit = float(item.get("intent_fit_score", 0.0))
-            constraints = item.get("constraint_evidence", {}) or {}
+            real_ev = float(item.get("real_intent_evidence", 0.0))
+            domain = float(item.get("domain_support_score", 0.0))
+            ontology_alignment = float(item.get("ontology_alignment_score", 0.0))
+            explicit_intent = bool(
+                item.get("direct_support")
+                or item.get("positive_hits")
+                or item.get("intent_signal_positive_hits")
+            )
+            entry = item.get("entry") or {}
             contract_status = str(item.get("intent_contract_status", "unknown"))
 
-            # Hard blocks only.
-            if contract_status == "contradicted":
+            if contract_status == "contradicted" or self._contract_is_unproven(item):
                 continue
-            if self._contract_is_unproven(item):
+            if CATEGORY_CHOICE_REQUIRE_ROUTABLE_ENTRY and not (
+                entry.get("template_answer") or entry.get("clarification_question")
+            ):
                 continue
-            if item.get("negative_hits"):
+            if item.get("negative_hits") or (item.get("constraint_evidence") or {}).get("forbidden_hits"):
                 continue
-            if constraints.get("forbidden_hits"):
+            if score < 0.48 or fit < 0.50 or real_ev < CATEGORY_CHOICE_MIN_REAL_EVIDENCE:
                 continue
-            if score < CATEGORY_CHOICE_MIN_SCORE * 0.85 and item is not ranked[0]:
-                # keep top even if slightly under threshold when building menu
-                if float(item.get("final_score", 0.0)) < 0.30:
-                    continue
-            if score < 0.30:
+            if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not explicit_intent:
                 continue
-            if fit < CATEGORY_CHOICE_MIN_INTENT_FIT and score < 0.50:
+            if top_score - score > CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST:
                 continue
-            # A Top-3 option should be defensible as an intent, not merely
-            # semantically related. Generic family neighbours (e.g. broad
-            # school-info) otherwise crowd out the actual user intent.
-            real_ev = float(item.get("real_intent_evidence", 0.0))
-            if real_ev < 0.24 and not item.get("direct_support") and score < 0.55:
+            if domain < 0.24 and not explicit_intent:
                 continue
-            if float(item.get("real_intent_evidence", 0.0)) < CATEGORY_CHOICE_MIN_REAL_EVIDENCE and not item.get("direct_support"):
-                if score < 0.45:
-                    continue
-            if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not item.get("direct_support"):
+            if ontology_alignment < 0.50 and not explicit_intent:
                 continue
-            if top_score - score > max(0.45, CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST * 4.0):
+            if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not explicit_intent:
+                continue
+
+            family = str(entry.get("family") or "other")
+            candidate_ontology = item.get("ontology") or {}
+            candidate_object = candidate_ontology.get("object")
+            candidate_action = candidate_ontology.get("action")
+            candidate_state = candidate_ontology.get("state")
+            same_family = family == top_family
+            same_object = bool(candidate_object and top_ontology.get("object") and candidate_object == top_ontology.get("object"))
+            query_object_match = bool(query_object and candidate_object and candidate_object in query_object)
+            query_action_match = bool(query_action and candidate_action and set(candidate_action) & set(query_action))
+            query_state_match = bool(query_state and candidate_state and set(candidate_state) & set(query_state))
+            meaningful_query_context = bool(
+                query_object_match or query_action_match or query_state_match
+                or (candidate_ontology.get("facet") and candidate_ontology.get("facet") in query_facets)
+            )
+
+            # Candidates must share the *query's* semantic context, not merely
+            # the leader's family. Same-family alone is too broad for Top-3.
+            if not meaningful_query_context:
+                continue
+
+            # When there is no explicit lexical hit, structured context must be
+            # strong enough to prove that this candidate is independently plausible.
+            if not explicit_intent and not (real_ev >= 0.58 and fit >= 0.56 and domain >= 0.32 and ontology_alignment >= 0.66):
                 continue
 
             payload = self._choice_candidate_payload(item)
             payload["margin"] = float(top_margin)
             eligible.append(payload)
-
-        # Fallback: if strict filters left <2, take top-3 ranked with any score >= 0.28
-        if len(eligible) < CATEGORY_CHOICE_MIN_CANDIDATES:
-            eligible = []
-            for item in ranked[:CATEGORY_CHOICE_MAX_CANDIDATES + 1]:
-                if item.get("negative_hits"):
-                    continue
-                if (item.get("constraint_evidence") or {}).get("forbidden_hits"):
-                    continue
-                if self._contract_is_unproven(item):
-                    continue
-                if float(item.get("final_score", 0.0)) < 0.28:
-                    continue
-                payload = self._choice_candidate_payload(item)
-                payload["margin"] = float(top_margin)
-                eligible.append(payload)
-                if len(eligible) >= CATEGORY_CHOICE_MAX_CANDIDATES:
-                    break
 
         if len(eligible) < CATEGORY_CHOICE_MIN_CANDIDATES:
             return []
@@ -3392,17 +3723,32 @@ class KnowledgeBase:
         seen_intent_types: set[str] = set()
         for candidate in eligible:
             kb_id = candidate["kb_id"]
-            entry = self.entries_by_id.get(kb_id)
-            intent_type = str(entry.get("intent_type") or kb_id) if entry else kb_id
-            if kb_id in seen_ids:
-                continue
-            if intent_type in seen_intent_types and len(unique) >= CATEGORY_CHOICE_MIN_CANDIDATES:
+            intent_type = str(candidate.get("intent_type") or kb_id)
+            if kb_id in seen_ids or intent_type in seen_intent_types:
                 continue
             unique.append(candidate)
             seen_ids.add(kb_id)
             seen_intent_types.add(intent_type)
 
         return unique[:CATEGORY_CHOICE_MAX_CANDIDATES]
+
+    def get_short_clarification_routes(self, kb_id: str | None) -> dict[str, str]:
+        """Map short contextual replies to routable KB ids for known clarifications."""
+        if not kb_id:
+            return {}
+        # Currently only one clarification is deliberately designed to accept
+        # one-word replies. Keep this explicit instead of guessing that any
+        # "да/нет/уйти/перейти" is meaningful in every clarification state.
+        if str(kb_id) == "kb_005":
+            return {
+                "выйти": "kb_005",
+                "уйти": "kb_005",
+                "покинуть": "kb_005",
+                "перейти": "kb_006",
+                "сменить": "kb_006",
+                "новую": "kb_006",
+            }
+        return {}
 
     def get_category_choice_candidates(
         self,
@@ -3422,7 +3768,7 @@ class KnowledgeBase:
             max(RETRIEVAL_TOP_K, top_n),
         )
         ranked = self._rank_candidates(question, candidates)
-        eligible = self._category_choice_candidates(ranked)
+        eligible = self._category_choice_candidates(ranked, question=question)
         return eligible[:top_n]
 
     @staticmethod
@@ -3562,6 +3908,17 @@ class KnowledgeBase:
                 decision_reason=f"high_risk:{high_risk}",
             )
 
+        # Standalone one-word queries are never classified in an idle context.
+        # Stateful exceptions (Top-3 / explicit clarification choices) are
+        # resolved by SupportApplication before the classifier is called.
+        if len(tokenize(question)) == 1:
+            return MatchResult(
+                MatchMode.NO_MATCH, 0.0, None, None, None, [],
+                subquestion=question,
+                decision_reason="noise:single_word",
+                query_quality_score=0.0,
+            )
+
         if not self.entries:
             return MatchResult(
                 MatchMode.NO_MATCH, 0.0, None, None, None, [],
@@ -3599,7 +3956,7 @@ class KnowledgeBase:
                 hard_safe = (
                     fit >= (0.80 if required_facets else 0.72)
                     and family_fit >= 0.45
-                    and alignment >= (0.65 if required_facets else 0.55)
+                    and alignment >= (0.75 if required_facets else 0.65)
                     and explicit_facet_ok
                     and explicit_positive
                 )
@@ -3823,7 +4180,7 @@ class KnowledgeBase:
             and contrastive_margin < CONTRASTIVE_AUTO_MARGIN
         )
         if both_supported and margin < 0.08:
-            choices = self._category_choice_candidates(ranked)
+            choices = self._category_choice_candidates(ranked, question=question)
             if len(choices) >= 2:
                 return MatchResult(
                     MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
@@ -3944,7 +4301,7 @@ class KnowledgeBase:
             and safe_template_eligible
             and entry.get("template_answer")
             and top_score >= AUTO_SCORE
-            and margin >= AUTO_MARGIN * 0.5
+            and margin >= AUTO_MARGIN * 0.75
             and intent_fit >= INTENT_FIT_TEMPLATE_MIN
             and real_evidence >= MIN_TEMPLATE_EVIDENCE
         ):
@@ -3972,7 +4329,7 @@ class KnowledgeBase:
             )
 
         # 6. Primary middle path: Top-3 whenever 2+ candidates survive soft filters.
-        choices = self._category_choice_candidates(ranked)
+        choices = self._category_choice_candidates(ranked, question=question)
         if len(choices) >= 2:
             return MatchResult(
                 MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
@@ -3991,46 +4348,16 @@ class KnowledgeBase:
                 negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
             )
 
-        # 6b. Single strong-but-not-template candidate: still try Top-3 from ranked.
-        if top_score >= 0.50 and len(top_candidates) >= 2:
-            soft_choices = []
-            for c in top_candidates[:3]:
-                soft_choices.append(c if isinstance(c, dict) else {"choice_label": str(c), "kb_id": str(c)})
-            # Ensure choice_label present
-            normalized = []
-            for c in soft_choices:
-                if not c:
-                    continue
-                label = c.get("choice_label") or c.get("category") or c.get("kb_id")
-                if not label:
-                    continue
-                normalized.append({**c, "choice_label": label})
-            if len(normalized) >= 2:
-                return MatchResult(
-                    MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
-                    entry.get("id"), relevant_entries, entry=entry,
-                    second_score=second_score, margin=margin,
-                    semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
-                    evidence_score=float(top.get("evidence_score", 0.0)),
-                    real_intent_evidence=real_evidence,
-                    embedding_score=embedding, intent_fit_score=intent_fit,
-                    intent_fit_reason=str(top.get("intent_fit_reason", "")),
-                    family_fit_score=family_fit, query_quality_score=quality.score,
-                    subquestion=question, decision_reason="mid_confidence_top3",
-                    choice_candidates=normalized, top_candidates=top_candidates,
-                    domain_support_score=float(top.get("domain_support_score", 0.0)),
-                    ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
-                    negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
-                )
-
         # 7. LLM mode is a last resort signal for orchestration (LLM disabled in live:
         # pipeline converts this to Top-3 or rephrase). Prefer not to reach here.
         llm_candidate_support = (
             top_score >= LLM_SCORE
-            and intent_fit >= INTENT_FIT_LLM_MIN
-            and family_fit >= 0.25
-            and real_evidence >= 0.28
-            and float(top.get("domain_support_score", 0.0)) >= 0.18
+            and intent_fit >= 0.52
+            and family_fit >= 0.30
+            and real_evidence >= 0.40
+            and float(top.get("domain_support_score", 0.0)) >= 0.24
+            and float(top.get("ontology_alignment_score", 0.0)) >= 0.50
+            and (direct_support or lexical >= 0.30)
             and not contradiction
         )
         llm_contrast_safe = (
