@@ -98,14 +98,15 @@ class DecisionPipeline:
                     ids.append(cid)
             if not settings.USER_VISIBLE_TOP3:
                 # A hidden menu must never create a CHOICE trace/state. The user
-                # cannot select something they were not shown; persisting CHOOSING
-                # here desynchronizes the UI and state machine and makes a later
-                # "1" look like an unrelated fresh query.
-                trace.decision = Decision.IGNORE
+                # cannot select something they were not shown. Because this is a
+                # substantive unresolved request, do not silently drop it: use
+                # the standard human fallback instead.
+                trace.decision = Decision.ESCALATE
                 trace.automated = True
                 trace.choice_candidate_ids = None
-                trace.decision_reason = (trace.decision_reason or "") + ";top3_user_output_disabled_silent_abstain"
-                return trace, []
+                trace.escalation_reason = EscalationReason.NO_CATEGORY
+                trace.decision_reason = (trace.decision_reason or "ambiguous") + ";top3_disabled_escalate"
+                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
             trace.decision = Decision.CHOICE
             trace.automated = True
             trace.choice_candidate_ids = ids if len(ids) >= 2 else None
@@ -149,16 +150,18 @@ class DecisionPipeline:
                     ) + ";llm_disabled_safe_top3"
                     return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
 
-            # No routable state means there is no safe user-facing action.
-            # Do not manufacture a rephrase/escalation response for an intent
-            # that the system cannot complete deterministically.
-            trace.decision = Decision.IGNORE
+            # A substantive query that the deterministic system cannot safely
+            # answer must never disappear silently. Escalation is the explicit
+            # fallback for supported-looking / unresolved questions; IGNORE is
+            # reserved for genuine noise handled before routing.
+            trace.decision = Decision.ESCALATE
             trace.automated = True
             trace.llm_used = False
+            trace.escalation_reason = EscalationReason.NO_CATEGORY
             trace.decision_reason = (
                 trace.decision_reason or "supported_intent_needs_llm"
-            ) + ";no_routable_state_silent_abstain"
-            return trace, []
+            ) + ";no_routable_state_escalate"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
             # FUTURE LLM PATH (intentionally disabled for now):
             # result = await self.llm.classify(question, match.relevant_entries)
@@ -181,22 +184,23 @@ class DecisionPipeline:
             match.decision_reason.startswith("oos:")
             or match.decision_reason in {"oos", "oos:no_domain_support", "oos:no_supported_intent"}
         ):
-            # Open-set/OOS is intentionally silent: the bot must not announce
-            # that it can or cannot help with a nearby-but-unsupported topic.
-            trace.decision = Decision.OOS
+            # A substantive message that falls outside the supported intent set
+            # is not user-visible noise. Escalate instead of silently dropping it.
+            # Genuine noise is filtered in decide() before the KB is queried.
+            trace.decision = Decision.ESCALATE
             trace.automated = True
-            trace.decision_reason = (trace.decision_reason or "oos") + ";ignored_out_of_scope"
-            return trace, []
+            trace.escalation_reason = EscalationReason.NO_CATEGORY
+            trace.decision_reason = (trace.decision_reason or "oos") + ";unsupported_question_escalate"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
         if match.mode == MatchMode.NO_MATCH:
-            # NO_MATCH is a silent abstention. We only show Top-3 from explicit
-            # CATEGORY_CHOICE matches, whose options have already passed the
-            # routability/evidence contract. Unknown, nearby or under-specified
-            # requests must not trigger a response or escalation.
-            trace.decision = Decision.IGNORE
+            # Any non-noise substantive query that reaches NO_MATCH must have an
+            # explicit user-facing fallback. Do not silently abandon it.
+            trace.decision = Decision.ESCALATE
             trace.automated = True
-            trace.decision_reason = (trace.decision_reason or "no_match") + ";silent_abstain"
-            return trace, []
+            trace.escalation_reason = EscalationReason.NO_CATEGORY
+            trace.decision_reason = (trace.decision_reason or "no_match") + ";no_safe_answer_escalate"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
         trace.decision = Decision.ESCALATE
         trace.escalation_reason = EscalationReason.NO_CATEGORY

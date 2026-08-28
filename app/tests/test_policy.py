@@ -1,6 +1,7 @@
 import asyncio
 from app.application.decision_pipeline import DecisionPipeline
 from app.domain.models import InboundMessage
+from app.domain.enums import EscalationReason
 from app.domain.enums import Channel, Decision
 from app.infrastructure.ai.knowledge_base import MatchMode, MatchResult
 
@@ -61,7 +62,7 @@ def test_meta_noise_produces_no_reply():
     assert result.actions == []
 
 
-def test_top3_output_is_disabled_by_default(monkeypatch):
+def test_top3_output_disabled_escalates_substantive_ambiguity(monkeypatch):
     from app.application import decision_pipeline as module
     monkeypatch.setattr(module.settings, "USER_VISIBLE_TOP3", False)
 
@@ -76,9 +77,9 @@ def test_top3_output_is_disabled_by_default(monkeypatch):
         decision_reason="ambiguous", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
-    assert trace.decision.value == 'ignore'
-    assert actions == []
-
+    assert trace.decision.value == 'escalate'
+    assert trace.escalation_reason == EscalationReason.NO_CATEGORY
+    assert actions and actions[0].escalate is True
 
 def test_llm_route_never_calls_llm_even_if_config_is_misconfigured(monkeypatch):
     from app.application import decision_pipeline as module
@@ -141,7 +142,7 @@ def test_llm_route_is_converted_to_top3_without_calling_llm(monkeypatch):
     assert "3. Вариант 3" in actions[0].text
 
 
-def test_llm_route_falls_back_to_rephrase_when_no_safe_top3(monkeypatch):
+def test_llm_route_escalates_when_no_safe_top3(monkeypatch):
     from app.application import decision_pipeline as module
     monkeypatch.setattr(module.settings, "LLM_ENABLED", False)
 
@@ -160,9 +161,10 @@ def test_llm_route_falls_back_to_rephrase_when_no_safe_top3(monkeypatch):
         decision_reason="supported_intent_needs_llm", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
-    assert trace.decision == Decision.IGNORE
+    assert trace.decision == Decision.ESCALATE
     assert trace.llm_used is False
-    assert actions == []
+    assert trace.escalation_reason == EscalationReason.NO_CATEGORY
+    assert actions and actions[0].escalate is True
 
 
 def test_trace_preserves_all_quality_metrics():
@@ -214,7 +216,7 @@ def test_trace_preserves_all_quality_metrics():
     assert trace.contrastive_reason == "positive_vs_negative"
 
 
-def test_oos_decision_produces_oos_reply():
+def test_oos_decision_escalates_for_substantive_message():
     import asyncio
     from app.application.decision_pipeline import DecisionPipeline
     from app.domain.enums import Decision
@@ -228,14 +230,16 @@ def test_oos_decision_produces_oos_reply():
 
     pipeline = DecisionPipeline(FakeKB(), object())
     result = asyncio.run(pipeline.decide(InboundMessage("e","k","t","c",Channel.CONVERSATION,"Как оформить налоговый вычет?")))
-    assert result.traces[0].decision == Decision.OOS
-    assert result.actions == []
+    assert result.traces[0].decision == Decision.ESCALATE
+    assert result.traces[0].escalation_reason == EscalationReason.NO_CATEGORY
+    assert result.actions and result.actions[0].escalate is True
+    assert "передан оператору" in result.actions[0].text.lower()
 
 
 def test_standalone_one_word_is_ignored_but_operator_is_not():
     import asyncio
     from app.application.decision_pipeline import DecisionPipeline
-    from app.domain.enums import Decision, Channel
+    from app.domain.enums import Decision, Channel, EscalationReason
     from app.domain.models import InboundMessage
 
     class FakeKB:
