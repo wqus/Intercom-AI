@@ -24,6 +24,19 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not settings.DRY_RUN:
+        missing = [
+            name for name, value in {
+                "INTERCOM_TOKEN": settings.INTERCOM_TOKEN,
+                "INTERCOM_ADMIN_ID": settings.INTERCOM_ADMIN_ID,
+                "INTERCOM_CLIENT_SECRET": settings.INTERCOM_CLIENT_SECRET,
+            }.items()
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                "Live mode requires Intercom configuration: " + ", ".join(missing)
+            )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await ensure_schema(engine)
@@ -41,7 +54,7 @@ async def lifespan(app: FastAPI):
             "Authorization": f"Bearer {settings.INTERCOM_TOKEN}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Intercom-Version": "2.15",
+            "Intercom-Version": "2.16",
         },
     )
     telegram_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
