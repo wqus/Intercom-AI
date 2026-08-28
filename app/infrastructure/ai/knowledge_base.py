@@ -51,6 +51,13 @@ ONTOLOGY_ALIGNMENT_MIN = 0.60
 ONTOLOGY_HARD_MISMATCH = 0.25
 NEGATIVE_CONTRAST_MIN = 0.015
 NEGATIVE_CONTRAST_UNSAFE = -0.015
+# Semantic similarity to a category's negative examples is a veto only when
+# affirmative intent evidence is weak. Negative examples are often semantically
+# close to the positive intent by design (e.g. "как записаться" vs "не могу
+# записаться"), so a negative-contrast signal must not override a direct positive
+# intent signal.
+NEGATIVE_VETO_MIN_INTENT_FIT = 0.58
+NEGATIVE_VETO_MIN_REAL_EVIDENCE = 0.40
 MIN_EXPLICIT_SUPPORT_FOR_NONHARD = 0.42
 MIN_DOMAIN_SUPPORT_FOR_AUTO = 0.34
 
@@ -1047,18 +1054,6 @@ class KnowledgeBase:
     @staticmethod
     def _query_ontology(question: str) -> dict[str, set[str]]:
         q = normalize_light(question)
-        # Match against a stemmed projection of the query so that Russian case
-        # inflection ("школа" / "школы" / "школе" / "школу") does not hide an
-        # object/facet from the ontology extractor. Plain substring matching on
-        # `q` previously only matched the nominative singular form, which is
-        # rare in real user messages (most write oblique cases), silently
-        # dropping the "object" signal and causing false ontology mismatches
-        # downstream (object_mismatch / unsupported_object).
-        stemmed_q = " ".join(light_stem(t) for t in q.split())
-
-        def _stem_phrase(phrase: str) -> str:
-            return " ".join(light_stem(t) for t in normalize_light(phrase).split())
-
         out = {"domain": set(), "object": set(), "action": set(), "state": set(), "facet": set()}
         patterns = {
             "price": ("сколько стоит", "стоимость", "цена", "платно", "платное", "платить", "бесплатно", "обойдется", "обойдётся"),
@@ -1093,7 +1088,7 @@ class KnowledgeBase:
             out["state"].add("intent")
 
         for key, vals in patterns.items():
-            if any(v in q or _stem_phrase(v) in stemmed_q for v in vals):
+            if any(v in q for v in vals):
                 target = "facet" if key in {"price", "date", "duration", "age", "registration", "technical_failure", "verification", "access"} else "object"
                 out[target].add(key)
         if out["object"]:
@@ -1258,6 +1253,54 @@ class KnowledgeBase:
             return any(token.startswith(("поток", "потоков")) for token in tokens)
 
         # ----------------------------------------------------
+        # High-signal support/payment/account intents.
+        # These are action/state rules, not topic-word rules: they fire only
+        # when the defining user operation is explicit.
+        # ----------------------------------------------------
+        recurring_charge = (
+            has_any("списыв", "списыва", "списание", "списания")
+            or has_phrase("каждый месяц списывают", "регулярно списывают", "повторно списали")
+        ) and has_any("карт", "деньг", "руб", "оплат", "плат")
+        if recurring_charge and not has_any("аренд", "обучен"):
+            return "kb_011"
+
+        # Support-process questions are about how/where to contact a curator or
+        # how support should perform an already-requested administrative action.
+        support_process = (
+            has_phrase(
+                "где найти куратора", "как обратиться к куратору",
+                "как обратиться к поддержке", "как выйти через куратора",
+                "куратор уже знает", "удалите в приложении",
+                "удалите меня в приложении", "куратор сказал обратиться в поддержку",
+            )
+        )
+        if support_process:
+            return "kb_022"
+
+        # Feedback/reporting is a distinct intent from a technical failure: the
+        # user asks to correct content or reports a problem with published information.
+        feedback_signal = (
+            has_any("исправ", "корректиров", "неверн", "ошибк")
+            and has_any("описани", "информац", "видео", "контент", "данн")
+        )
+        if feedback_signal:
+            return "kb_031"
+
+        # Explicit event attendance/access questions should not be pulled into
+        # generic school/registration intents.
+        if (
+            has_any("мероприят")
+            and has_any("прийти", "посет", "участв", "формат", "онлайн")
+            and not has_any("запис", "регистра", "инвайт", "qr")
+        ):
+            return "kb_045"
+
+        # Registration with mismatched account identity is a specific account
+        # state, not generic phone verification.
+        if has_any("несоответ", "не совпада", "разн") and has_any("номер", "телефон", "телеграм", "аккаунт"):
+            return "kb_026"
+
+        # ----------------------------------------------------
         # School lifecycle: the most important conflict group.
         # ----------------------------------------------------
         explicit_transfer = (
@@ -1346,6 +1389,21 @@ class KnowledgeBase:
         )
         retry_signal = mentor and has_any("повтор", "снов", "отказ", "отклон")
         program_signal = mentor and has_any("программ", "наставничеств")
+
+        # Asking how to get an assigned mentor is different from asking about
+        # the mentorship programme itself or becoming a mentor.
+        mentor_enrolment = mentor and (
+            has_phrase(
+                "как записаться к наставнику", "как записаться к ментору",
+                "записаться к наставнику", "записаться к ментору",
+                "как попасть к наставнику", "как попасть к ментору",
+                "как осуществляется запись к наставнику",
+                "хочу записаться к наставнику",
+            )
+            or (has_any("запис", "попаст") and has_any("настав", "ментор"))
+        )
+        if mentor_enrolment and not wants_to_become and not program_signal and not retry_signal:
+            return "kb_042"
 
         # This is intentionally before the quality gate in match():
         # short requests such as «Хочу стать наставником» are valid.
@@ -1693,36 +1751,12 @@ class KnowledgeBase:
         ontology = entry.get("ontology") or self._derive_ontology(entry)
         checks: list[tuple[str, float, str]] = []
 
-        # The entry-side vocabulary (built from `intent_type` via
-        # _derive_ontology) and the query-side vocabulary (built from the
-        # `patterns` dict in _query_ontology) evolved independently and use
-        # different labels for the same underlying concept in a handful of
-        # cases (e.g. entries say "school"/"schools"/"education", the query
-        # extractor says "training"; entries say "mentor_role", the query
-        # extractor says "mentor"/"personal_mentor"). Without normalizing
-        # both sides onto one canonical vocabulary, these dimensions are
-        # compared as a hard mismatch even when they refer to the same thing,
-        # which previously produced false object_mismatch / wrong_entity
-        # rejections for otherwise-correct top candidates.
-        object_aliases = {
-            "school": "training",
-            "schools": "training",
-            "education": "training",
-            "education_admin": "training",
-            "mentor_role": "mentor",
-            "personal_mentor": "mentor",
-        }
-
-        def _canon(dim: str, value: str) -> str:
-            return object_aliases.get(value, value) if dim == "object" else value
-
         dimensions = ("object", "action", "state", "facet")
         for dim in dimensions:
-            q_values = {_canon(dim, v) for v in (qo.get(dim) or set())}
+            q_values = qo.get(dim) or set()
             c_value = ontology.get(dim)
             if not q_values or not c_value:
                 continue
-            c_value = _canon(dim, c_value)
             if c_value in q_values:
                 checks.append((dim, 1.0, "match"))
             else:
@@ -1896,7 +1930,16 @@ class KnowledgeBase:
                 return "wrong_entity"
 
         if contrast <= NEGATIVE_CONTRAST_UNSAFE:
-            return "negative_evidence_dominates"
+            # A negative example can be semantically close even when the user
+            # explicitly expresses the candidate intent. Do not let semantic
+            # negative contrast veto a candidate that has strong affirmative
+            # lexical/contract evidence. This specifically protects long queries
+            # where a single positive clause is surrounded by explanatory text.
+            positive_hits = bool(top.get("positive_hits") or top.get("intent_signal_positive_hits"))
+            intent_fit = float(top.get("intent_fit_score", 0.0))
+            real_evidence = float(top.get("real_intent_evidence", 0.0))
+            if not (positive_hits and intent_fit >= NEGATIVE_VETO_MIN_INTENT_FIT and real_evidence >= NEGATIVE_VETO_MIN_REAL_EVIDENCE):
+                return "negative_evidence_dominates"
 
         if not direct and domain_support < MIN_DOMAIN_SUPPORT_FOR_AUTO and alignment < ONTOLOGY_ALIGNMENT_MIN:
             return "insufficient_domain_support"
@@ -3304,6 +3347,12 @@ class KnowledgeBase:
             if score < 0.30:
                 continue
             if fit < CATEGORY_CHOICE_MIN_INTENT_FIT and score < 0.50:
+                continue
+            # A Top-3 option should be defensible as an intent, not merely
+            # semantically related. Generic family neighbours (e.g. broad
+            # school-info) otherwise crowd out the actual user intent.
+            real_ev = float(item.get("real_intent_evidence", 0.0))
+            if real_ev < 0.24 and not item.get("direct_support") and score < 0.55:
                 continue
             if float(item.get("real_intent_evidence", 0.0)) < CATEGORY_CHOICE_MIN_REAL_EVIDENCE and not item.get("direct_support"):
                 if score < 0.45:

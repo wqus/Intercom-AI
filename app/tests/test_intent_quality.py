@@ -425,3 +425,27 @@ def test_category_choice_candidates_drop_unproven_contracts():
     # The public selector must never expose a candidate whose own contract is not proven.
     choices = kb._category_choice_candidates(ranked)
     assert choices == []
+
+
+def test_high_signal_recurring_charge_routes_to_payment():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries_by_id = {"kb_011": {"id": "kb_011", "priority": 90}}
+    assert kb._hard_rule_match("Добрый день, как отменить списания по карте?") == "kb_011"
+
+
+def test_high_signal_mentor_enrolment_routes_to_become_mentee():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries_by_id = {"kb_042": {"id": "kb_042", "priority": 100}}
+    assert kb._hard_rule_match("Как осуществляется запись к наставнику?") == "kb_042"
+
+
+def test_support_process_does_not_require_generic_semantic_match():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries_by_id = {"kb_022": {"id": "kb_022", "priority": 100}}
+    assert kb._hard_rule_match("где найти куратора") == "kb_022"
+
+
+def test_content_correction_routes_to_feedback():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.entries_by_id = {"kb_031": {"id": "kb_031", "priority": 90}}
+    assert kb._hard_rule_match("Период прохождения школы в описании не верный, внесите корректировку") == "kb_031"
