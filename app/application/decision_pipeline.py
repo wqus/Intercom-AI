@@ -93,11 +93,17 @@ class DecisionPipeline:
                 label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "").strip()
                 cid = str(c.get("kb_id") or "").strip()
                 answer = str(c.get("template_answer") or "").strip()
+                category = str(c.get("category") or "").strip()
                 if not label or not cid or not answer:
                     continue
                 labels.append(label)
                 ids.append(cid)
-                safe_candidates.append({"kb_id": cid, "label": label, "answer": answer})
+                safe_candidates.append({
+                    "kb_id": cid,
+                    "label": label,
+                    "category": category,
+                    "answer": answer,
+                })
             if not settings.USER_VISIBLE_TOP3:
                 # A hidden menu must never create a CHOICE trace/state. The user
                 # cannot select something they were not shown. Because this is a
@@ -140,11 +146,17 @@ class DecisionPipeline:
                     label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "").strip()
                     cid = str(c.get("kb_id") or "").strip()
                     answer = str(c.get("template_answer") or "").strip()
+                    category = str(c.get("category") or "").strip()
                     if not label or not cid or not answer:
                         continue
                     labels.append(label)
                     ids.append(cid)
-                    safe_candidates.append({"kb_id": cid, "label": label, "answer": answer})
+                    safe_candidates.append({
+                        "kb_id": cid,
+                        "label": label,
+                        "category": category,
+                        "answer": answer,
+                    })
                 if len(labels) >= 2 and settings.USER_VISIBLE_TOP3:
                     trace.decision = Decision.CHOICE
                     trace.automated = True

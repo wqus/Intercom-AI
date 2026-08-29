@@ -74,3 +74,68 @@ def test_attachments_belong_only_to_current_source_message():
     assert msg is not None
     assert msg.text == "Спасибо"
     assert msg.has_attachments is False
+
+
+
+def test_conversation_user_replied_does_not_reuse_history_when_source_is_admin():
+    payload = {
+        "id": "evt-admin-with-history",
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "conv-history-race",
+            "source": {
+                "body": "Ботское/операторское сообщение",
+                "author": {"type": "admin", "name": "Operator"},
+                "created_at": "300",
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"body": "Старый вопрос пользователя", "author": {"type": "user"}, "created_at": "200"},
+            ]},
+        }},
+    }
+    assert parse(payload) is None
+
+
+def test_event_key_is_stable_for_same_intercom_message_across_webhook_ids():
+    base = {
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "conv-dedupe",
+            "source": {
+                "id": "message-42",
+                "body": "1",
+                "author": {"type": "user", "name": "Ben"},
+                "created_at": "300",
+            },
+            "conversation_parts": {"conversation_parts": []},
+        }},
+    }
+    first = dict(base, id="webhook-1")
+    second = dict(base, id="webhook-2")
+    assert parse(first).event_key == parse(second).event_key
+    assert parse(first).event_key.endswith(":message:message-42")
+
+
+def test_event_key_uses_part_id_when_selected_message_is_history_entry():
+    payload = {
+        "id": "webhook-history",
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "conv-dedupe-history",
+            "source": {
+                "id": "source-admin",
+                "body": "operator",
+                "author": {"type": "admin"},
+                "created_at": "400",
+            },
+            "conversation_parts": {"conversation_parts": [
+                {
+                    "id": "user-part-9",
+                    "body": "старое",
+                    "author": {"type": "user"},
+                    "created_at": "300",
+                }
+            ]},
+        }},
+    }
+    assert parse(payload) is None
