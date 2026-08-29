@@ -3551,6 +3551,7 @@ class KnowledgeBase:
         return {
             "kb_id": str(entry["id"]),
             "choice_label": str(entry.get("choice_label") or entry.get("category") or entry["id"]),
+            "template_answer": str(entry.get("template_answer") or ""),
             "category": str(entry.get("category") or ""),
             "score": float(item.get("final_score", 0.0)),
             "ranking_score": float(item.get("ranking_score", item.get("final_score", 0.0))),

@@ -109,8 +109,8 @@ def test_top3_is_user_visible_when_enabled(monkeypatch):
         None,
         [],
         choice_candidates=[
-            {"kb_id": "a", "choice_label": "Вариант A"},
-            {"kb_id": "b", "choice_label": "Вариант B"},
+            {"kb_id": "a", "choice_label": "Вариант A", "template_answer": "Ответ A"},
+            {"kb_id": "b", "choice_label": "Вариант B", "template_answer": "Ответ B"},
         ],
         decision_reason="ambiguous",
         subquestion="q",

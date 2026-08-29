@@ -86,16 +86,18 @@ class DecisionPipeline:
             cands = list(match.choice_candidates or []) or list(getattr(match, "top_candidates", None) or [])
             labels = []
             ids = []
+            safe_candidates = []
             for c in cands[:3]:
                 if not isinstance(c, dict):
                     continue
-                label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "")
-                cid = str(c.get("kb_id") or "")
-                if not label:
+                label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "").strip()
+                cid = str(c.get("kb_id") or "").strip()
+                answer = str(c.get("template_answer") or "").strip()
+                if not label or not cid or not answer:
                     continue
                 labels.append(label)
-                if cid:
-                    ids.append(cid)
+                ids.append(cid)
+                safe_candidates.append({"kb_id": cid, "label": label, "answer": answer})
             if not settings.USER_VISIBLE_TOP3:
                 # A hidden menu must never create a CHOICE trace/state. The user
                 # cannot select something they were not shown. Because this is a
@@ -110,6 +112,7 @@ class DecisionPipeline:
             trace.decision = Decision.CHOICE
             trace.automated = True
             trace.choice_candidate_ids = ids if len(ids) >= 2 else None
+            trace.choice_candidates = safe_candidates if len(safe_candidates) >= 2 else None
             if len(labels) < 2:
                 trace.decision = Decision.REPHRASE
                 return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
@@ -130,21 +133,24 @@ class DecisionPipeline:
             if len(candidates) >= 2:
                 labels = []
                 ids = []
+                safe_candidates = []
                 for c in candidates[:3]:
                     if not isinstance(c, dict):
                         continue
-                    label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "")
-                    cid = str(c.get("kb_id") or "")
-                    if not label:
+                    label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "").strip()
+                    cid = str(c.get("kb_id") or "").strip()
+                    answer = str(c.get("template_answer") or "").strip()
+                    if not label or not cid or not answer:
                         continue
                     labels.append(label)
-                    if cid:
-                        ids.append(cid)
+                    ids.append(cid)
+                    safe_candidates.append({"kb_id": cid, "label": label, "answer": answer})
                 if len(labels) >= 2 and settings.USER_VISIBLE_TOP3:
                     trace.decision = Decision.CHOICE
                     trace.automated = True
                     trace.llm_used = False
                     trace.choice_candidate_ids = ids if len(ids) >= 2 else None
+                    trace.choice_candidates = safe_candidates if len(safe_candidates) >= 2 else None
                     trace.decision_reason = (
                         trace.decision_reason or "supported_intent_needs_llm"
                     ) + ";llm_disabled_safe_top3"

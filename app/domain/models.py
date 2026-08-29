@@ -44,6 +44,7 @@ class DecisionTrace:
     contrastive_competitor_id: str | None = None
     contrastive_reason: str = ""
     choice_candidate_ids: list[str] | None = None
+    choice_candidates: list[dict[str, Any]] | None = None
 
 @dataclass(slots=True)
 class OutboundAction:

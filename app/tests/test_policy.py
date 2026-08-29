@@ -73,7 +73,7 @@ def test_top3_output_disabled_escalates_substantive_ambiguity(monkeypatch):
     pipeline = DecisionPipeline(FakeKB(), FakeLLM())
     match = MatchResult(
         MatchMode.CATEGORY_CHOICE, 0.8, "Cat A", None, None, [],
-        choice_candidates=[{"kb_id":"a","choice_label":"A"},{"kb_id":"b","choice_label":"B"}],
+        choice_candidates=[{"kb_id":"a","choice_label":"A","template_answer":"A answer"},{"kb_id":"b","choice_label":"B","template_answer":"B answer"}],
         decision_reason="ambiguous", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
@@ -89,9 +89,9 @@ def test_llm_route_never_calls_llm_even_if_config_is_misconfigured(monkeypatch):
     class FakeKB:
         def get_category_choice_candidates(self, q, top_n=3):
             return [
-                {"kb_id":"kb_1", "choice_label":"Вариант 1"},
-                {"kb_id":"kb_2", "choice_label":"Вариант 2"},
-                {"kb_id":"kb_3", "choice_label":"Вариант 3"},
+                {"kb_id":"kb_1", "choice_label":"Вариант 1", "template_answer":"Ответ 1"},
+                {"kb_id":"kb_2", "choice_label":"Вариант 2", "template_answer":"Ответ 2"},
+                {"kb_id":"kb_3", "choice_label":"Вариант 3", "template_answer":"Ответ 3"},
             ]
 
     class NeverCallLLM:
@@ -118,9 +118,9 @@ def test_llm_route_is_converted_to_top3_without_calling_llm(monkeypatch):
     class FakeKB:
         def get_category_choice_candidates(self, q, top_n=3):
             return [
-                {"kb_id":"kb_1", "choice_label":"Вариант 1"},
-                {"kb_id":"kb_2", "choice_label":"Вариант 2"},
-                {"kb_id":"kb_3", "choice_label":"Вариант 3"},
+                {"kb_id":"kb_1", "choice_label":"Вариант 1", "template_answer":"Ответ 1"},
+                {"kb_id":"kb_2", "choice_label":"Вариант 2", "template_answer":"Ответ 2"},
+                {"kb_id":"kb_3", "choice_label":"Вариант 3", "template_answer":"Ответ 3"},
             ]
 
     class NeverCallLLM:

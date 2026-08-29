@@ -368,60 +368,65 @@ class SupportApplication:
             if governing_trace is None or _STATE_PRIORITY[trace.decision] > _STATE_PRIORITY[governing_trace.decision]:
                 governing_trace = trace
 
+        choice_state_persisted = False
         if governing_trace is not None:
             trace = governing_trace
             if trace.decision == Decision.CHOICE:
-                try:
-                    # MUST persist the same ids that were shown to the user.
-                    # Re-running get_category_choice_candidates(question) can return a
-                    # different set (or empty) and then CHOOSING is never saved —
-                    # user replies "1" and falls through to normal match → escalate.
-                    ids = list(getattr(trace, "choice_candidate_ids", None) or [])
-                    if len(ids) < 2:
-                        candidates = self.pipeline.kb.get_category_choice_candidates(trace.question)
-                        ids = [str(x["kb_id"]) for x in candidates if x.get("kb_id")]
-                    if len(ids) >= 2:
-                        snapshots = []
-                        for cid in ids:
-                            entry = self.pipeline.kb.get_by_id(cid) or {}
-                            snapshots.append({
-                                "kb_id": cid,
-                                "label": str(entry.get("choice_label") or entry.get("category") or cid),
-                                "answer": str(entry.get("template_answer") or ""),
-                            })
-                        if any(not item["answer"] for item in snapshots):
-                            logger.warning(
-                                "choice_state_not_saved | entity=%s | non-routable candidate",
-                                message.entity_id,
-                            )
-                        else:
-                            await states.replace(message.entity_id, ConversationStateKind.CHOOSING, {
-                                "candidate_ids": ids,
-                                "candidates": snapshots,
-                                "attempts": 0,
-                                "original_question": trace.question,
-                            })
-                            logger.info(
-                                "choice_state_saved | entity=%s | candidate_ids=%s",
-                                message.entity_id,
-                                ids,
-                            )
-                        logger.info(
-                            "choice_state_saved | entity=%s | candidate_ids=%s",
-                            message.entity_id,
-                            ids,
-                        )
-                    else:
-                        logger.warning(
-                            "choice_state_not_saved | entity=%s | no candidate ids",
-                            message.entity_id,
-                        )
-                except Exception:
-                    logger.exception("Failed to persist category choice state")
+                # Hard invariant: a user-visible numbered menu is valid only when
+                # the exact candidate IDs + answer snapshots are durably persisted
+                # before the reply enters the outbox. Never send an unresolvable menu.
+                ids = [str(x).strip() for x in (getattr(trace, "choice_candidate_ids", None) or []) if str(x).strip()]
+                raw_candidates = list(getattr(trace, "choice_candidates", None) or [])
+
+                if len(raw_candidates) < 2 and len(ids) >= 2:
+                    # Defensive compatibility for traces created by an older build.
+                    # Reconstruct only from the known IDs and validate every candidate.
+                    raw_candidates = []
+                    for cid in ids[:3]:
+                        entry = self.pipeline.kb.get_by_id(cid) or {}
+                        label = str(entry.get("choice_label") or entry.get("category") or cid).strip()
+                        answer = str(entry.get("template_answer") or "").strip()
+                        if label and answer:
+                            raw_candidates.append({"kb_id": cid, "label": label, "answer": answer})
+
+                normalized = []
+                seen_ids: set[str] = set()
+                for item in raw_candidates[:3]:
+                    if not isinstance(item, dict):
+                        continue
+                    cid = str(item.get("kb_id") or "").strip()
+                    label = str(item.get("label") or item.get("choice_label") or cid).strip()
+                    answer = str(item.get("answer") or item.get("template_answer") or "").strip()
+                    if not cid or not label or not answer or cid in seen_ids:
+                        continue
+                    normalized.append({"kb_id": cid, "label": label, "answer": answer})
+                    seen_ids.add(cid)
+
+                if len(normalized) < 2:
+                    logger.error(
+                        "choice_state_invalid | entity=%s | ids=%s | candidates=%r",
+                        message.entity_id, ids, raw_candidates,
+                    )
+                    # Do not send the invalid menu. This is a substantive unresolved
+                    # query, so use the normal human fallback instead.
+                    await self._escalate(
+                        session, message, event, EscalationReason.NO_CATEGORY,
+                    )
+                    return
+
+                ids = [item["kb_id"] for item in normalized]
+                await states.replace(message.entity_id, ConversationStateKind.CHOOSING, {
+                    "candidate_ids": ids,
+                    "candidates": normalized,
+                    "attempts": 0,
+                    "original_question": trace.question,
+                })
+                choice_state_persisted = True
+                logger.info(
+                    "choice_state_saved | entity=%s | candidate_ids=%s | snapshot_size=%d",
+                    message.entity_id, ids, len(normalized),
+                )
             else:
-                # The first clarification/rephrase response starts the counter at 1.
-                # When this happens while already waiting for clarification, advance
-                # the counter rather than resetting it back to 1.
                 attempts = current_attempts + 1 if current_state in _CLARIFICATION_STATES else 1
                 if trace.decision == Decision.CLARIFY and trace.kb_id:
                     await states.replace(message.entity_id, ConversationStateKind.CLARIFYING, {
@@ -434,6 +439,16 @@ class SupportApplication:
                         "attempts": attempts,
                         "original_question": trace.question,
                     })
+
+        if any(t.decision == Decision.CHOICE for t in result.traces) and not choice_state_persisted:
+            # Defensive final gate: never allow a Choice action into the outbox unless
+            # CHOOSING state has been persisted in this very transaction. If persistence
+            # itself failed, the exception propagates and EventWorker retries the event.
+            logger.error(
+                "choice_state_missing_before_send | entity=%s | event=%s",
+                message.entity_id, event.id,
+            )
+            raise RuntimeError("Top-3 state was not persisted before sending choice")
 
         # Escalation is persisted BEFORE Telegram notification but in the same database
         # transaction. That guarantees future events stop at the blocklist once the

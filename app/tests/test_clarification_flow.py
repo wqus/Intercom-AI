@@ -1,7 +1,7 @@
 import asyncio
 
 from app.application.support_service import SupportApplication
-from app.domain.enums import Channel, ConversationStateKind, Decision
+from app.domain.enums import Channel, ConversationStateKind, Decision, EscalationReason
 from app.domain.models import InboundMessage, ProcessingResult, DecisionTrace, OutboundAction
 
 
@@ -293,3 +293,145 @@ def test_choice_invalid_free_text_does_not_auto_escalate(monkeypatch):
     assert FakeStates.instances.state == ConversationStateKind.IDLE
     assert FakeStates.instances.data == {}
 
+
+
+def test_top3_round_trip_always_resolves_numeric_choice(monkeypatch):
+    """The exact user-visible Top-3 must survive one full two-event round trip."""
+    install_repos(monkeypatch, (ConversationStateKind.IDLE, {}))
+
+    class KB:
+        def get_by_id(self, kb_id):
+            return {
+                "id": kb_id,
+                "choice_label": {"kb_a": "Вариант A", "kb_b": "Вариант B"}[kb_id],
+                "template_answer": {"kb_a": "ANSWER A", "kb_b": "ANSWER B"}[kb_id],
+            }
+
+        def parse_category_choice(self, text, max_index):
+            return [int(text)] if text in {"1", "2"} and int(text) <= max_index else []
+
+    first = ProcessingResult(
+        traces=[DecisionTrace(
+            decision=Decision.CHOICE,
+            question="исходный вопрос",
+            choice_candidate_ids=["kb_a", "kb_b"],
+            choice_candidates=[
+                {"kb_id": "kb_a", "label": "Вариант A", "answer": "ANSWER A"},
+                {"kb_id": "kb_b", "label": "Вариант B", "answer": "ANSWER B"},
+            ],
+        )],
+        actions=[OutboundAction("reply", "MENU")],
+    )
+
+    class Pipeline:
+        kb = KB()
+        def __init__(self): self.calls = 0
+        async def decide(self, message):
+            self.calls += 1
+            if self.calls == 1:
+                return first
+            raise AssertionError("numeric choice must be consumed by CHOOSING state")
+
+    class Event: id = 777
+
+    outbox = FakeOutbox()
+    pipeline = Pipeline()
+    app = SupportApplication(pipeline, FakeIntercom(), None, outbox)
+    initial = InboundMessage("e1", "k1", "topic", "c", Channel.CONVERSATION, "исходный вопрос")
+    asyncio.run(app.handle(object(), Event(), initial))
+
+    assert FakeStates.instances.state == ConversationStateKind.CHOOSING
+    assert FakeStates.instances.data["candidate_ids"] == ["kb_a", "kb_b"]
+    assert [x["answer"] for x in FakeStates.instances.data["candidates"]] == ["ANSWER A", "ANSWER B"]
+    assert any(a["payload"]["text"] == "MENU" for a in outbox.actions)
+
+    choice = InboundMessage("e2", "k2", "topic", "c", Channel.CONVERSATION, "2")
+    asyncio.run(app.handle(object(), Event(), choice))
+
+    assert FakeStates.instances.state == ConversationStateKind.IDLE
+    assert any("ANSWER B" in a["payload"]["text"] for a in outbox.actions)
+
+
+def test_top3_is_never_sent_when_choice_state_cannot_be_persisted(monkeypatch):
+    install_repos(monkeypatch, (ConversationStateKind.IDLE, {}))
+
+    class FailingStates(FakeStates):
+        async def replace(self, entity_id, state, data):
+            raise RuntimeError("db write failed")
+
+    import app.application.support_service as module
+    monkeypatch.setattr(module, "StateRepository", FailingStates)
+    monkeypatch.setattr(module, "EscalatedConversationRepository", FakeEscalations)
+
+    class KB:
+        def get_by_id(self, kb_id):
+            return {"id": kb_id, "choice_label": kb_id, "template_answer": "ANSWER"}
+
+    class Pipeline:
+        kb = KB()
+        async def decide(self, message):
+            return ProcessingResult(
+                traces=[DecisionTrace(
+                    decision=Decision.CHOICE, question=message.text,
+                    choice_candidate_ids=["a", "b"],
+                    choice_candidates=[
+                        {"kb_id": "a", "label": "A", "answer": "ANSWER A"},
+                        {"kb_id": "b", "label": "B", "answer": "ANSWER B"},
+                    ],
+                )],
+                actions=[OutboundAction("reply", "MENU")],
+            )
+
+    outbox = FakeOutbox()
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, outbox)
+    message = InboundMessage("e", "k", "topic", "c", Channel.CONVERSATION, "вопрос")
+    class Event: id = 778
+
+    try:
+        asyncio.run(app.handle(object(), Event(), message))
+        assert False, "state persistence failure must propagate"
+    except RuntimeError as exc:
+        assert "db write failed" in str(exc)
+    assert not any(a["payload"]["text"] == "MENU" for a in outbox.actions)
+
+
+def test_top3_plus_same_turn_escalation_never_sends_unresolvable_menu(monkeypatch):
+    install_repos(monkeypatch, (ConversationStateKind.IDLE, {}))
+
+    class Pipeline:
+        class KB:
+            def get_by_id(self, kb_id):
+                return {"id": kb_id, "choice_label": kb_id, "template_answer": "ANSWER"}
+        kb = KB()
+        async def decide(self, message):
+            return ProcessingResult(
+                traces=[
+                    DecisionTrace(
+                        decision=Decision.CHOICE, question="q1",
+                        choice_candidate_ids=["a", "b"],
+                        choice_candidates=[
+                            {"kb_id": "a", "label": "A", "answer": "A"},
+                            {"kb_id": "b", "label": "B", "answer": "B"},
+                        ],
+                    ),
+                    DecisionTrace(
+                        decision=Decision.ESCALATE, question="q2",
+                        escalation_reason=EscalationReason.NO_CATEGORY,
+                    ),
+                ],
+                actions=[
+                    OutboundAction("reply", "MENU"),
+                    OutboundAction("reply", "ESC", True),
+                ],
+            )
+
+    outbox = FakeOutbox()
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, outbox)
+    msg = InboundMessage("e", "k", "topic", "c", Channel.CONVERSATION, "два вопроса")
+    class Event: id = 779
+    asyncio.run(app.handle(object(), Event(), msg))
+
+    texts = [a["payload"]["text"] for a in outbox.actions if a["action_type"] == "intercom_reply"]
+    assert texts
+    assert all("MENU" not in text for text in texts)
+    assert FakeStates.instances.state == ConversationStateKind.ESCALATED
