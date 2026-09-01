@@ -1,6 +1,8 @@
 # Direct runtime dependencies for Intercom AI.
 # Keep this file intentionally small. Transitive dependencies are resolved by pip.
-# ML inference is CPU-only in this service; torch is pinned explicitly for reproducibility.
+# ML inference is CPU-only in this service; use the official CPU wheel index
+# so Docker does not pull the multi-GB CUDA runtime into a CPU container.
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 fastapi==0.138.0
 uvicorn==0.49.0
@@ -13,6 +15,6 @@ python-dotenv==1.2.2
 numpy==2.5.2
 RapidFuzz==3.14.5
 sentence-transformers==5.7.0
-torch==2.13.0
+torch==2.13.0+cpu
 
 openai==2.43.0

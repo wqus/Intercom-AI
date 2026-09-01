@@ -38,3 +38,12 @@ def test_outbound_action_table_is_registered_and_unique():
     assert "status" in table.c
 
 
+
+
+def test_cpu_only_torch_dependency_is_pinned_for_production():
+    from pathlib import Path
+
+    requirements = (Path(__file__).resolve().parents[2] / "requirements.txt").read_text(encoding="utf-8")
+    assert "--extra-index-url https://download.pytorch.org/whl/cpu" in requirements
+    assert "torch==2.13.0+cpu" in requirements
+    assert "torch==2.13.0\n" not in requirements
