@@ -76,6 +76,6 @@ async def lifespan(app: FastAPI):
     await telegram_client.aclose()
     await engine.dispose()
 
-app=FastAPI(title="Terra Intercom AI Support v20 Production", lifespan=lifespan)
+app=FastAPI(title="Terra Intercom AI Support v22.11 Production", lifespan=lifespan)
 app.include_router(webhook_router)
 

@@ -17,7 +17,7 @@ def verify_signature(body: bytes, signature: str) -> bool:
 def _strip(value: str) -> str:
     return re.sub(r"<[^>]+>", "", value or "").strip()
 
-def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,str] | None:
+def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     item = payload.get("data", {}).get("item", {}) or {}
     cid = str(item.get("id") or "")
     if not cid:
@@ -32,22 +32,11 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,str] | None:
     # operate on the LATEST customer message. Prefer the freshest timestamp
     # across `source` and `conversation_parts`; when timestamps are missing,
     # retain payload order and take the last user part.
-    source_author = source.get("author", {}) or {}
-    source_author_type = str(source_author.get("type") or "").strip().lower()
-
-    # `conversation.user.replied` is an event about the current source message.
-    # If Intercom explicitly says that source was written by an admin/bot, the
-    # historical user parts below must NEVER be used as a fallback. Otherwise a
-    # bot/admin reply can be re-ingested as the previous customer question, racing
-    # the real next user choice and corrupting CHOOSING state.
-    if topic in CONVERSATION_TOPICS and source.get("body") and source_author_type and source_author_type != "user":
-        return None
-
     user_parts = [
         p for p in parts
         if (p.get("author", {}) or {}).get("type") == "user" and p.get("body")
     ]
-    if source_author_type == "user" and source.get("body"):
+    if (source.get("author", {}) or {}).get("type") == "user" and source.get("body"):
         user_parts.append(source)
 
     def _timestamp(value: object) -> float:
@@ -77,16 +66,9 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,str] | None:
     attachments = bool(part.get("attachments"))
     author = part.get("author", {}) or {}
     last_message_at = part.get("created_at") or item.get("updated_at") or ""
-    # Deduplicate on the actual Intercom message/part, not the webhook
-    # notification id. Intercom documents `source.id` as the source message id
-    # and conversation-part `id` as the part identifier; either is stable across
-    # webhook delivery attempts.
-    stable_message_id = str(part.get("id") or "").strip()
-    if not stable_message_id and part is source:
-        stable_message_id = str(source.get("id") or "").strip()
-    return cid, text, attachments, author.get("name", ""), author.get("email", ""), str(last_message_at), stable_message_id
+    return cid, text, attachments, author.get("name", ""), author.get("email", ""), str(last_message_at)
 
-def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str,str] | None:
+def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     item=payload.get("data",{}).get("item",{})
     topic=payload.get("topic","")
     if topic=="ticket.contact.replied":
@@ -97,13 +79,11 @@ def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str,str] | None:
         author=part.get("author",{}) or {}
         attachments=bool(part.get("attachments"))
         last_message_at = part.get("created_at") or item.get("updated_at") or ""
-        stable_message_id = str(part.get("id") or "").strip()
-        return tid,text,attachments,author.get("name",""),author.get("email",""),str(last_message_at),stable_message_id
+        return tid,text,attachments,author.get("name",""),author.get("email",""),str(last_message_at)
     tid=str(item.get("id") or "")
     attrs=item.get("ticket_attributes",{}) or {}
     text=_strip(attrs.get("_default_description_",""))
-    stable_message_id = str(item.get("id") or "").strip()
-    return (tid,text,False,"","",str(item.get("updated_at","")),stable_message_id) if tid else None
+    return (tid,text,False,"","",str(item.get("updated_at",""))) if tid else None
 
 def parse(payload: dict) -> InboundMessage | None:
     topic=payload.get("topic","")
@@ -118,18 +98,13 @@ def parse(payload: dict) -> InboundMessage | None:
         return None
     if not data or not data[1]:
         return None
-    entity_id,text,attachments,name,email,updated_at,stable_message_id=data
-    identity = stable_message_id
-    if not identity:
-        # Safe fallback for old/unusual payloads without a message id. Include
-        # timestamp + normalized content so two distinct messages with the same
-        # text at different times do not collapse into one event.
-        identity = hashlib.sha256(
-            f"{entity_id}|{updated_at}|{text}".encode("utf-8")
-        ).hexdigest()
+    entity_id,text,attachments,name,email,updated_at=data
+    fallback_key = hashlib.sha1(
+        f"{entity_id}:{updated_at}:{text}".encode("utf-8")
+    ).hexdigest()
     return InboundMessage(
         event_id=event_id,
-        event_key=f"{topic}:{entity_id}:message:{identity}",
+        event_key=f"{topic}:{entity_id}:{event_id or fallback_key}",
         topic=topic,
         entity_id=entity_id,
         channel=channel,

@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import re
+import hashlib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -162,12 +163,16 @@ OOS_MIN_DOMAIN_TERM_HITS = 0
 # CATEGORY_CHOICE is a rare ambiguity mode, not a generic low-confidence fallback.
 CATEGORY_CHOICE_MIN_SCORE = 0.42
 CATEGORY_CHOICE_MIN_INTENT_FIT = 0.40
-CATEGORY_CHOICE_MAX_MARGIN = 0.16
+CATEGORY_CHOICE_MAX_MARGIN = 0.26
 CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST = 0.14
 CATEGORY_CHOICE_MAX_CANDIDATES = 3
 CATEGORY_CHOICE_MIN_CANDIDATES = 2
-CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.42
-CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT = True
+CATEGORY_CHOICE_MIN_REAL_EVIDENCE = 0.34
+CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT = False
+# The leader still needs concrete affirmative evidence; alternative Top-3
+# candidates may be supported by query-level ontology/facet alignment.
+CATEGORY_CHOICE_REQUIRE_TOP_DIRECT_SUPPORT = True
+CATEGORY_CHOICE_MIN_CONTEXT_EVIDENCE = 0.30
 # A Top-3 option is a promise: the next user reply must be resolvable locally.
 # Entries without a terminal answer/clarification are therefore never shown.
 CATEGORY_CHOICE_REQUIRE_ROUTABLE_ENTRY = True
@@ -239,6 +244,7 @@ INTENT_REQUIRED_FACETS: dict[str, set[str]] = {
     "qr_code": {"qr_code"},
     "become_mentee": {"mentor_enrolment"},
     "online_mentorship": {"online"},
+    "online_training": {"online_training"},
     "speaker_collaboration": {"speaker_collaboration"},
     "event_access": {"event_access"},
     "record_second_person": {"record_second_person"},
@@ -1067,6 +1073,7 @@ class KnowledgeBase:
             "global_exit": ("schools", "leave", "intent"),
             "become_mentee": ("mentor", "join", "intent"),
             "online_mentorship": ("mentor", "learn", "online"),
+            "online_training": ("training", "learn", "online"),
             "speaker_collaboration": ("collaboration", "offer", "intent"),
             "event_access": ("event", "access", "information"),
             "record_second_person": ("event", "register", "second_person"),
@@ -1093,7 +1100,7 @@ class KnowledgeBase:
             "date": ("когда следующий", "когда новый", "когда старт", "дата старта", "даты потока", "в какой день"),
             "duration": ("сколько длится", "как долго", "сколько месяцев", "сколько недель", "длительность", "продолжительность"),
             "age": ("с какого возраста", "со скольки лет", "до какого возраста", "возраст"),
-            "registration": ("записаться", "запись", "регистрация", "зарегистрироваться"),
+            "registration": ("записаться", "запись", "регистрация", "зарегистрироваться", "зарег"),
             "technical_failure": ("не работает", "не получается", "не могу", "ошибка", "не открывается", "не принимает", "не пускает"),
             "verification": ("код подтверждения", "подтвердить номер", "не приходит смс"),
             "access": ("нет доступа", "не вижу", "не пускает", "доступ"),
@@ -1418,13 +1425,27 @@ class KnowledgeBase:
             return "kb_031"
 
         # Online mentorship is distinct from both the general mentorship
-        # programme and the user's own assigned mentor.
+        # programme and online education. Keep this rule before the generic
+        # online-learning rule so mentor questions cannot be swallowed by the
+        # broader "онлайн + обучение" signal.
         if (
             has_any("настав", "ментор")
             and has_any("онлайн", "удален", "удалён", "дистанцион")
             and not has_any("стать", "спикер", "программ")
         ):
             return "kb_040"
+
+        # Online learning is a distinct education intent: route explicit
+        # questions about online schools/courses to the dedicated KB answer.
+        # The rule is intentionally narrow and excludes mentorship so that a
+        # shared word like "онлайн" cannot determine the category by itself.
+        online_training_signal = (
+            has_any("онлайн", "удален", "удалён", "дистанцион")
+            and has_any("обучен", "учит", "школ", "кур")
+            and not has_any("настав", "ментор")
+        )
+        if online_training_signal:
+            return "kb_047"
 
         # Speaking/intensive/collaboration requests are a separate role from
         # becoming a mentor or joining mentorship as a student.
@@ -1433,6 +1454,65 @@ class KnowledgeBase:
             and not has_any("ученик", "наставничеств")
         ):
             return "kb_041"
+
+        # Explicit missed-event questions are common and should outrank generic
+        # stream/registration retrieval. Keep this narrow so ordinary event
+        # planning questions do not get misrouted.
+        missed_event_signal = (
+            has_phrase(
+                "как получить код, если меня не будет на мероприятии",
+                "если меня не будет на мероприятии",
+                "если не буду на мероприятии",
+                "если не смогу быть на мероприятии",
+            )
+            or (
+                has_any("мероприят")
+                and has_phrase("не буду", "не смогу", "не получится", "не присутствую", "не присутствовать")
+                and has_any("код", "запис", "попаст", "участв", "доступ")
+            )
+        )
+        if missed_event_signal:
+            return "kb_003"
+
+        # Explicit application/Telegram-account binding failures are technical
+        # application problems, not Telegram group membership. Do not route these
+        # to the chat-membership answer.
+        telegram_binding_failure = (
+            has_any("телеграм", "тг", "telegram")
+            and has_any("привяз", "подключ", "связ")
+            and (
+                has_phrase("по кнопке не переходит", "кнопка не срабатывает", "не переходит по кнопке")
+                or has_phrase("не работает", "не могу", "не получается", "не переходит")
+            )
+        )
+        if telegram_binding_failure and has_any("прилож", "профил", "аккаунт", "регистра", "кнопк"):
+            return "kb_001"
+
+        # Explicit account/profile loss after an application update is an account
+        # / app failure, not a fresh registration intent.
+        account_lost_after_update = (
+            has_any("обнов", "обновл")
+            and has_any("аккаунт", "профил", "данн")
+            and has_any("пропал", "пропали", "новый", "новым", "считыва", "нет данных", "без данных")
+            and has_any("прилож", "регистра", "войти", "зайти", "профил", "аккаунт")
+        )
+        if account_lost_after_update:
+            return "kb_001"
+
+        # Explicit verification-by-call failure should not fall into generic
+        # application or registration retrieval. The phone verification KB is
+        # the closest supported contract and is safe for this operation.
+        verification_call_failure = (
+            has_any("позвони", "звонок", "звонил", "звонила")
+            and has_any("указан", "номер", "телефон")
+            and (
+                has_phrase("не вошел", "не вошла", "не войдет", "не войду", "не смог войти",
+                           "не смогла войти", "не могу войти", "не получается войти")
+                or has_any("неудач", "ошиб")
+            )
+        )
+        if verification_call_failure:
+            return "kb_027"
 
         # Explicit event attendance/access questions should not be pulled into
         # generic school/registration intents.
@@ -1556,6 +1636,11 @@ class KnowledgeBase:
         # «хочу быть наставников в будущем» / «хочу стать наставником потом».
         future_role = mentor and has_any("будущ", "потом", "дальш") and has_any("хот", "жел", "готов", "стат", "буд")
         wants_to_become = wants_to_become or future_role
+        application_to_become_mentor = mentor and has_any("заяв", "анкета") and (
+            has_any("выступ", "стат", "быть", "работ", "преподав")
+            or has_phrase("подать заявку", "заполнить анкету")
+        )
+        wants_to_become = wants_to_become or application_to_become_mentor
 
         personal_mentor_problem = mentor and (
             has_phrase(
@@ -1600,14 +1685,58 @@ class KnowledgeBase:
         # ----------------------------------------------------
         # Education entry / school registration / registration failure.
         # ----------------------------------------------------
-        registration_terms = has_any("запис", "вступ", "попаст", "оформ", "регистра")
-        failure_terms = has_any("не", "нет", "ошиб", "проблем", "неприн", "отказ")
-        registration_failure = registration_terms and (
-            failure_terms
-            or has_phrase("не пускает в школу", "нет кнопки записи", "кнопки записи нет", "не дает записаться")
+        registration_terms = has_any("запис", "вступ", "попаст", "оформ", "регистра", "зарегистр", "зарег")
+        failure_terms = (
+            has_phrase(
+                "не могу", "не получается", "не работает", "не дает", "не даёт",
+                "нет возможности", "нет кнопки", "кнопка не активна",
+                "не проходит", "не пускает", "дальше не идет", "дальше не идёт",
+                "не принимает", "не открывается", "не переходит",
+            )
+            or has_any("ошиб", "неприн", "отказ")
+        )
+        app_login_context = has_any("прилож", "приложен") and has_any("зайт", "войд", "войти", "вход", "авториз", "логин")
+        # Missing/unavailable Telegram during registration is a separate support
+        # situation. Do not label it as a school-registration failure just because
+        # the user mentions registration and a failure phrase in the same sentence.
+        telegram_registration_dependency = (
+            registration_terms
+            and has_any("телеграм", "тг", "telegram")
+            and has_phrase(
+                "нет телеграм", "нет telegram", "нет тг",
+                "не работает телеграм", "не работает telegram", "не работает тг",
+                "телеграм не работает", "telegram не работает",
+            )
+        )
+        combined_login_registration_failure = (
+            registration_terms
+            and has_any("войти", "зайти", "авториз", "вход")
+            and failure_terms
+        )
+        registration_failure = (
+            not app_login_context
+            and not telegram_registration_dependency
+            and not combined_login_registration_failure
+            and (
+                registration_terms and (
+                    failure_terms
+                    or has_phrase("не пускает в школу", "нет кнопки записи", "кнопки записи нет", "не дает записаться")
+                )
+                or has_phrase(
+                    "кнопка продолжить не активна", "кнопка не активна",
+                    "нет перехода далее", "не переходит далее", "дальше не идет", "дальше не идёт",
+                )
+            )
         )
         school_registration = has_school() and has_any("запис", "вступ", "попаст", "выбрат", "оформ")
         general_training = has_any("обуч", "учит", "учеб", "курс")
+
+        # When one message combines registration with an explicit login failure,
+        # route it to the application/account intent. This is closer to the user's
+        # actual problem than the generic registration category (e.g.
+        # "не могу зарегистрироваться и войти в приложение").
+        if (app_login_context or combined_login_registration_failure) and failure_terms:
+            return "kb_001"
 
         # "Не получается записаться" is a complete supported intent even
         # without the word "школа"; don't require a noun the user may omit.
@@ -1649,7 +1778,7 @@ class KnowledgeBase:
         # the user explicitly says the application rejects their data or login.
         # ----------------------------------------------------
         app_signal = has_any("прилож", "приложен")
-        login_signal = has_any("зайт", "войд", "вход", "авториз", "логин")
+        login_signal = has_any("зайт", "войд", "войти", "вход", "авториз", "логин")
         rejected_data = has_any("данн", "информац", "учет") and failure_terms
         explicit_app_login = (
             app_signal
@@ -2247,6 +2376,15 @@ class KnowledgeBase:
             facets.add("mentor_application")
         if stems & mentor_stems and "будущ" in stems and (stems & wants_stems):
             facets.add("mentor_application")
+
+        # Online learning is stronger than the generic `online` facet only
+        # when education/training is explicitly present.
+        if (
+            any(p in q for p in ("онлайн", "удаленно", "удалённо", "дистанционно"))
+            and any(p in q for p in ("обучение", "обучаться", "учиться", "школ", "курс"))
+            and not any(p in q for p in ("наставничество", "наставник", "ментор"))
+        ):
+            facets.add("online_training")
 
         patterns: dict[str, tuple[str, ...]] = {
             "mentor_application": (
@@ -2939,7 +3077,7 @@ class KnowledgeBase:
     @staticmethod
     def _real_intent_evidence(item: dict) -> float:
         """Affirmative intent evidence independent of embedding similarity."""
-        positive = 1.0 if item.get("positive_hits") else 0.0
+        positive = 1.0 if (item.get("positive_hits") or item.get("intent_signal_positive_hits")) else 0.0
         lexical = float(item.get("lexical_score", 0.0))
         fuzzy = float(item.get("fuzzy_phrase_score", 0.0))
         required = float((item.get("required_evidence") or {}).get("coverage", 0.0))
@@ -3222,6 +3360,7 @@ class KnowledgeBase:
         for item, generic in zip(candidates, generic_scores):
             entry = item["entry"]
             positives = self._lexical_phrase_hits(question, entry)
+            signal_pos, signal_neg = self._intent_signal_hits(question, entry)
             negatives = self._negative_hits(question, entry)
             constraints = self._constraint_evidence(question, entry)
             required = self._required_evidence(question, entry)
@@ -3252,10 +3391,10 @@ class KnowledgeBase:
             rrf_max = 2.0 / (RRF_K + 1.0)
             rrf_norm = min(1.0, float(item["rrf_score"]) / max(rrf_max, 1e-9))
 
-            phrase_evidence = 1.0 if positives else fuzzy_phrase
+            phrase_evidence = 1.0 if positives or signal_pos else fuzzy_phrase
             constraint_coverage = float(required["coverage"])
             contradiction = bool(
-                negatives or constraints.get("forbidden_hits")
+                negatives or signal_neg or constraints.get("forbidden_hits")
             )
 
             # Evidence quality: direct phrase/required evidence helps, while
@@ -3362,6 +3501,8 @@ class KnowledgeBase:
                 "ranking_score": ranking_score,
                 "final_score": final_score,
                 "positive_hits": positives,
+                "intent_signal_positive_hits": signal_pos,
+                "intent_signal_negative_hits": signal_neg,
                 "negative_hits": negatives,
                 "constraint_evidence": constraints,
             })
@@ -3676,15 +3817,18 @@ class KnowledgeBase:
                 continue
             if score < 0.48 or fit < 0.50 or real_ev < CATEGORY_CHOICE_MIN_REAL_EVIDENCE:
                 continue
-            if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not explicit_intent:
+            # The best option must be grounded in explicit user intent.
+            # Alternatives do not have to repeat the exact phrase: they are allowed
+            # when the query's object/action/state/facet places them in the same
+            # support context. This is what makes Top-3 useful for terse real-world
+            # messages such as "не могу зарегистрироваться".
+            if item is top and CATEGORY_CHOICE_REQUIRE_TOP_DIRECT_SUPPORT and not explicit_intent:
                 continue
             if top_score - score > CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST:
                 continue
-            if domain < 0.24 and not explicit_intent:
+            if domain < 0.20 and not explicit_intent:
                 continue
-            if ontology_alignment < 0.50 and not explicit_intent:
-                continue
-            if CATEGORY_CHOICE_REQUIRE_DIRECT_SUPPORT and not explicit_intent:
+            if ontology_alignment < 0.46 and not explicit_intent:
                 continue
 
             family = str(entry.get("family") or "other")
@@ -3709,7 +3853,7 @@ class KnowledgeBase:
 
             # When there is no explicit lexical hit, structured context must be
             # strong enough to prove that this candidate is independently plausible.
-            if not explicit_intent and not (real_ev >= 0.58 and fit >= 0.56 and domain >= 0.32 and ontology_alignment >= 0.66):
+            if not explicit_intent and not (real_ev >= CATEGORY_CHOICE_MIN_CONTEXT_EVIDENCE and fit >= 0.48 and domain >= 0.20 and ontology_alignment >= 0.46):
                 continue
 
             payload = self._choice_candidate_payload(item)
@@ -3894,9 +4038,10 @@ class KnowledgeBase:
         high_risk = detect_high_risk(question)
         if high_risk:
             logger.info(
-                "high_risk_detected | kind=%s | question=%s",
+                "high_risk_detected | kind=%s | question_len=%d | question_sha256=%s",
                 high_risk,
-                question[:300],
+                len(question),
+                hashlib.sha256(question.encode("utf-8")).hexdigest()[:16],
             )
             return MatchResult(
                 MatchMode.NO_MATCH,
@@ -4566,6 +4711,8 @@ class KnowledgeBase:
                     "required_evidence": x.get("required_evidence", {}),
                     "final_score": x["final_score"],
                     "positive_hits": x["positive_hits"],
+                    "intent_signal_positive_hits": x.get("intent_signal_positive_hits", []),
+                    "intent_signal_negative_hits": x.get("intent_signal_negative_hits", []),
                     "negative_hits": x["negative_hits"],
                     "best_phrase": x["best_phrase"],
                     "intent_fit_score": x.get("intent_fit_score", 0.0),

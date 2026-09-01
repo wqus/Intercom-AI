@@ -687,3 +687,54 @@ def test_escalation_ack_explains_operator_handoff_and_optional_materials():
     assert "передан оператору" in text
     assert "скриншот" in text
     assert "уточнить суть проблемы" in text
+
+
+def test_category_choice_allows_contextual_alternatives_without_exact_phrase():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb.family_vocabulary = {"education": {"регистрация", "школа", "поток"}}
+    top_entry = _entry(
+        kb, "kb_002", "education", "registration_failure", ["technical_failure", "registration"],
+        ["не могу зарегистрироваться"],
+    )
+    top_entry["template_answer"] = "Ответ 1"
+    alt_entry = _entry(
+        kb, "kb_033", "education", "school_registration", ["registration", "school"],
+        ["как записаться в школу"],
+    )
+    alt_entry["template_answer"] = "Ответ 2"
+    alt2_entry = _entry(
+        kb, "kb_043", "education", "repeat_registration", ["repeat_registration"],
+        ["записаться повторно"],
+    )
+    alt2_entry["template_answer"] = "Ответ 3"
+    ranked = [
+        {
+            "entry": top_entry, "final_score": 0.58, "intent_fit_score": 0.68,
+            "real_intent_evidence": 0.52, "domain_support_score": 0.60,
+            "ontology_alignment_score": 0.75, "query_quality_score": 0.20, "direct_support": True,
+            "positive_hits": ["не могу зарегистрироваться"],
+            "intent_signal_positive_hits": ["не могу зарегистрироваться"],
+            "negative_hits": [], "constraint_evidence": {},
+            "intent_contract_status": "proven", "ontology": {"object": "school", "action": "register", "state": "failure", "facet": "registration"},
+        },
+        {
+            "entry": alt_entry, "final_score": 0.53, "intent_fit_score": 0.52,
+            "real_intent_evidence": 0.36, "domain_support_score": 0.48,
+            "ontology_alignment_score": 0.62, "direct_support": False,
+            "positive_hits": [], "intent_signal_positive_hits": [],
+            "negative_hits": [], "constraint_evidence": {},
+            "intent_contract_status": "proven", "ontology": {"object": "school", "action": "register", "state": "intent", "facet": "registration"},
+        },
+        {
+            "entry": alt2_entry, "final_score": 0.50, "intent_fit_score": 0.49,
+            "real_intent_evidence": 0.35, "domain_support_score": 0.44,
+            "ontology_alignment_score": 0.56, "direct_support": False,
+            "positive_hits": [], "intent_signal_positive_hits": [],
+            "negative_hits": [], "constraint_evidence": {},
+            "intent_contract_status": "proven", "ontology": {"object": "flow", "action": "register", "state": "repeat", "facet": "repeat_registration"},
+        },
+    ]
+    # Ensure the query ontology provides a registration context shared by the
+    # alternatives, without requiring their exact trigger phrase.
+    choices = kb._category_choice_candidates(ranked, question="Не могу зарегистрироваться")
+    assert [c["kb_id"] for c in choices] == ["kb_002", "kb_033"] or [c["kb_id"] for c in choices] == ["kb_002", "kb_033", "kb_043"]

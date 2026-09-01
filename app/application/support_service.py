@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 
 from app.domain.enums import Channel, ConversationStateKind, Decision, EscalationReason
 from app.domain.models import InboundMessage
@@ -17,6 +16,7 @@ from app.infrastructure.persistence.repository import (
 from app.infrastructure.persistence.models import InboundEvent
 from app.infrastructure.persistence.outbox import OutboundRepository
 from app.infrastructure.telegram.notifier import TelegramNotifier
+from app.infrastructure.ai.knowledge_base import contains_operator_request
 
 logger = logging.getLogger("support_service")
 
@@ -183,18 +183,6 @@ class SupportApplication:
         await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
         return True
 
-    @staticmethod
-    def _message_timestamp(value: str | None) -> float:
-        if value in (None, ""):
-            return -1.0
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            try:
-                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-            except (TypeError, ValueError, OverflowError):
-                return -1.0
-
     async def _handle_state(self, session, event: InboundEvent, message: InboundMessage, state) -> bool:
         try:
             normalized_state = ConversationStateKind(state.state)
@@ -230,39 +218,49 @@ class SupportApplication:
             return False
 
         if normalized_state == ConversationStateKind.CHOOSING:
+            if contains_operator_request(message.text):
+                await self._escalate(
+                    session,
+                    message,
+                    event,
+                    EscalationReason.USER_REQUESTED_OPERATOR,
+                )
+                return True
+
             candidate_ids = state.data.get("candidate_ids", [])
             indices = self.pipeline.kb.parse_category_choice(
                 message.text,
                 max_index=len(candidate_ids),
             )
             if not indices:
-                # CHOOSING is a transactional UI contract: until the user selects
-                # one of the options, this event must not be allowed to fall through
-                # into the generic classifier. Otherwise a delayed/replayed webhook
-                # containing the original question can answer that question and reset
-                # the menu before the real "1"/"2"/"3" arrives.
-                #
-                # A genuinely new free-text clarification is still permitted, but only
-                # when Intercom provides a timestamp newer than the menu-triggering
-                # message. Missing/unparseable timestamps are treated conservatively:
-                # keep CHOOSING and ask for the option number.
-                prompt_at = self._message_timestamp(state.data.get("prompt_at"))
-                incoming_at = self._message_timestamp(message.updated_at)
-                is_fresh_after_prompt = (
-                    prompt_at >= 0 and incoming_at >= 0 and incoming_at > prompt_at
-                )
+                # The choice prompt itself invites either a number OR a short
+                # clarification ("Напишите номер или кратко уточните свой
+                # вопрос"). Previously any non-numeric reply here was treated
+                # as an invalid answer and only ever got a "please send a
+                # number" retry (or an escalation) — so the prompt's own
+                # second option never actually worked. Give the normal
+                # pipeline one chance to resolve the free text; only fall
+                # back to the numeric retry/escalation flow if it can't
+                # produce anything actionable either.
+                probe = await self.pipeline.decide(message)
+                if any(
+                    t.decision in {Decision.ANSWER_TEMPLATE, Decision.CHOICE, Decision.CLARIFY}
+                    for t in probe.traces
+                ):
+                    return False
 
-                if is_fresh_after_prompt:
-                    probe = await self.pipeline.decide(message)
-                    if any(
-                        t.decision in {Decision.ANSWER_TEMPLATE, Decision.CHOICE, Decision.CLARIFY}
-                        for t in probe.traces
-                    ):
-                        return False
-
-                # Never escalate or silently destroy a still-live Top-3 state because
-                # of an invalid/non-choice message. Keep the exact candidate snapshot.
+                # A non-choice message is not evidence that a human operator is
+                # required. Keep the menu state intact and stay silent rather than
+                # escalating on arbitrary/nearby text. A real free-text question
+                # that the classifier can answer is handled above via `probe`.
                 attempts = self._attempts_after_failed_clarification(state)
+                if attempts >= 2:
+                    # Do not turn repeated non-choice/nearby text into a human
+                    # escalation. The menu has gone stale; silently close this
+                    # transient state so the next message starts cleanly.
+                    await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
+                    return True
+
                 state.data["attempts"] = attempts + 1
                 await session.flush()
                 if attempts == 0:
@@ -296,20 +294,6 @@ class SupportApplication:
                 )
                 return True
 
-            selected = []
-            for idx in indices:
-                if 1 <= idx <= len(snapshots) and isinstance(snapshots[idx - 1], dict):
-                    item = snapshots[idx - 1]
-                    selected.append({
-                        "index": idx,
-                        "kb_id": str(item.get("kb_id") or ""),
-                        "category": str(item.get("category") or ""),
-                    })
-            logger.info(
-                "choice_resolved | entity=%s | selected=%s",
-                message.entity_id,
-                selected,
-            )
             await self._enqueue_reply(
                 session,
                 message,
@@ -422,16 +406,10 @@ class SupportApplication:
                         continue
                     cid = str(item.get("kb_id") or "").strip()
                     label = str(item.get("label") or item.get("choice_label") or cid).strip()
-                    category = str(item.get("category") or "").strip()
                     answer = str(item.get("answer") or item.get("template_answer") or "").strip()
                     if not cid or not label or not answer or cid in seen_ids:
                         continue
-                    normalized.append({
-                        "kb_id": cid,
-                        "label": label,
-                        "category": category,
-                        "answer": answer,
-                    })
+                    normalized.append({"kb_id": cid, "label": label, "answer": answer})
                     seen_ids.add(cid)
 
                 if len(normalized) < 2:
@@ -452,11 +430,6 @@ class SupportApplication:
                     "candidates": normalized,
                     "attempts": 0,
                     "original_question": trace.question,
-                    # Timestamp of the user message that caused the menu. This lets
-                    # CHOOSING distinguish a genuinely new clarification from a late
-                    # replay of an older webhook/history snapshot.
-                    "prompt_at": message.updated_at or "",
-                    "prompt_event_id": message.event_id or "",
                 })
                 choice_state_persisted = True
                 logger.info(

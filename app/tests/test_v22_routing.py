@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +15,7 @@ from app.domain.policy import high_risk_reply
 from app.infrastructure.ai.knowledge_base import (
     MatchMode,
     MatchResult,
+    KnowledgeBase,
     detect_high_risk,
 )
 
@@ -150,3 +153,130 @@ def test_inbound_query_is_logged(caplog):
     joined = " ".join(r.message for r in caplog.records)
     assert "inbound_query" in joined
     assert "entity-9" in joined
+    assert "Бесполезное сообщение" in joined
+
+
+def test_choice_state_operator_request_escalates_directly():
+    import asyncio
+    from app.application.support_service import SupportApplication
+    from app.domain.enums import Channel, ConversationStateKind, EscalationReason
+    from app.domain.models import InboundMessage
+    from app.infrastructure.persistence.models import InboundEvent
+
+    class DummyPipeline:
+        def decide(self, *_args, **_kwargs):
+            raise AssertionError("classifier should not be called for explicit operator request")
+    class DummyIntercom: pass
+    app = SupportApplication(DummyPipeline(), DummyIntercom())
+
+    class DummyState:
+        state = ConversationStateKind.CHOOSING
+        data = {"candidate_ids": ["a", "b"], "candidates": [], "attempts": 0}
+
+    called = {}
+    async def fake_escalate(session, message, event, reason, reply_text=None):
+        called["reason"] = reason
+    app._escalate = fake_escalate
+
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "оператор")
+    event = InboundEvent(id="ev", event_id="ev") if False else object()
+    result = asyncio.run(app._handle_state(None, event, message, DummyState()))
+    assert result is True
+    assert called["reason"] == EscalationReason.USER_REQUESTED_OPERATOR
+
+
+def test_real_world_missed_event_code_question_routes_to_kb_003():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match("Как получить код, если меня не будет на мероприятии?") == "kb_003"
+
+
+def test_real_world_telegram_binding_failure_routes_to_app_failure():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match(
+        "Не могу привязать свой Телеграмм аккаунт. По кнопке не переходит. Не работает в приложении"
+    ) == "kb_001"
+
+
+def test_real_world_account_lost_after_update_routes_to_app_failure():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match(
+        "После обновления пропал мой аккаунт, считывает как новый без данных в приложении"
+    ) == "kb_001"
+
+
+def test_real_world_verification_call_failure_routes_to_phone_verification():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match("Позвонил на указанный номер но не вошел") == "kb_027"
+
+
+def test_combined_login_and_registration_failure_prefers_app_failure():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match("Не могу войти и зарегистрироваться на следующий поток") == "kb_001"
+
+
+def test_registration_with_missing_telegram_is_not_misclassified_as_registration_failure():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match(
+        "При регистрации на запись в школу требуется заполнить поле Telegram, но у меня нет/не работает Telegram"
+    ) != "kb_002"
+
+
+def test_inbound_and_routing_logs_keep_full_text(caplog):
+    class QuietKB:
+        def match_many(self, q):
+            return [
+                MatchResult(
+                    MatchMode.NO_MATCH, 0.0, None, None, None, [],
+                    decision_reason="reason-" + "x" * 300, subquestion=q,
+                )
+            ]
+        def match(self, q):
+            return self.match_many(q)[0]
+
+    pipeline = DecisionPipeline(QuietKB(), _FakeLLM())
+    text = "Полный текст обращения " + ("деталь " * 80)
+    msg = InboundMessage("evt-full", "key", "topic", "entity-full", Channel.CONVERSATION, text)
+    with caplog.at_level(logging.INFO, logger="decision_pipeline"):
+        asyncio.run(pipeline.decide(msg))
+    joined = " ".join(r.message for r in caplog.records)
+    assert text in joined
+    assert "reason-" + "x" * 300 in joined
+
+
+def test_online_training_hard_rule_routes_to_dedicated_kb():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match(
+        "Здравствуйте! Какие есть онлайн-школы и как записаться на онлайн обучение?"
+    ) == "kb_047"
+
+
+def test_online_training_answer_is_exact_and_routable():
+    data = json.loads(Path("data/knowledge_base.json").read_text())
+    entry = next(item for item in data if item.get("id") == "kb_047")
+    assert entry["template_answer"] == (
+        "Список актуальных онлайн-школ опубликован в данном Telegram-канале. https://t.me/terraonlinescho\n\n"
+        "Пожалуйста, ознакомьтесь с доступными направлениями и выберите интересующую вас школу. "
+        "Все инструкции по записи также размещены в канале."
+    )
+
+
+def test_online_mentorship_stays_separate_from_online_training():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match(
+        "Есть ли онлайн наставничество? Хочу работать с наставником удаленно."
+    ) == "kb_040"
+
+
+def test_online_training_is_not_triggered_by_generic_online_word():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match("Есть ли онлайн формат мероприятия 9 сентября?") != "kb_047"
+
+
+def test_online_training_handles_common_russian_variants():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    for question in (
+        "Подскажите, есть ли дистанционное обучение?",
+        "Хочу учиться онлайн, какие школы доступны?",
+        "Где посмотреть список онлайн школ?",
+    ):
+        assert kb._hard_rule_match(question) == "kb_047"

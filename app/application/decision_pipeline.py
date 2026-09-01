@@ -1,5 +1,6 @@
 import time
 import logging
+import hashlib
 from app.domain.enums import Decision, EscalationReason
 from app.domain.models import DecisionTrace, InboundMessage, OutboundAction, ProcessingResult
 from app.domain.policy import escalation_ack, rephrase_prompt, oos_response, high_risk_reply
@@ -93,17 +94,11 @@ class DecisionPipeline:
                 label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "").strip()
                 cid = str(c.get("kb_id") or "").strip()
                 answer = str(c.get("template_answer") or "").strip()
-                category = str(c.get("category") or "").strip()
                 if not label or not cid or not answer:
                     continue
                 labels.append(label)
                 ids.append(cid)
-                safe_candidates.append({
-                    "kb_id": cid,
-                    "label": label,
-                    "category": category,
-                    "answer": answer,
-                })
+                safe_candidates.append({"kb_id": cid, "label": label, "answer": answer})
             if not settings.USER_VISIBLE_TOP3:
                 # A hidden menu must never create a CHOICE trace/state. The user
                 # cannot select something they were not shown. Because this is a
@@ -146,17 +141,11 @@ class DecisionPipeline:
                     label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "").strip()
                     cid = str(c.get("kb_id") or "").strip()
                     answer = str(c.get("template_answer") or "").strip()
-                    category = str(c.get("category") or "").strip()
                     if not label or not cid or not answer:
                         continue
                     labels.append(label)
                     ids.append(cid)
-                    safe_candidates.append({
-                        "kb_id": cid,
-                        "label": label,
-                        "category": category,
-                        "answer": answer,
-                    })
+                    safe_candidates.append({"kb_id": cid, "label": label, "answer": answer})
                 if len(labels) >= 2 and settings.USER_VISIBLE_TOP3:
                     trace.decision = Decision.CHOICE
                     trace.automated = True
@@ -227,12 +216,15 @@ class DecisionPipeline:
     async def decide(self, message: InboundMessage) -> ProcessingResult:
         started = time.perf_counter()
 
+        raw_text = message.text or ""
         logger.info(
-            "inbound_query | entity_id=%s | event_id=%s | channel=%s | text=%s",
+            "inbound_query | entity_id=%s | event_id=%s | channel=%s | text_len=%d | text_sha256=%s | text=%r",
             getattr(message, "entity_id", None),
             getattr(message, "event_id", None),
             getattr(message, "channel", None),
-            (message.text or "")[:2000],
+            len(raw_text),
+            hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16],
+            raw_text,
         )
 
         # Operator request is an explicit user action and must survive the
@@ -286,15 +278,18 @@ class DecisionPipeline:
         for match in matches[:5]:
             question = match.subquestion or message.text
             trace, actions = await self.decide_match(match, question)
+            question_text = question or ""
             logger.info(
-                "routing_decision | question=%s | mode=%s | decision=%s | kb_id=%s | score=%.4f | margin=%.4f | reason=%s",
-                (question or "")[:400],
+                "routing_decision | question_len=%d | question_sha256=%s | question=%r | mode=%s | decision=%s | kb_id=%s | score=%.4f | margin=%.4f | reason=%s",
+                len(question_text),
+                hashlib.sha256(question_text.encode("utf-8")).hexdigest()[:16],
+                question_text,
                 getattr(match.mode, "value", match.mode),
                 getattr(trace.decision, "value", trace.decision),
                 trace.kb_id,
                 float(trace.score or 0.0),
                 float(trace.margin or 0.0),
-                (trace.decision_reason or "")[:200],
+                trace.decision_reason or "",
             )
             traces.append(trace)
             raw_actions.extend(actions)

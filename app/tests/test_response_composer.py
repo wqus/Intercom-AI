@@ -35,3 +35,10 @@ def test_current_kb_answers_are_business_content_only():
         answer = str(entry.get("template_answer") or "")
         assert not answer.lower().startswith("добрый день")
         assert "Если этот ответ не помог" not in answer
+
+
+def test_choice_offers_operator_fallback():
+    text = ResponseComposer.choice(["Первый", "Второй", "Третий"])
+    assert "Если ни один вариант не подходит" in text
+    assert "«оператор»" in text
+    assert "передан оператору" in text

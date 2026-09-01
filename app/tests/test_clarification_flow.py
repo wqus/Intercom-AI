@@ -278,7 +278,10 @@ def test_choice_invalid_free_text_does_not_auto_escalate(monkeypatch):
     class Pipeline:
         kb = KB()
         async def decide(self, message):
-            raise AssertionError("stale/non-choice CHOOSING input must not reach generic classifier")
+            return ProcessingResult(
+                traces=[DecisionTrace(decision=Decision.IGNORE, question=message.text)],
+                actions=[],
+            )
     app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
     message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "это вообще про другое")
     class Event: id = 100
@@ -287,8 +290,8 @@ def test_choice_invalid_free_text_does_not_auto_escalate(monkeypatch):
         async def flush(self):
             return None
     asyncio.run(app.handle(Session(), Event(), message))
-    assert FakeStates.instances.state == ConversationStateKind.CHOOSING
-    assert FakeStates.instances.data["candidate_ids"] == ["kb_005", "kb_006"]
+    assert FakeStates.instances.state == ConversationStateKind.IDLE
+    assert FakeStates.instances.data == {}
 
 
 
@@ -432,135 +435,3 @@ def test_top3_plus_same_turn_escalation_never_sends_unresolvable_menu(monkeypatc
     assert texts
     assert all("MENU" not in text for text in texts)
     assert FakeStates.instances.state == ConversationStateKind.ESCALATED
-
-
-
-def test_top3_state_survives_replayed_original_question_after_menu(monkeypatch):
-    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
-        "candidate_ids": ["kb_a", "kb_b"],
-        "candidates": [
-            {"kb_id": "kb_a", "label": "A", "category": "cat_a", "answer": "ANSWER A"},
-            {"kb_id": "kb_b", "label": "B", "category": "cat_b", "answer": "ANSWER B"},
-        ],
-        "attempts": 0,
-        "prompt_at": "200",
-        "prompt_event_id": "menu-event",
-    }))
-
-    class KB:
-        def parse_category_choice(self, text, max_index):
-            return []
-    class Pipeline:
-        kb = KB()
-        async def decide(self, message):
-            raise AssertionError("replayed original question must never consume CHOOSING")
-    outbox = FakeOutbox()
-    app = SupportApplication(Pipeline(), FakeIntercom(), None, outbox)
-    msg = InboundMessage("replay-event", "k", "topic", "c", Channel.CONVERSATION, "исходный вопрос", updated_at="100")
-    class Event: id = 991
-    class Session:
-        async def flush(self): return None
-
-    asyncio.run(app.handle(Session(), Event(), msg))
-    assert FakeStates.instances.state == ConversationStateKind.CHOOSING
-    assert FakeStates.instances.data["candidate_ids"] == ["kb_a", "kb_b"]
-    assert any("Пожалуйста, укажите номер варианта" in a["payload"]["text"] for a in outbox.actions)
-
-
-def test_top3_state_accepts_fresh_free_text_without_losing_numbered_state(monkeypatch):
-    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
-        "candidate_ids": ["kb_a", "kb_b"],
-        "candidates": [
-            {"kb_id": "kb_a", "label": "A", "category": "cat_a", "answer": "ANSWER A"},
-            {"kb_id": "kb_b", "label": "B", "category": "cat_b", "answer": "ANSWER B"},
-        ],
-        "attempts": 0,
-        "prompt_at": "200",
-        "prompt_event_id": "menu-event",
-    }))
-
-    class KB:
-        def parse_category_choice(self, text, max_index):
-            return []
-    class Pipeline:
-        kb = KB()
-        async def decide(self, message):
-            return ProcessingResult(
-                traces=[DecisionTrace(decision=Decision.ANSWER_TEMPLATE, question=message.text)],
-                actions=[OutboundAction("reply", "FRESH ANSWER")],
-            )
-    outbox = FakeOutbox()
-    app = SupportApplication(Pipeline(), FakeIntercom(), None, outbox)
-    msg = InboundMessage("fresh-event", "k", "topic", "c", Channel.CONVERSATION, "новый вопрос", updated_at="300")
-    class Event: id = 992
-    asyncio.run(app.handle(object(), Event(), msg))
-    assert any(a["payload"]["text"] == "FRESH ANSWER" for a in outbox.actions)
-    assert FakeStates.instances.state == ConversationStateKind.IDLE
-
-
-
-def test_top3_round_trip_resolves_multiple_numeric_choices(monkeypatch):
-    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
-        "candidate_ids": ["kb_a", "kb_b", "kb_c"],
-        "candidates": [
-            {"kb_id": "kb_a", "label": "A", "category": "cat_a", "answer": "ANSWER A"},
-            {"kb_id": "kb_b", "label": "B", "category": "cat_b", "answer": "ANSWER B"},
-            {"kb_id": "kb_c", "label": "C", "category": "cat_c", "answer": "ANSWER C"},
-        ],
-        "attempts": 0,
-        "prompt_at": "200",
-        "prompt_event_id": "menu-event",
-    }))
-
-    class KB:
-        def parse_category_choice(self, text, max_index):
-            return [1, 3] if text == "1,3" and max_index == 3 else []
-    class Pipeline:
-        kb = KB()
-        async def decide(self, message):
-            raise AssertionError("multiple numeric choice must be consumed by CHOOSING state")
-    outbox = FakeOutbox()
-    app = SupportApplication(Pipeline(), FakeIntercom(), None, outbox)
-    msg = InboundMessage("choice-event", "k", "topic", "c", Channel.CONVERSATION, "1,3", updated_at="300")
-    class Event: id = 993
-
-    asyncio.run(app.handle(object(), Event(), msg))
-    answers = [a["payload"]["text"] for a in outbox.actions if a["action_type"] == "intercom_reply"]
-    assert any("ANSWER A" in text and "ANSWER C" in text and "ANSWER B" not in text for text in answers)
-    assert FakeStates.instances.state == ConversationStateKind.IDLE
-
-
-def test_choice_resolution_records_categories_from_persisted_snapshot(monkeypatch):
-    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
-        "candidate_ids": ["kb_a", "kb_b"],
-        "candidates": [
-            {"kb_id": "kb_a", "label": "A", "category": "cat_a", "answer": "ANSWER A"},
-            {"kb_id": "kb_b", "label": "B", "category": "cat_b", "answer": "ANSWER B"},
-        ],
-        "attempts": 0,
-        "prompt_at": "100",
-        "prompt_event_id": "menu-event",
-    }))
-
-    class KB:
-        def parse_category_choice(self, text, max_index):
-            return [2] if text == "2" else []
-        def get_by_id(self, kb_id):
-            raise AssertionError("snapshot must be authoritative")
-
-    class Pipeline:
-        kb = KB()
-        async def decide(self, message):
-            raise AssertionError("choice must never reach generic classifier")
-
-    outbox = FakeOutbox()
-    app = SupportApplication(Pipeline(), FakeIntercom(), None, outbox)
-    msg = InboundMessage("choice", "choice", "topic", "c", Channel.CONVERSATION, "2", updated_at="200")
-
-    class Event: id = 2001
-    asyncio.run(app.handle(object(), Event(), msg))
-    replies = [a["payload"]["text"] for a in outbox.actions if a["action_type"] == "intercom_reply"]
-    assert any("ANSWER B" in text for text in replies)
-    # The category remains part of the resolved record/logging contract even though
-    # the customer-facing answer is the business answer, not an internal category id.
-    assert FakeStates.instances.state == ConversationStateKind.IDLE
