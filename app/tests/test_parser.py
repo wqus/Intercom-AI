@@ -53,8 +53,10 @@ def test_conversation_parser_uses_latest_user_message():
     }
     msg = parse(payload)
     assert msg is not None
-    assert msg.text == "Более новое сообщение"
-    assert msg.updated_at == "200"
+    # For `conversation.user.replied`, the source is the event's message. Do
+    # not replace it with a later historical user part.
+    assert msg.text == "Первое сообщение"
+    assert msg.updated_at == "100"
 
 
 def test_attachments_belong_only_to_current_source_message():
@@ -74,3 +76,28 @@ def test_attachments_belong_only_to_current_source_message():
     assert msg is not None
     assert msg.text == "Спасибо"
     assert msg.has_attachments is False
+
+
+def test_conversation_user_replied_prefers_event_source_over_later_history():
+    payload = {
+        "id": "evt-current",
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "conv-order",
+            "source": {
+                "body": "1",
+                "author": {"type": "user", "name": "User"},
+                "created_at": "200",
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"body": "Первый вопрос", "author": {"type": "user"}, "created_at": "100"},
+                # Simulates a later message already visible in conversation history
+                # when a delayed webhook is delivered.
+                {"body": "Оператор", "author": {"type": "user"}, "created_at": "300"},
+            ]},
+        }},
+    }
+    msg = parse(payload)
+    assert msg is not None
+    assert msg.text == "1"
+    assert msg.updated_at == "200"

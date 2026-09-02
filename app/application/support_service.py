@@ -218,6 +218,9 @@ class SupportApplication:
             return False
 
         if normalized_state == ConversationStateKind.CHOOSING:
+            # Defensive duplicate of the global operator gate. Keeping this
+            # guard makes `_handle_state` safe when exercised directly and when
+            # called by any future internal workflow that bypasses `handle()`.
             if contains_operator_request(message.text):
                 await self._escalate(
                     session,
@@ -228,6 +231,9 @@ class SupportApplication:
                 return True
 
             candidate_ids = state.data.get("candidate_ids", [])
+            # Deterministic numeric/ordinal selection is resolved BEFORE any
+            # generic classifier call. The persisted candidate snapshot is the
+            # source of truth for the answer, not the current KB ranking.
             indices = self.pipeline.kb.parse_category_choice(
                 message.text,
                 max_index=len(candidate_ids),
@@ -319,6 +325,20 @@ class SupportApplication:
         escalations = EscalatedConversationRepository(session)
         if await escalations.is_escalated(message.entity_id):
             logger.info("Ignoring event for escalated conversation entity=%s", message.entity_id)
+            return
+
+        # Strict routing order is an invariant:
+        # 1) active escalation blocklist; 2) explicit operator request;
+        # 3) persisted conversational state; 4) fresh classifier.
+        # A numeric reply such as `1` must never reach the classifier while a
+        # CHOOSING state exists, and `оператор` must always escalate directly.
+        if contains_operator_request(message.text):
+            await self._escalate(
+                session,
+                message,
+                event,
+                EscalationReason.USER_REQUESTED_OPERATOR,
+            )
             return
 
         states = StateRepository(session)

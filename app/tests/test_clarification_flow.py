@@ -435,3 +435,129 @@ def test_top3_plus_same_turn_escalation_never_sends_unresolvable_menu(monkeypatc
     assert texts
     assert all("MENU" not in text for text in texts)
     assert FakeStates.instances.state == ConversationStateKind.ESCALATED
+
+
+def test_operator_is_checked_before_state_and_classifier(monkeypatch):
+    """Explicit operator request has absolute priority over persisted state."""
+    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
+        "candidate_ids": ["kb_a", "kb_b"],
+        "candidates": [
+            {"kb_id": "kb_a", "label": "A", "answer": "ANSWER A"},
+            {"kb_id": "kb_b", "label": "B", "answer": "ANSWER B"},
+        ],
+        "attempts": 0,
+    }))
+
+    class Pipeline:
+        class KB:
+            def parse_category_choice(self, text, max_index):
+                raise AssertionError("state parser must not run before operator check")
+        kb = KB()
+        async def decide(self, message):
+            raise AssertionError("classifier must not run for explicit operator request")
+
+    called = {}
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
+    async def fake_escalate(session, message, event, reason, reply_text=None):
+        called["reason"] = reason
+    app._escalate = fake_escalate
+
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "оператор")
+    class Event: id = 801
+
+    asyncio.run(app.handle(object(), Event(), message))
+    assert called["reason"] == EscalationReason.USER_REQUESTED_OPERATOR
+
+
+def test_numeric_choice_is_consumed_by_state_without_classifier(monkeypatch):
+    """A persisted Top-3 must make `1/2/3` deterministic and never reclassify it."""
+    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
+        "candidate_ids": ["kb_a", "kb_b", "kb_c"],
+        "candidates": [
+            {"kb_id": "kb_a", "label": "A", "answer": "ANSWER A"},
+            {"kb_id": "kb_b", "label": "B", "answer": "ANSWER B"},
+            {"kb_id": "kb_c", "label": "C", "answer": "ANSWER C"},
+        ],
+        "attempts": 0,
+    }))
+
+    class Pipeline:
+        class KB:
+            def parse_category_choice(self, text, max_index):
+                return [int(text)] if text.isdigit() and 1 <= int(text) <= max_index else []
+            def get_by_id(self, kb_id):
+                return {"id": kb_id, "template_answer": f"ANSWER {kb_id[-1].upper()}"}
+        kb = KB()
+        async def decide(self, message):
+            raise AssertionError("numeric choice must never reach generic classifier")
+
+    outbox = FakeOutbox()
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, outbox)
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "2")
+    class Event: id = 802
+
+    asyncio.run(app.handle(object(), Event(), message))
+    assert FakeStates.instances.state == ConversationStateKind.IDLE
+    texts = [
+        x["payload"]["text"]
+        for x in outbox.actions
+        if x["action_type"] == "intercom_reply"
+    ]
+    assert texts and "ANSWER B" in texts[-1]
+    assert "ANSWER A" not in texts[-1]
+
+
+def test_top3_persists_state_before_outbox_and_keeps_snapshot(monkeypatch):
+    """The menu is created only after state persistence, never the other way around."""
+    install_repos(monkeypatch, (ConversationStateKind.IDLE, {}))
+
+    events = []
+
+    class KB:
+        def get_by_id(self, kb_id):
+            return {
+                "id": kb_id,
+                "choice_label": kb_id,
+                "template_answer": f"ANSWER:{kb_id}",
+            }
+
+    class Pipeline:
+        kb = KB()
+        async def decide(self, message):
+            return ProcessingResult(
+                traces=[DecisionTrace(
+                    decision=Decision.CHOICE,
+                    question=message.text,
+                    choice_candidate_ids=["kb_a", "kb_b"],
+                    choice_candidates=[
+                        {"kb_id": "kb_a", "label": "A", "answer": "A"},
+                        {"kb_id": "kb_b", "label": "B", "answer": "B"},
+                    ],
+                )],
+                actions=[OutboundAction("reply", "MENU")],
+            )
+
+    import app.application.support_service as module
+
+    class OrderedStates(FakeStates):
+        async def replace(self, entity_id, state, data):
+            events.append(("state", state, dict(data)))
+            await super().replace(entity_id, state, data)
+
+    class OrderedOutbox(FakeOutbox):
+        async def enqueue(self, **kwargs):
+            assert FakeStates.instances.state == ConversationStateKind.CHOOSING
+            assert FakeStates.instances.data["candidate_ids"] == ["kb_a", "kb_b"]
+            events.append(("outbox", kwargs["action_type"]))
+            return await super().enqueue(**kwargs)
+
+    monkeypatch.setattr(module, "StateRepository", OrderedStates)
+    outbox = OrderedOutbox()
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, outbox)
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "исходный вопрос")
+    class Event: id = 803
+
+    asyncio.run(app.handle(object(), Event(), message))
+    assert events[0][0] == "state"
+    assert any(kind == "outbox" for kind, *_ in events)
+    assert events.index(next(item for item in events if item[0] == "state")) < events.index(next(item for item in events if item[0] == "outbox"))

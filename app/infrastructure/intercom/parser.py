@@ -1,6 +1,5 @@
 from __future__ import annotations
 import hashlib, hmac, re
-from datetime import datetime
 from app.core.config import settings
 from app.domain.enums import Channel
 from app.domain.models import InboundMessage
@@ -27,40 +26,29 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     parts = item.get("conversation_parts", {}).get("conversation_parts", []) or []
     topic = payload.get("topic", "")
 
-    # Intercom exposes the conversation as history, where the first customer
-    # message is still present after later replies arrive. Classification must
-    # operate on the LATEST customer message. Prefer the freshest timestamp
-    # across `source` and `conversation_parts`; when timestamps are missing,
-    # retain payload order and take the last user part.
-    user_parts = [
-        p for p in parts
-        if (p.get("author", {}) or {}).get("type") == "user" and p.get("body")
-    ]
-    if (source.get("author", {}) or {}).get("type") == "user" and source.get("body"):
-        user_parts.append(source)
-
-    def _timestamp(value: object) -> float:
-        if value in (None, ""):
-            return -1.0
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            try:
-                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-            except (TypeError, ValueError, OverflowError):
-                return -1.0
-
-    if user_parts:
-        part = max(
-            enumerate(user_parts),
-            key=lambda pair: (_timestamp(pair[1].get("created_at")), pair[0]),
-        )[1]
-    elif topic == "conversation.user.replied" and source.get("body") and not (source.get("author", {}) or {}).get("type"):
-        # Compatibility fallback only when author.type is genuinely absent. An
-        # explicit admin/bot author must never be treated as a customer reply.
+    # For `conversation.user.replied`, `source` is the message that triggered
+    # this webhook. Prefer it over the full conversation history. A delayed or
+    # retried webhook can arrive after later user messages are already present in
+    # the conversation; selecting the newest historical message would then run
+    # the classifier against the wrong text and can bypass an active Top-3 state.
+    source_author_type = (source.get("author", {}) or {}).get("type")
+    if topic == "conversation.user.replied" and source.get("body") and source_author_type == "user":
         part = source
     else:
-        return None
+        user_parts = [
+            p for p in parts
+            if (p.get("author", {}) or {}).get("type") == "user" and p.get("body")
+        ]
+        if user_parts:
+            # Compatibility fallback for payloads where the current source is
+            # absent or incomplete. Preserve payload order in this fallback.
+            part = user_parts[-1]
+        elif topic == "conversation.user.replied" and source.get("body") and not source_author_type:
+            # Compatibility fallback only when author.type is genuinely absent.
+            # An explicit admin/bot author must never be treated as a customer reply.
+            part = source
+        else:
+            return None
 
     text = _strip(part.get("body", ""))
     attachments = bool(part.get("attachments"))

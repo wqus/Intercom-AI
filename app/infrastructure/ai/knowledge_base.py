@@ -1435,18 +1435,6 @@ class KnowledgeBase:
         ):
             return "kb_040"
 
-        # Online learning is a distinct education intent: route explicit
-        # questions about online schools/courses to the dedicated KB answer.
-        # The rule is intentionally narrow and excludes mentorship so that a
-        # shared word like "онлайн" cannot determine the category by itself.
-        online_training_signal = (
-            has_any("онлайн", "удален", "удалён", "дистанцион")
-            and has_any("обучен", "учит", "школ", "кур")
-            and not has_any("настав", "ментор")
-        )
-        if online_training_signal:
-            return "kb_047"
-
         # Speaking/intensive/collaboration requests are a separate role from
         # becoming a mentor or joining mentorship as a student.
         if (
@@ -2782,6 +2770,16 @@ class KnowledgeBase:
         rival with a strong positive signal/facet fit can veto the shortcut and
         send the query through the normal contrastive ranker.
         """
+        # A generic education-entry hard rule must not win when the query
+        # explicitly establishes an online-education context. In that situation
+        # the exact route must be decided by the normal semantic/contrastive
+        # ranker, where online-training, generic entry and school-info remain
+        # distinct candidates. This is a concept-level guard, not a phrase rule.
+        q_facets = self._question_facets(question)
+        intent_type = str(entry.get("intent_type") or "")
+        if "online_training" in q_facets and intent_type in {"education_entry", "school_registration"}:
+            return False, "hard_rule_online_context_requires_semantic_ranking"
+
         candidate_fit, _ = self._intent_fit(question, entry)
         candidate_family = self._family_fit(question, entry)
         candidate_pos, candidate_neg = self._intent_signal_hits(question, entry)
@@ -3757,6 +3755,77 @@ class KnowledgeBase:
             return True
         return int(constraint_evidence.get("failed_any_groups", 0) or 0) > 0
 
+    @staticmethod
+    def _choice_context_compatibility(
+        question: str,
+        top_item: dict,
+        candidate: dict,
+    ) -> tuple[float, str]:
+        """Measure semantic/business-context compatibility for a Top-3 alternative.
+
+        Top-3 alternatives do not need to share the leader's exact intent. They
+        do need to explain the same user situation. This helper compares the
+        structured meaning extracted from the query with the candidate ontology
+        and allows related business objects inside one domain (for example
+        education -> school/training/flow) without making them interchangeable
+        for automatic answering.
+        """
+        qo = KnowledgeBase._query_ontology(question)
+        q_facets = KnowledgeBase._question_facets(question)
+        top_entry = top_item.get("entry") or {}
+        entry = candidate.get("entry") or {}
+        top_ontology = top_item.get("ontology") or KnowledgeBase._derive_ontology(top_entry)
+        ontology = candidate.get("ontology") or KnowledgeBase._derive_ontology(entry)
+        candidate_family = str(entry.get("family") or "other")
+        top_family = str(top_entry.get("family") or "other")
+        score = 0.0
+        reasons: list[str] = []
+
+        if candidate_family == top_family and candidate_family != "other":
+            score += 0.18
+            reasons.append("same_family")
+
+        q_objects = set(qo.get("object") or set())
+        candidate_object = ontology.get("object")
+        top_object = top_ontology.get("object")
+        education_objects = {"education", "training", "school", "flow"}
+        if candidate_object and candidate_object in q_objects:
+            score += 0.42
+            reasons.append("query_object")
+        elif candidate_object and top_object and candidate_object == top_object:
+            score += 0.28
+            reasons.append("same_object")
+        elif candidate_family == "education" and candidate_object in education_objects and q_objects & education_objects:
+            score += 0.30
+            reasons.append("related_education_object")
+
+        query_action = set(qo.get("action") or set())
+        query_state = set(qo.get("state") or set())
+        candidate_action = ontology.get("action")
+        candidate_state = ontology.get("state")
+        if candidate_action and candidate_action in query_action:
+            score += 0.18
+            reasons.append("query_action")
+        if candidate_state and candidate_state in query_state:
+            score += 0.14
+            reasons.append("query_state")
+
+        candidate_facet = ontology.get("facet")
+        if candidate_facet and candidate_facet in q_facets:
+            score += 0.18
+            reasons.append("query_facet")
+
+        # Online is a contextual modifier, not an exclusive intent by itself.
+        # If the query clearly combines education + online, related education
+        # intents stay valid Top-3 alternatives unless they explicitly
+        # contradict the query. The dedicated online-training intent still wins
+        # when its semantic evidence is strongest.
+        if "online_training" in q_facets and candidate_family == "education" and candidate_object in education_objects:
+            score += 0.22
+            reasons.append("online_education_context")
+
+        return float(min(1.0, score)), ";".join(reasons) or "no_shared_context"
+
     def _category_choice_candidates(self, ranked: list[dict], question: str | None = None) -> list[dict]:
         """Build a small, semantically coherent user-facing choice set.
 
@@ -3778,11 +3847,22 @@ class KnowledgeBase:
             return []
         if top_score < 0.48:
             return []
-        # Top-3 is for genuine ambiguity, not for a clear winner.
-        if top_margin > CATEGORY_CHOICE_MAX_MARGIN:
+        query_text = str(question or top.get("question") or "")
+        query_facets = self._question_facets(query_text) if query_text else set()
+        # Some real support questions contain a strong contextual modifier (for
+        # example online + education) while the exact route is intentionally
+        # distributed across several related education intents. In that case a
+        # somewhat larger score gap is still genuine ambiguity, because the
+        # leading route and the alternatives describe different ways to satisfy
+        # the same request. For all other queries keep the original strict gap.
+        context_ambiguity_margin = (
+            0.34
+            if "online_training" in query_facets and str(top.get("entry", {}).get("family") or "") == "education"
+            else CATEGORY_CHOICE_MAX_MARGIN
+        )
+        if top_margin > context_ambiguity_margin:
             return []
 
-        query_text = str(question or top.get("question") or "")
         qo = self._query_ontology(query_text) if query_text else {}
         query_facets = self._question_facets(query_text) if query_text else set()
         top_entry = top.get("entry") or {}
@@ -3815,48 +3895,45 @@ class KnowledgeBase:
                 continue
             if item.get("negative_hits") or (item.get("constraint_evidence") or {}).get("forbidden_hits"):
                 continue
-            if score < 0.48 or fit < 0.50 or real_ev < CATEGORY_CHOICE_MIN_REAL_EVIDENCE:
+            context_compatibility, context_reason = self._choice_context_compatibility(
+                query_text, top, item,
+            )
+            # The leader remains strict; alternatives are judged by semantic
+            # context rather than requiring an exact ontology-field match.
+            # This preserves recall for natural paraphrases while keeping a
+            # minimum evidence floor before anything becomes user-visible.
+            contextual_modifier = (
+                "online_training" in query_facets
+                and str(entry.get("family") or "") == "education"
+            )
+            min_fit = 0.50
+            min_real_ev = CATEGORY_CHOICE_MIN_REAL_EVIDENCE
+            if context_compatibility >= 0.72:
+                min_fit = 0.44
+                min_real_ev = 0.28
+            elif contextual_modifier and context_compatibility >= 0.60:
+                # A contextual facet such as online_training can legitimately
+                # differ from a generic education route's primary facet. Do not
+                # require exact facet equality for a Top-3 alternative when the
+                # business object/domain is strongly aligned.
+                min_fit = 0.26
+                min_real_ev = 0.28
+            if score < 0.48 or fit < min_fit or real_ev < min_real_ev:
                 continue
-            # The best option must be grounded in explicit user intent.
-            # Alternatives do not have to repeat the exact phrase: they are allowed
-            # when the query's object/action/state/facet places them in the same
-            # support context. This is what makes Top-3 useful for terse real-world
-            # messages such as "не могу зарегистрироваться".
             if item is top and CATEGORY_CHOICE_REQUIRE_TOP_DIRECT_SUPPORT and not explicit_intent:
                 continue
             if top_score - score > CATEGORY_CHOICE_MIN_SCORE_GAP_FROM_BEST:
                 continue
-            if domain < 0.20 and not explicit_intent:
+            if context_compatibility < 0.60:
                 continue
-            if ontology_alignment < 0.46 and not explicit_intent:
+            if domain < 0.16 and not explicit_intent:
                 continue
-
-            family = str(entry.get("family") or "other")
-            candidate_ontology = item.get("ontology") or {}
-            candidate_object = candidate_ontology.get("object")
-            candidate_action = candidate_ontology.get("action")
-            candidate_state = candidate_ontology.get("state")
-            same_family = family == top_family
-            same_object = bool(candidate_object and top_ontology.get("object") and candidate_object == top_ontology.get("object"))
-            query_object_match = bool(query_object and candidate_object and candidate_object in query_object)
-            query_action_match = bool(query_action and candidate_action and set(candidate_action) & set(query_action))
-            query_state_match = bool(query_state and candidate_state and set(candidate_state) & set(query_state))
-            meaningful_query_context = bool(
-                query_object_match or query_action_match or query_state_match
-                or (candidate_ontology.get("facet") and candidate_ontology.get("facet") in query_facets)
-            )
-
-            # Candidates must share the *query's* semantic context, not merely
-            # the leader's family. Same-family alone is too broad for Top-3.
-            if not meaningful_query_context:
-                continue
-
-            # When there is no explicit lexical hit, structured context must be
-            # strong enough to prove that this candidate is independently plausible.
-            if not explicit_intent and not (real_ev >= CATEGORY_CHOICE_MIN_CONTEXT_EVIDENCE and fit >= 0.48 and domain >= 0.20 and ontology_alignment >= 0.46):
+            if ontology_alignment < 0.38 and not explicit_intent and context_compatibility < 0.72:
                 continue
 
             payload = self._choice_candidate_payload(item)
+            payload["context_compatibility"] = float(context_compatibility)
+            payload["context_compatibility_reason"] = context_reason
             payload["margin"] = float(top_margin)
             eligible.append(payload)
 

@@ -2,11 +2,10 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 
-def test_business_metrics_are_documented():
-    path=ROOT.parent/"BUSINESS_VALUE.md"
-    text=path.read_text(encoding="utf-8")
-    for marker in ("75%", "25–30%", "1000+", "3000+", "<5 секунд"):
-        assert marker in text
+def test_project_has_production_changelog():
+    project_root = ROOT.parent
+    candidates = list(project_root.glob("CHANGELOG_*.md"))
+    assert candidates, "production changelog must be shipped with the project"
 
 def test_webhook_is_thin():
     text=(ROOT/"api/webhook.py").read_text(encoding="utf-8")

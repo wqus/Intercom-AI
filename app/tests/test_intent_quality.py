@@ -738,3 +738,42 @@ def test_category_choice_allows_contextual_alternatives_without_exact_phrase():
     # alternatives, without requiring their exact trigger phrase.
     choices = kb._category_choice_candidates(ranked, question="Не могу зарегистрироваться")
     assert [c["kb_id"] for c in choices] == ["kb_002", "kb_033"] or [c["kb_id"] for c in choices] == ["kb_002", "kb_033", "kb_043"]
+
+
+def test_online_training_natural_paraphrase_is_not_a_hard_rule():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match(
+        "Добрый день! Хочу пройти обучение. Есть возможность пройти онлайн. Как это можно осуществить?"
+    ) is None
+
+
+def test_online_training_natural_paraphrase_extracts_semantic_context():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    question = "Хочу пройти обучение. Есть возможность пройти онлайн. Как это можно осуществить?"
+    facets = kb._question_facets(question)
+    ontology = kb._query_ontology(question)
+    assert "online_training" in facets
+    assert "training" in ontology["object"]
+    assert "online" in ontology["facet"]
+    assert ontology["action"] == set()
+
+
+def test_online_training_top3_context_accepts_related_education_intents():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    question = "Хочу пройти обучение. Есть возможность пройти онлайн. Как это можно осуществить?"
+    online = {"id": "kb_047", "intent_type": "online_training", "family": "education", "intent_facets": ["online_training", "online"]}
+    entry = {"id": "kb_035", "intent_type": "education_entry", "family": "education", "intent_facets": ["procedure"]}
+    top = {"entry": online, "ontology": {"object": "training", "action": "learn", "state": "online", "facet": "online"}}
+    candidate = {"entry": entry, "ontology": {"object": "education", "action": "enter", "state": "procedure", "facet": "procedure"}}
+    compatibility, reason = kb._choice_context_compatibility(question, top, candidate)
+    assert compatibility >= 0.70
+    assert "online_education_context" in reason
+
+
+def test_online_training_top3_context_rejects_unrelated_family():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    question = "Хочу пройти обучение. Есть возможность пройти онлайн. Как это можно осуществить?"
+    top = {"entry": {"id": "kb_047", "family": "education"}, "ontology": {"object": "training", "action": "learn", "state": "online", "facet": "online"}}
+    candidate = {"entry": {"id": "kb_012", "family": "payments"}, "ontology": {"object": "training", "action": "pay", "state": "information", "facet": "price"}}
+    compatibility, _ = kb._choice_context_compatibility(question, top, candidate)
+    assert compatibility < 0.45

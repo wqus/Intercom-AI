@@ -243,11 +243,14 @@ def test_inbound_and_routing_logs_keep_full_text(caplog):
     assert "reason-" + "x" * 300 in joined
 
 
-def test_online_training_hard_rule_routes_to_dedicated_kb():
+def test_online_training_natural_query_bypasses_generic_education_hard_rule():
     kb = KnowledgeBase.__new__(KnowledgeBase)
     assert kb._hard_rule_match(
-        "Здравствуйте! Какие есть онлайн-школы и как записаться на онлайн обучение?"
-    ) == "kb_047"
+        "Добрый день! Хочу пройти обучение. Есть возможность пройти онлайн. Как это можно осуществить?"
+    ) != "kb_035"
+    assert "online_training" in kb._question_facets(
+        "Добрый день! Хочу пройти обучение. Есть возможность пройти онлайн. Как это можно осуществить?"
+    )
 
 
 def test_online_training_answer_is_exact_and_routable():
@@ -272,11 +275,11 @@ def test_online_training_is_not_triggered_by_generic_online_word():
     assert kb._hard_rule_match("Есть ли онлайн формат мероприятия 9 сентября?") != "kb_047"
 
 
-def test_online_training_handles_common_russian_variants():
+def test_online_training_common_variants_are_semantically_marked():
     kb = KnowledgeBase.__new__(KnowledgeBase)
     for question in (
         "Подскажите, есть ли дистанционное обучение?",
         "Хочу учиться онлайн, какие школы доступны?",
         "Где посмотреть список онлайн школ?",
     ):
-        assert kb._hard_rule_match(question) == "kb_047"
+        assert "online_training" in kb._question_facets(question)
