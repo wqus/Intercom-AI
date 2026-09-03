@@ -8,7 +8,7 @@ from app.domain.response_composer import ResponseComposer
 from app.infrastructure.ai.knowledge_base import (
     KnowledgeBase, MatchMode, MatchResult, contains_operator_request, is_non_query_message,
 )
-from app.infrastructure.ai.llm_client import YandexLLMClient
+from app.infrastructure.ai.llm_client import PolzaLLMClient
 from app.core.config import settings
 
 logger = logging.getLogger("decision_pipeline")
@@ -16,7 +16,7 @@ logger = logging.getLogger("decision_pipeline")
 class DecisionPipeline:
     """Application-level policy. Retrieval and generation remain infrastructure concerns."""
 
-    def __init__(self, kb: KnowledgeBase, llm: YandexLLMClient):
+    def __init__(self, kb: KnowledgeBase, llm: PolzaLLMClient | None):
         self.kb = kb
         self.llm = llm
 
@@ -51,6 +51,103 @@ class DecisionPipeline:
             decision_reason=match.decision_reason,
         )
 
+    async def _decide_with_llm(
+        self,
+        trace: DecisionTrace,
+        question: str,
+        match: MatchResult,
+    ) -> tuple[DecisionTrace, list[OutboundAction]]:
+        """Use Polza only after deterministic routing cannot safely choose."""
+        assert self.llm is not None
+
+        candidates = list(match.relevant_entries or [])
+        if not candidates:
+            trace.decision = Decision.ESCALATE
+            trace.automated = True
+            trace.llm_used = False
+            trace.escalation_reason = EscalationReason.NO_CATEGORY
+            trace.decision_reason = (trace.decision_reason or "no_candidates") + ";llm_no_candidates"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+
+        # Keep the LLM candidate set intentionally narrow. The hybrid KB has
+        # already done retrieval/ranking; the LLM is only the final semantic judge.
+        candidates = candidates[:7]
+        result = await self.llm.classify(question, candidates)
+        trace.llm_used = True
+        trace.automated = True
+
+        if result.escalation or not result.selected_kb_ids:
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = (trace.decision_reason or "supported_intent_needs_llm") + ";llm_escalation"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+
+        business_answers: list[str] = []
+        selected_ids: list[str] = []
+        validation_reasons: list[str] = []
+        candidate_set = {str(entry.get("id")) for entry in candidates}
+
+        for kb_id in result.selected_kb_ids:
+            kb_id = str(kb_id).strip()
+            if kb_id not in candidate_set:
+                trace.decision = Decision.ESCALATE
+                trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+                trace.decision_reason = "llm_selected_unknown_candidate"
+                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+
+            valid, reason, _ = self.kb.validate_llm_selection(question, kb_id)
+            validation_reasons.append(reason)
+            if not valid:
+                trace.decision = Decision.ESCALATE
+                trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+                trace.decision_reason = f"llm_selection_rejected:{kb_id}:{reason}"
+                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+
+            entry = self.kb.entries_by_id.get(kb_id)
+            entry_data = entry or {}
+            requires_clarification = bool(entry_data.get("requires_clarification"))
+            clarification = str(entry_data.get("clarification_question") or "").strip()
+            template = str(entry_data.get("template_answer") or "").strip()
+
+            # If the selected KB intent requires clarification, preserve that
+            # contract instead of silently treating its generic template_answer
+            # as a final answer. The next user turn must be routed with kb_id.
+            if requires_clarification:
+                if not clarification:
+                    trace.decision = Decision.ESCALATE
+                    trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+                    trace.decision_reason = f"llm_selected_clarification_without_question:{kb_id}"
+                    return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+                if len(result.selected_kb_ids) != 1:
+                    # A single conversation state cannot safely represent two
+                    # simultaneous clarification intents.
+                    trace.decision = Decision.ESCALATE
+                    trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+                    trace.decision_reason = "llm_multi_intent_with_clarification"
+                    return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+
+                trace.decision = Decision.CLARIFY
+                trace.kb_id = kb_id
+                trace.category = str(entry_data.get("category") or "") or trace.category
+                trace.decision_reason = "llm_selected_clarification:" + ";".join(validation_reasons)
+                return trace, [OutboundAction("reply", ResponseComposer.rephrase(clarification))]
+
+            if not template:
+                trace.decision = Decision.ESCALATE
+                trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+                trace.decision_reason = f"llm_selected_without_approved_text:{kb_id}"
+                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+
+            selected_ids.append(kb_id)
+            business_answers.append(template)
+
+        trace.decision = Decision.ANSWER_TEMPLATE
+        trace.kb_id = selected_ids[0]
+        first_entry = self.kb.entries_by_id.get(selected_ids[0]) or {}
+        trace.category = str(first_entry.get("category") or "") or trace.category
+        trace.decision_reason = "llm_selected_validated:" + ",".join(validation_reasons)
+        return trace, [OutboundAction("business_answer", answer) for answer in business_answers]
+
     async def decide_match(self, match: MatchResult, question: str) -> tuple[DecisionTrace, list[OutboundAction]]:
         trace = self._trace(match, question)
 
@@ -84,96 +181,51 @@ class DecisionPipeline:
             return trace, [OutboundAction("reply", ResponseComposer.rephrase(match.template_answer or rephrase_prompt()))]
 
         if match.mode == MatchMode.CATEGORY_CHOICE:
-            cands = list(match.choice_candidates or []) or list(getattr(match, "top_candidates", None) or [])
-            labels = []
-            ids = []
-            safe_candidates = []
-            for c in cands[:3]:
-                if not isinstance(c, dict):
-                    continue
-                label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "").strip()
-                cid = str(c.get("kb_id") or "").strip()
-                answer = str(c.get("template_answer") or "").strip()
-                if not label or not cid or not answer:
-                    continue
-                labels.append(label)
-                ids.append(cid)
-                safe_candidates.append({"kb_id": cid, "label": label, "answer": answer})
-            if not settings.USER_VISIBLE_TOP3:
-                # A hidden menu must never create a CHOICE trace/state. The user
-                # cannot select something they were not shown. Because this is a
-                # substantive unresolved request, do not silently drop it: use
-                # the standard human fallback instead.
-                trace.decision = Decision.ESCALATE
-                trace.automated = True
-                trace.choice_candidate_ids = None
-                trace.escalation_reason = EscalationReason.NO_CATEGORY
-                trace.decision_reason = (trace.decision_reason or "ambiguous") + ";top3_disabled_escalate"
-                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
-            trace.decision = Decision.CHOICE
-            trace.automated = True
-            trace.choice_candidate_ids = ids if len(ids) >= 2 else None
-            trace.choice_candidates = safe_candidates if len(safe_candidates) >= 2 else None
-            if len(labels) < 2:
-                trace.decision = Decision.REPHRASE
-                return trace, [OutboundAction("reply", ResponseComposer.rephrase(rephrase_prompt()))]
-            return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
-
-        if match.mode == MatchMode.LLM and match.relevant_entries:
-            # LLM disabled in live: always prefer Top-3 over rephrase.
+            # User-visible Top-3 is a first-class routing outcome. It is used only
+            # for close, independently supported intents. Weak/OOS cases never
+            # reach this branch; middle-band cases use MatchMode.LLM instead.
             candidates = list(match.choice_candidates or [])
             if len(candidates) < 2:
-                candidates = list(getattr(match, "top_candidates", None) or [])
-            if len(candidates) < 2:
-                try:
-                    candidates = self.kb.get_category_choice_candidates(question, top_n=3)
-                except Exception:
-                    logger.exception("Failed to build Top-3 fallback for LLM route")
-                    candidates = []
+                trace.decision = Decision.ESCALATE
+                trace.automated = True
+                trace.llm_used = False
+                trace.escalation_reason = EscalationReason.NO_CATEGORY
+                trace.decision_reason = (trace.decision_reason or "choice_invalid") + ";choice_candidates_missing"
+                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
-            if len(candidates) >= 2:
-                labels = []
-                ids = []
-                safe_candidates = []
-                for c in candidates[:3]:
-                    if not isinstance(c, dict):
-                        continue
-                    label = str(c.get("choice_label") or c.get("category") or c.get("kb_id") or "").strip()
-                    cid = str(c.get("kb_id") or "").strip()
-                    answer = str(c.get("template_answer") or "").strip()
-                    if not label or not cid or not answer:
-                        continue
-                    labels.append(label)
-                    ids.append(cid)
-                    safe_candidates.append({"kb_id": cid, "label": label, "answer": answer})
-                if len(labels) >= 2 and settings.USER_VISIBLE_TOP3:
-                    trace.decision = Decision.CHOICE
-                    trace.automated = True
-                    trace.llm_used = False
-                    trace.choice_candidate_ids = ids if len(ids) >= 2 else None
-                    trace.choice_candidates = safe_candidates if len(safe_candidates) >= 2 else None
-                    trace.decision_reason = (
-                        trace.decision_reason or "supported_intent_needs_llm"
-                    ) + ";llm_disabled_safe_top3"
-                    return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
+            trace.decision = Decision.CHOICE
+            trace.automated = True
+            trace.llm_used = False
+            normalized = []
+            for item in candidates[:3]:
+                if not isinstance(item, dict):
+                    continue
+                kb_id = str(item.get("kb_id") or item.get("id") or "").strip()
+                label = str(item.get("choice_label") or item.get("label") or item.get("category") or kb_id).strip()
+                answer = str(item.get("template_answer") or item.get("answer") or "").strip()
+                if kb_id and label:
+                    normalized.append({"kb_id": kb_id, "label": label, "answer": answer})
 
-            # A substantive query that the deterministic system cannot safely
-            # answer must never disappear silently. Escalation is the explicit
-            # fallback for supported-looking / unresolved questions; IGNORE is
-            # reserved for genuine noise handled before routing.
+            trace.choice_candidates = normalized
+            trace.choice_candidate_ids = [x["kb_id"] for x in normalized]
+            trace.decision_reason = trace.decision_reason or "ambiguous_supported_choice"
+            labels = "\n".join(f"{i}. {item['label']}" for i, item in enumerate(normalized, 1))
+            text = (
+                "Похоже, ваш вопрос может относиться к нескольким вариантам. "
+                "Выберите подходящий номер:\n\n" + labels
+            )
+            return trace, [OutboundAction("reply", text)]
+
+        if match.mode == MatchMode.LLM:
+            if settings.LLM_ENABLED and self.llm and match.relevant_entries:
+                return await self._decide_with_llm(trace, question, match)
+
             trace.decision = Decision.ESCALATE
             trace.automated = True
             trace.llm_used = False
             trace.escalation_reason = EscalationReason.NO_CATEGORY
-            trace.decision_reason = (
-                trace.decision_reason or "supported_intent_needs_llm"
-            ) + ";no_routable_state_escalate"
+            trace.decision_reason = (trace.decision_reason or "supported_intent_needs_llm") + ";llm_disabled_escalate"
             return trace, [OutboundAction("reply", self._escalation_reply(), True)]
-
-            # FUTURE LLM PATH (intentionally disabled for now):
-            # result = await self.llm.classify(question, match.relevant_entries)
-            # ... validate selected_kb_id with self.kb.validate_llm_selection(...)
-            # ... send result.answer only after the model is re-enabled and audited.
 
         if match.mode == MatchMode.REPHRASE:
             trace.decision = Decision.REPHRASE

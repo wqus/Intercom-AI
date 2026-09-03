@@ -62,108 +62,84 @@ def test_meta_noise_produces_no_reply():
     assert result.actions == []
 
 
-def test_top3_output_disabled_escalates_substantive_ambiguity(monkeypatch):
+def test_category_choice_is_user_visible_and_not_llm(monkeypatch):
     from app.application import decision_pipeline as module
-    monkeypatch.setattr(module.settings, "USER_VISIBLE_TOP3", False)
+    monkeypatch.setattr(module.settings, "LLM_ENABLED", True)
 
     class FakeKB:
-        def get_category_choice_candidates(self, q): return []
-    class FakeLLM: pass
-    from app.infrastructure.ai.knowledge_base import MatchResult, MatchMode
+        entries_by_id = {}
+    class FakeLLM:
+        async def classify(self, *_args, **_kwargs):
+            raise AssertionError("Top-3 choice must not call LLM")
+
     pipeline = DecisionPipeline(FakeKB(), FakeLLM())
+    from app.infrastructure.ai.knowledge_base import MatchResult, MatchMode
     match = MatchResult(
-        MatchMode.CATEGORY_CHOICE, 0.8, "Cat A", None, None, [],
-        choice_candidates=[{"kb_id":"a","choice_label":"A","template_answer":"A answer"},{"kb_id":"b","choice_label":"B","template_answer":"B answer"}],
+        MatchMode.CATEGORY_CHOICE, 0.8, "Cat A", None, "kb_1", [],
+        choice_candidates=[
+            {"kb_id":"kb_1","choice_label":"A","template_answer":"A answer"},
+            {"kb_id":"kb_2","choice_label":"B","template_answer":"B answer"},
+        ],
         decision_reason="ambiguous", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
-    assert trace.decision.value == 'escalate'
-    assert trace.escalation_reason == EscalationReason.NO_CATEGORY
-    assert actions and actions[0].escalate is True
+    assert trace.decision == Decision.CHOICE
+    assert trace.llm_used is False
+    assert trace.choice_candidate_ids == ["kb_1", "kb_2"]
+    assert actions and "1. A" in (actions[0].text or "") and "2. B" in (actions[0].text or "")
 
-def test_llm_route_never_calls_llm_even_if_config_is_misconfigured(monkeypatch):
+def test_llm_mode_selects_and_validates_template(monkeypatch):
     from app.application import decision_pipeline as module
     monkeypatch.setattr(module.settings, "LLM_ENABLED", True)
-    monkeypatch.setattr(module.settings, "USER_VISIBLE_TOP3", True)
 
     class FakeKB:
-        def get_category_choice_candidates(self, q, top_n=3):
-            return [
-                {"kb_id":"kb_1", "choice_label":"Вариант 1", "template_answer":"Ответ 1"},
-                {"kb_id":"kb_2", "choice_label":"Вариант 2", "template_answer":"Ответ 2"},
-                {"kb_id":"kb_3", "choice_label":"Вариант 3", "template_answer":"Ответ 3"},
-            ]
+        entries_by_id = {
+            "kb_1": {"id": "kb_1", "category": "A", "template_answer": "Answer A"},
+        }
+        def validate_llm_selection(self, q, kb_id):
+            return True, "ok", {}
 
-    class NeverCallLLM:
-        async def classify(self, *_args, **_kwargs):
-            raise AssertionError("LLM must never be called in conservative mode")
+    class FakeLLM:
+        async def classify(self, question, candidates):
+            from app.infrastructure.ai.llm_client import LLMResult
+            assert candidates
+            return LLMResult(["kb_1"])
 
-    pipeline = DecisionPipeline(FakeKB(), NeverCallLLM())
+    pipeline = DecisionPipeline(FakeKB(), FakeLLM())
+    from app.infrastructure.ai.knowledge_base import MatchResult, MatchMode
     match = MatchResult(
-        MatchMode.LLM, 0.8, "Cat A", None, "kb_1",
-        [{"kb_id":"kb_1","category":"Cat A"}],
-        decision_reason="supported_intent_needs_llm", subquestion="q"
+        MatchMode.LLM, 0.6, "Cat A", None, "kb_1", [{"id": "kb_1"}],
+        decision_reason="middle_band", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
-    assert trace.decision == Decision.CHOICE
-    assert trace.llm_used is False
-    assert len(actions) == 1
+    assert trace.decision == Decision.ANSWER_TEMPLATE
+    assert trace.llm_used is True
+    assert actions and actions[0].text == "Answer A"
 
 
-def test_llm_route_is_converted_to_top3_without_calling_llm(monkeypatch):
+def test_llm_escalation_is_the_only_fallback(monkeypatch):
     from app.application import decision_pipeline as module
-    monkeypatch.setattr(module.settings, "LLM_ENABLED", False)
-    monkeypatch.setattr(module.settings, "USER_VISIBLE_TOP3", True)
+    monkeypatch.setattr(module.settings, "LLM_ENABLED", True)
 
     class FakeKB:
-        def get_category_choice_candidates(self, q, top_n=3):
-            return [
-                {"kb_id":"kb_1", "choice_label":"Вариант 1", "template_answer":"Ответ 1"},
-                {"kb_id":"kb_2", "choice_label":"Вариант 2", "template_answer":"Ответ 2"},
-                {"kb_id":"kb_3", "choice_label":"Вариант 3", "template_answer":"Ответ 3"},
-            ]
+        entries_by_id = {}
+        def validate_llm_selection(self, q, kb_id):
+            return False, "bad", {}
 
-    class NeverCallLLM:
+    class FakeLLM:
         async def classify(self, *_args, **_kwargs):
-            raise AssertionError("LLM must never be called in conservative mode")
+            from app.infrastructure.ai.llm_client import LLMResult
+            return LLMResult([], escalation=True, reason="model_escalation")
 
-    pipeline = DecisionPipeline(FakeKB(), NeverCallLLM())
+    pipeline = DecisionPipeline(FakeKB(), FakeLLM())
     match = MatchResult(
-        MatchMode.LLM, 0.80, "Cat A", None, "kb_1",
-        [{"kb_id":"kb_1","category":"Cat A"}],
-        decision_reason="supported_intent_needs_llm", subquestion="q"
-    )
-    trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
-    assert trace.decision == Decision.CHOICE
-    assert trace.llm_used is False
-    assert len(actions) == 1
-    assert "1. Вариант 1" in actions[0].text
-    assert "2. Вариант 2" in actions[0].text
-    assert "3. Вариант 3" in actions[0].text
-
-
-def test_llm_route_escalates_when_no_safe_top3(monkeypatch):
-    from app.application import decision_pipeline as module
-    monkeypatch.setattr(module.settings, "LLM_ENABLED", False)
-
-    class FakeKB:
-        def get_category_choice_candidates(self, q, top_n=3):
-            return []
-
-    class NeverCallLLM:
-        async def classify(self, *_args, **_kwargs):
-            raise AssertionError("LLM must never be called in conservative mode")
-
-    pipeline = DecisionPipeline(FakeKB(), NeverCallLLM())
-    match = MatchResult(
-        MatchMode.LLM, 0.60, "Cat A", None, "kb_1",
-        [{"kb_id":"kb_1","category":"Cat A"}],
-        decision_reason="supported_intent_needs_llm", subquestion="q"
+        MatchMode.LLM, 0.6, "Cat A", None, "kb_1",
+        [{"id": "kb_1"}], decision_reason="supported_intent_needs_llm", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
     assert trace.decision == Decision.ESCALATE
-    assert trace.llm_used is False
-    assert trace.escalation_reason == EscalationReason.NO_CATEGORY
+    assert trace.llm_used is True
+    assert trace.escalation_reason == EscalationReason.LLM_CANNOT_ANSWER
     assert actions and actions[0].escalate is True
 
 

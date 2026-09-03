@@ -1,9 +1,9 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    YANDEX_API_KEY: str = ""
-    YANDEX_FOLDER_ID: str = ""
-    YANDEX_PROMPT_ID: str = ""
+    POLZA_API_KEY: str = ""
+    POLZA_MODEL: str = "anthropic/claude-sonnet-5"
+    POLZA_TEMPERATURE: float = 0.0
     INTERCOM_TOKEN: str = ""
     INTERCOM_CLIENT_SECRET: str = ""
     INTERCOM_ADMIN_ID: str = ""
@@ -16,11 +16,11 @@ class Settings(BaseSettings):
     KB_PATH: str = "data/knowledge_base.json"
     EMBEDDING_DEVICE: str = "cpu"
     USE_RERANKER: bool = False
-    # Conservative production routing: do not call the LLM until it is explicitly enabled.
-    LLM_ENABLED: bool = False
-    # User-facing fallback for ambiguous / LLM-worthy cases.
+    # Final LLM judge for supported middle-band matches.
+    LLM_ENABLED: bool = True
+    # Kept for backwards compatibility with older deployments; Top-3 is always
+    # a real user-facing state when MatchMode.CATEGORY_CHOICE is selected.
     USER_VISIBLE_LLM: bool = False
-    # Top-3 category choice is enabled for full traffic (precision-first middle mode).
     USER_VISIBLE_TOP3: bool = True
     # When True, TEMPLATE requires higher evidence/margin/specificity — rare auto-answers only.
     STRICT_TEMPLATE: bool = True

@@ -94,35 +94,36 @@ def test_pipeline_high_risk_escalates_with_collection_text():
     assert "ФИО" in (result.actions[0].text or "")
 
 
-def test_top3_is_user_visible_when_enabled(monkeypatch):
+def test_top3_is_user_visible_and_does_not_call_llm(monkeypatch):
     from app.application import decision_pipeline as module
+    monkeypatch.setattr(module.settings, "LLM_ENABLED", True)
 
-    monkeypatch.setattr(module.settings, "USER_VISIBLE_TOP3", True)
+    class FakeKB:
+        entries_by_id = {}
 
-    class DummyKB:
-        def get_category_choice_candidates(self, q, top_n=3):
-            return []
+    class FakeLLM:
+        async def classify(self, *_args, **_kwargs):
+            raise AssertionError("Top-3 must not call LLM")
 
-    pipeline = DecisionPipeline(DummyKB(), _FakeLLM())
+    from app.application.decision_pipeline import DecisionPipeline
+    from app.domain.enums import Decision
+    from app.infrastructure.ai.knowledge_base import MatchMode, MatchResult
+
+    pipeline = DecisionPipeline(FakeKB(), FakeLLM())
     match = MatchResult(
-        MatchMode.CATEGORY_CHOICE,
-        0.8,
-        "Cat A",
-        None,
-        None,
-        [],
+        MatchMode.CATEGORY_CHOICE, 0.7, "A", None, "kb_1",
+        [{"id": "kb_1"}, {"id": "kb_2"}],
         choice_candidates=[
-            {"kb_id": "a", "choice_label": "Вариант A", "template_answer": "Ответ A"},
-            {"kb_id": "b", "choice_label": "Вариант B", "template_answer": "Ответ B"},
+            {"kb_id": "kb_1", "choice_label": "A", "template_answer": "Answer A"},
+            {"kb_id": "kb_2", "choice_label": "B", "template_answer": "Answer B"},
         ],
-        decision_reason="ambiguous",
-        subquestion="q",
+        decision_reason="supported_ambiguity", subquestion="q",
     )
+    import asyncio
     trace, actions = asyncio.run(pipeline.decide_match(match, "q"))
     assert trace.decision == Decision.CHOICE
-    assert len(actions) == 1
-    assert "Вариант A" in (actions[0].text or "")
-    assert "Вариант B" in (actions[0].text or "")
+    assert trace.llm_used is False
+    assert "1. A" in (actions[0].text or "")
 
 
 def test_inbound_query_is_logged(caplog):

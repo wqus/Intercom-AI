@@ -37,7 +37,7 @@ RERANKER_MODEL_NAME = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 
 RETRIEVAL_TOP_K = 20
 FINAL_CANDIDATES = 8
-LLM_TOP_K = 3
+LLM_TOP_K = 7
 NEGATIVE_SEMANTIC_WEIGHT = 0.14
 OBJECT_MISMATCH_PENALTY = 0.22
 STATE_MISMATCH_PENALTY = 0.16
@@ -107,8 +107,8 @@ GENERIC_RERANK_WEIGHT = 0.10
 # Decision thresholds. These are routing thresholds, NOT probabilities.
 # The score is deliberately bounded to [0, 1].
 # v22 STRICT: TEMPLATE is rare — only near-perfect evidence + proven contract.
-# Ambiguous cases go to CATEGORY_CHOICE (Top-3) or escalate/rephrase.
-# v22.1: TEMPLATE is ultra-niche. Default middle path is CATEGORY_CHOICE (Top-3).
+# Ambiguous cases go to the LLM judge when enabled; CATEGORY_CHOICE remains a legacy fallback.
+# TEMPLATE is ultra-niche; Polza is the final semantic judge for weaker matches.
 # v22.3: raised further so TEMPLATE fires only on near-certain, well-evidenced
 # matches — anything softer now falls through to Top-3/rephrase instead of
 # auto-answering.
@@ -3587,7 +3587,7 @@ class KnowledgeBase:
                 ordered_ids.append(kb_id)
 
         result = []
-        for kb_id in ordered_ids[: max(LLM_TOP_K, CONTRASTIVE_MAX_CONTEXT_NEIGHBORS)]:
+        for kb_id in ordered_ids[:LLM_TOP_K]:
             item = ranked_by_id.get(kb_id)
             if item is None:
                 entry = self.entries_by_id.get(kb_id)
@@ -4507,17 +4507,8 @@ class KnowledgeBase:
             second_is_conflict=second_is_conflict,
         )
 
-        if entry.get("requires_clarification") and safe_auto and safe_template_eligible:
-            return MatchResult(
-                MatchMode.CLARIFICATION, top_score, entry.get("category"),
-                entry.get("clarification_question"), entry.get("id"), relevant_entries,
-                entry=entry, second_score=second_score, margin=margin,
-                embedding_score=embedding, intent_fit_score=intent_fit,
-                intent_fit_reason=str(top.get("intent_fit_reason", "")),
-                family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason="supported_intent_requires_clarification",
-            )
-
+        # Entries that normally require clarification are still judged by the
+        # LLM in the middle band. The final response remains pre-approved KB text.
         # TEMPLATE only when aggregate score is near-certain (ultra-niche).
         if (
             safe_auto
@@ -4551,9 +4542,26 @@ class KnowledgeBase:
                 contrastive_reason=str(top.get("contrastive_reason", "")),
             )
 
-        # 6. Primary middle path: Top-3 whenever 2+ candidates survive soft filters.
+        # 6. Middle band: anything that is not ultra-safe TEMPLATE and is not
+        # genuinely weak/OOS goes to the LLM judge. Retrieval still supplies
+        # the top candidates; the LLM is the final semantic decision-maker.
         choices = self._category_choice_candidates(ranked, question=question)
-        if len(choices) >= 2:
+
+        domain_support = float(top.get("domain_support_score", 0.0))
+        ontology_alignment = float(top.get("ontology_alignment_score", 0.0))
+        # 6a. User-visible Top-3 is reserved for evidence-backed ambiguity.
+        # These candidates are genuinely plausible and close enough that asking
+        # the user is safer than guessing, but they are not weak/OOS cases.
+        choice_is_supported = (
+            len(choices) >= 2
+            and second is not None
+            and margin <= CATEGORY_CHOICE_MAX_MARGIN
+            and second_real >= CATEGORY_CHOICE_MIN_REAL_EVIDENCE
+            and intent_fit >= CATEGORY_CHOICE_MIN_INTENT_FIT
+            and top_score >= CATEGORY_CHOICE_MIN_SCORE
+            and not contradiction
+        )
+        if choice_is_supported and margin >= 0.08 and not secondary_ambiguity:
             return MatchResult(
                 MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
                 entry.get("id"), relevant_entries, entry=entry,
@@ -4564,31 +4572,36 @@ class KnowledgeBase:
                 embedding_score=embedding, intent_fit_score=intent_fit,
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason="supported_ambiguity",
-                choice_candidates=choices, top_candidates=top_candidates,
-                domain_support_score=float(top.get("domain_support_score", 0.0)),
-                ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
+                subquestion=question, decision_reason="supported_ambiguity_to_top3",
+                choice_candidates=choices[:3], top_candidates=top_candidates,
+                domain_support_score=domain_support, ontology_alignment_score=ontology_alignment,
                 negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
+                contrastive_margin=contrastive_margin,
+                contrastive_competitor_id=top.get("contrastive_competitor_id"),
+                contrastive_reason=str(top.get("contrastive_reason", "")),
             )
 
-        # 7. LLM mode is a last resort signal for orchestration (LLM disabled in live:
-        # pipeline converts this to Top-3 or rephrase). Prefer not to reach here.
+        # 6b. Everything supported but not strong enough for TEMPLATE and not
+        # suitable for user-visible Top-3 goes to the LLM judge.
         llm_candidate_support = (
-            top_score >= LLM_SCORE
-            and intent_fit >= 0.52
-            and family_fit >= 0.30
-            and real_evidence >= 0.40
-            and float(top.get("domain_support_score", 0.0)) >= 0.24
-            and float(top.get("ontology_alignment_score", 0.0)) >= 0.50
-            and (direct_support or lexical >= 0.30)
-            and not contradiction
-        )
-        llm_contrast_safe = (
-            not second_is_conflict
-            or contrastive_margin >= CONTRASTIVE_LLM_MARGIN
+            not contradiction
+            and family_fit >= 0.25
+            and (
+                top_score >= 0.40
+                or direct_support
+                or lexical >= 0.28
+            )
+            and (
+                direct_support
+                or lexical >= 0.28
+                or real_evidence >= 0.28
+                or intent_fit >= 0.40
+                or domain_support >= 0.20
+                or ontology_alignment >= 0.40
+            )
         )
 
-        if llm_candidate_support and llm_contrast_safe:
+        if llm_candidate_support:
             return MatchResult(
                 MatchMode.LLM, top_score, entry.get("category"), None,
                 entry.get("id"), relevant_entries, entry=entry,
@@ -4599,8 +4612,39 @@ class KnowledgeBase:
                 embedding_score=embedding, intent_fit_score=intent_fit,
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason="supported_intent_needs_llm",
+                subquestion=question, decision_reason=(
+                    "ambiguous_candidates_to_llm" if len(choices) >= 2
+                    else "supported_middle_to_llm"
+                ),
                 choice_candidates=choices if len(choices) >= 2 else None,
+                top_candidates=top_candidates,
+                domain_support_score=domain_support,
+                ontology_alignment_score=ontology_alignment,
+                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
+                contrastive_margin=contrastive_margin,
+                contrastive_competitor_id=top.get("contrastive_competitor_id"),
+                contrastive_reason=str(top.get("contrastive_reason", "")),
+            )
+
+        # 8. Very unclear / insufficient-context cases get one explicit
+        # clarification attempt. True open-set/OOS cases were already returned
+        # by the OOS gate above and remain immediate escalation.
+        if (
+            quality.score < REPHRASE_QUERY_QUALITY_MAX
+            or top_score < REPHRASE_SCORE_MAX
+            or intent_fit <= REPHRASE_INTENT_FIT_MAX
+        ):
+            reason = "insufficient_context" if quality.score < 0.34 else "low_confidence"
+            return MatchResult(
+                MatchMode.REPHRASE, top_score, None, None, None, relevant_entries,
+                second_score=second_score, margin=margin,
+                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+                evidence_score=float(top.get("evidence_score", 0.0)),
+                real_intent_evidence=real_evidence, embedding_score=embedding,
+                intent_fit_score=intent_fit, intent_fit_reason=str(top.get("intent_fit_reason", "")),
+                family_fit_score=family_fit, query_quality_score=quality.score,
+                subquestion=question, decision_reason=reason,
+                choice_candidates=None,
                 top_candidates=top_candidates,
                 domain_support_score=float(top.get("domain_support_score", 0.0)),
                 ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
@@ -4610,26 +4654,14 @@ class KnowledgeBase:
                 contrastive_reason=str(top.get("contrastive_reason", "")),
             )
 
-        # 8. Abstain when evidence is weak. This is preferable to a wrong answer.
-        # Mark the reason explicitly so orchestration can distinguish OOS from
-        # insufficient context from low-confidence known intent.
-        if quality.score < 0.14 and not direct_support:
-            reason = "insufficient_context"
-        elif top_score < 0.50 and not direct_support:
-            reason = "low_confidence"
-        elif family_fit < 0.25 and not direct_support:
-            reason = "oos_or_wrong_family"
-        else:
-            reason = "unsupported_or_ambiguous"
-
+        reason = "unsupported_or_ambiguous"
         return MatchResult(
             MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
             second_score=second_score, margin=margin,
             semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
             evidence_score=float(top.get("evidence_score", 0.0)),
-            real_intent_evidence=real_evidence,
-            embedding_score=embedding, intent_fit_score=intent_fit,
-            intent_fit_reason=str(top.get("intent_fit_reason", "")),
+            real_intent_evidence=real_evidence, embedding_score=embedding,
+            intent_fit_score=intent_fit, intent_fit_reason=str(top.get("intent_fit_reason", "")),
             family_fit_score=family_fit, query_quality_score=quality.score,
             subquestion=question, decision_reason=reason,
             choice_candidates=None,

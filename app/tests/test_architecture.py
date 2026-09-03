@@ -16,3 +16,4 @@ def test_no_in_memory_webhook_dedup():
     text=(ROOT/"api/webhook.py").read_text(encoding="utf-8")
     assert "processed_events = set()" not in text
 
+

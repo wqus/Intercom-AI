@@ -63,27 +63,24 @@ def test_pairwise_discriminator_rejects_mentor_program_when_user_wants_to_be_men
     assert result["advantage"] > 0.1
 
 
-def test_llm_prompt_contains_contrastive_evidence_and_context_only_flag():
-    entries = [{
-        "id": "kb_002",
-        "category": "registration_failure",
-        "intent_type": "registration_failure",
-        "intent_facets": ["registration", "technical_failure"],
-        "intent_signals": {"positive": ["не могу записаться"], "negative": ["как записаться"]},
-        "constraints": {},
-        "definition": "Проблема с записью",
-        "positive_examples": ["Не могу записаться"],
-        "negative_phrases": ["Как записаться"],
-        "_context_only": True,
-        "_contrastive_margin": 0.01,
-        "_contrastive_competitor_id": "kb_033",
-        "_contrastive_reason": "A:positive_signal;B:negative_signal",
-    }]
-    payload = build_user_message("Не могу записаться", entries)
-    assert "context_only" in payload
-    assert "contrastive" in payload.lower()
-    assert "intent_signals" in payload
+def test_llm_prompt_is_conservative_and_has_no_generation_fields():
+    from app.infrastructure.ai.llm_client import build_system_prompt, build_user_message
 
+    prompt = build_system_prompt()
+    payload = build_user_message("Не могу записаться", [{
+        "id": "kb_002",
+        "category": "Регистрация",
+        "definition": "Проблема при регистрации",
+        "negative_phrases": ["как записаться"],
+    }])
+
+    assert "escalation" in prompt
+    assert "Нельзя возвращать `none`" in prompt
+    assert "НЕ отвечаешь пользователю" in prompt
+    assert '"question"' in payload
+    assert '"candidates"' in payload
+    assert "embedding_score" not in payload
+    assert "_context_only" not in payload
 
 def test_llm_selection_validator_blocks_explicit_negative_signal():
     kb = KnowledgeBase.__new__(KnowledgeBase)

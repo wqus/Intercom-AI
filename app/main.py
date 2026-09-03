@@ -8,7 +8,7 @@ from app.database.engine import engine
 from app.database.schema import ensure_schema
 from app.infrastructure.persistence import models as _persistence_models
 from app.infrastructure.ai.knowledge_base import KnowledgeBase
-from app.infrastructure.ai.llm_client import YandexLLMClient
+from app.infrastructure.ai.llm_client import PolzaLLMClient
 from app.infrastructure.intercom.client import IntercomGateway
 from app.infrastructure.telegram.notifier import TelegramNotifier
 from app.application.decision_pipeline import DecisionPipeline
@@ -42,11 +42,11 @@ async def lifespan(app: FastAPI):
     await ensure_schema(engine)
 
     kb=KnowledgeBase(path=settings.KB_PATH, device=settings.EMBEDDING_DEVICE, use_reranker=settings.USE_RERANKER)
-    llm=YandexLLMClient(
-        api_key=settings.YANDEX_API_KEY,
-        folder_id=settings.YANDEX_FOLDER_ID,
-        prompt_id=settings.YANDEX_PROMPT_ID,
-    )
+    llm = PolzaLLMClient(
+        api_key=settings.POLZA_API_KEY,
+        model=settings.POLZA_MODEL,
+        temperature=settings.POLZA_TEMPERATURE,
+    ) if settings.LLM_ENABLED else None
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=5.0),
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
