@@ -80,7 +80,7 @@ def test_polza_client_sends_only_top7_and_compact_payload_for_sonnet5(monkeypatc
     payload = json.loads(captured["messages"][1]["content"])
     assert [x["id"] for x in payload["candidates"]] == [f"kb_{i}" for i in range(1, 8)]
     assert "temperature" not in captured
-    assert captured["max_tokens"] == 64
+    assert captured["max_tokens"] == 256
 
 
 def test_polza_client_marks_transport_or_empty_output_as_unavailable(monkeypatch):
@@ -101,3 +101,95 @@ def test_polza_client_marks_transport_or_empty_output_as_unavailable(monkeypatch
     assert result.unavailable is True
     assert result.escalation is False
     assert result.selected_kb_ids == []
+
+
+def test_polza_client_parses_markdown_wrapped_json(monkeypatch):
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="```json\n{\"result\":[\"kb_1\"]}\n```")
+                )]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    import sys, types
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
+    result = asyncio.run(client.classify("q", [{"id": "kb_1"}]))
+    assert result.selected_kb_ids == ["kb_1"]
+    assert result.unavailable is False
+
+
+def test_polza_client_retries_when_first_content_is_empty(monkeypatch):
+    calls = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            content = "" if len(calls) == 1 else json.dumps({"result": ["kb_1"]})
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    import sys, types
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
+    result = asyncio.run(client.classify("q", [{"id": "kb_1"}]))
+    assert result.selected_kb_ids == ["kb_1"]
+    assert len(calls) == 2
+    assert calls[0]["max_tokens"] == 256
+    assert calls[1]["max_tokens"] == 512
+
+
+def test_polza_client_extracts_text_parts(monkeypatch):
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=[{"type": "text", "text": "{\"result\":[\"kb_1\"]}"}]
+                    )
+                )]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    import sys, types
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
+    result = asyncio.run(client.classify("q", [{"id": "kb_1"}]))
+    assert result.selected_kb_ids == ["kb_1"]
+
+
+def test_polza_client_retries_when_first_content_is_malformed(monkeypatch):
+    calls = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            content = "not-json" if len(calls) == 1 else json.dumps({"result": ["kb_1"]})
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    import sys, types
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
+    result = asyncio.run(client.classify("q", [{"id": "kb_1"}]))
+    assert result.selected_kb_ids == ["kb_1"]
+    assert len(calls) == 2
+    assert calls[1]["max_tokens"] == 512

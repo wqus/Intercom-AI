@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -178,6 +179,81 @@ class PolzaLLMClient:
             timeout=timeout,
         )
 
+    @staticmethod
+    def _extract_content(response: Any) -> str:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            raise ValueError("LLM response has no choices")
+
+        message = getattr(choices[0], "message", None)
+        if message is None:
+            raise ValueError("LLM response has no message")
+
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+
+        # Some OpenAI-compatible providers/models return content as a list of
+        # typed parts. Join text-bearing parts instead of assuming a string.
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                    continue
+                if isinstance(part, dict):
+                    value = part.get("text")
+                    if isinstance(value, str):
+                        parts.append(value)
+                    continue
+                value = getattr(part, "text", None)
+                if isinstance(value, str):
+                    parts.append(value)
+            joined = "".join(parts).strip()
+            if joined:
+                return joined
+
+        # Newer reasoning-capable responses may expose refusal/tool-ish payloads
+        # without usable text. Fail closed with a precise diagnostic.
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            raise ValueError("LLM refusal/no usable content")
+        raise ValueError("LLM response has no usable text content")
+
+    @staticmethod
+    def _parse_json_content(content: str) -> dict[str, Any]:
+        if not content.strip():
+            raise ValueError("LLM returned empty content")
+
+        candidates = [content.strip()]
+        # Be tolerant of markdown wrappers occasionally added despite the
+        # structured-output instruction. Never execute or reinterpret the text.
+        fence = re.search(r"```(?:json)?\s*(.*?)\s*```", content, flags=re.IGNORECASE | re.DOTALL)
+        if fence:
+            candidates.append(fence.group(1).strip())
+
+        # As a last parsing fallback, take the outermost JSON object from a
+        # response that contains harmless leading/trailing prose.
+        start = content.find("{")
+        end = content.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(content[start:end + 1].strip())
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+        preview = re.sub(r"\s+", " ", content)[:300]
+        raise ValueError(f"LLM content is not a JSON object: {preview!r}")
+
     async def classify(
         self,
         question: str,
@@ -219,7 +295,9 @@ class PolzaLLMClient:
                     {"role": "system", "content": build_system_prompt()},
                     {"role": "user", "content": user_message},
                 ],
-                "max_tokens": 64,
+                # Sonnet 5 uses adaptive reasoning; a tiny output cap can consume
+                # the entire budget before the final JSON reaches message.content.
+                "max_tokens": 256,
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
@@ -238,8 +316,24 @@ class PolzaLLMClient:
 
             response = await self._client.chat.completions.create(**request_kwargs)
 
-            content = response.choices[0].message.content or ""
-            data = json.loads(content)
+            try:
+                content = self._extract_content(response)
+                data = self._parse_json_content(content)
+            except ValueError as first_error:
+                # Providers can return a successful HTTP response while the first
+                # generation exhausts its output budget before emitting the final
+                # structured payload. Retry once with a larger budget. This is
+                # deliberately limited to parsing/empty-content failures so normal
+                # transport/auth/provider errors are not duplicated.
+                logger.warning(
+                    "Polza LLM returned unusable structured content; retrying once: %s",
+                    first_error,
+                )
+                retry_kwargs = dict(request_kwargs)
+                retry_kwargs["max_tokens"] = 512
+                response = await self._client.chat.completions.create(**retry_kwargs)
+                content = self._extract_content(response)
+                data = self._parse_json_content(content)
             if not isinstance(data, dict) or not isinstance(data.get("result"), list):
                 raise ValueError("LLM output must contain result[]")
 
