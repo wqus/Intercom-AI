@@ -25,6 +25,73 @@ class DecisionPipeline:
         """Compose a consistent human-handoff message."""
         return ResponseComposer.escalation_ack(text or escalation_ack())
 
+    @staticmethod
+    def _top3_fallback_actions(match: MatchResult) -> tuple[DecisionTrace, list[OutboundAction]] | None:
+        """Return the user-visible Top-3 menu as a safe fallback after LLM failure.
+
+        Only previously validated CATEGORY_CHOICE candidates are allowed here.
+        We never manufacture a menu from arbitrary nearest neighbours.
+        """
+        candidates = list(match.choice_candidates or [])
+        if len(candidates) < 2:
+            return None
+
+        normalized = []
+        seen_ids: set[str] = set()
+        for item in candidates[:3]:
+            if not isinstance(item, dict):
+                continue
+            kb_id = str(item.get("kb_id") or item.get("id") or "").strip()
+            label = str(
+                item.get("choice_label")
+                or item.get("label")
+                or item.get("category")
+                or kb_id
+            ).strip()
+            answer = str(item.get("template_answer") or item.get("answer") or "").strip()
+            if kb_id and label and kb_id not in seen_ids:
+                normalized.append({"kb_id": kb_id, "label": label, "answer": answer})
+                seen_ids.add(kb_id)
+
+        if len(normalized) < 2:
+            return None
+
+        trace = DecisionTrace(
+            decision=Decision.CHOICE,
+            question=match.subquestion or "",
+            kb_id=match.kb_id,
+            category=match.category,
+            score=match.score,
+            margin=match.margin,
+            embedding_score=match.embedding_score,
+            intent_fit_score=match.intent_fit_score,
+            family_fit_score=match.family_fit_score,
+            query_quality_score=match.query_quality_score,
+            semantic_score=getattr(match, "semantic_score", 0.0),
+            lexical_score=getattr(match, "lexical_score", 0.0),
+            fuzzy_score=getattr(match, "fuzzy_score", 0.0),
+            evidence_score=getattr(match, "evidence_score", 0.0),
+            real_intent_evidence=getattr(match, "real_intent_evidence", 0.0),
+            domain_support_score=getattr(match, "domain_support_score", 0.0),
+            ontology_alignment_score=getattr(match, "ontology_alignment_score", 0.0),
+            negative_contrast_score=getattr(match, "negative_contrast_score", 0.0),
+            contrastive_margin=getattr(match, "contrastive_margin", 0.0),
+            contrastive_competitor_id=getattr(match, "contrastive_competitor_id", None),
+            contrastive_reason=getattr(match, "contrastive_reason", ""),
+            decision_reason="llm_failed_fallback_to_top3",
+            choice_candidates=normalized,
+            choice_candidate_ids=[x["kb_id"] for x in normalized],
+            automated=True,
+            llm_used=True,
+        )
+
+        labels = "\n".join(f"{i}. {item['label']}" for i, item in enumerate(normalized, 1))
+        text = (
+            "Не удалось однозначно обработать ваш вопрос автоматически. "
+            "Выберите подходящий вариант:\n\n" + labels
+        )
+        return trace, [OutboundAction("reply", text)]
+
     def _trace(self, match: MatchResult, question: str) -> DecisionTrace:
         return DecisionTrace(
             decision=Decision.ESCALATE,
@@ -75,6 +142,30 @@ class DecisionPipeline:
         result = await self.llm.classify(question, candidates)
         trace.llm_used = True
         trace.automated = True
+
+        # Provider/network/parse failure: fail closed without escalating
+        # immediately. If the pre-existing safe Top-3 menu is available,
+        # expose it to the user as a deterministic fallback.
+        if result.unavailable:
+            fallback = self._top3_fallback_actions(match)
+            if fallback is not None:
+                fallback_trace, fallback_actions = fallback
+                # Preserve all original trace metrics while changing only the
+                # externally visible route.
+                trace.decision = fallback_trace.decision
+                trace.choice_candidates = fallback_trace.choice_candidates
+                trace.choice_candidate_ids = fallback_trace.choice_candidate_ids
+                trace.decision_reason = (
+                    trace.decision_reason or "supported_middle_to_llm"
+                ) + ";llm_failed_fallback_to_top3"
+                return trace, fallback_actions
+
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = (
+                trace.decision_reason or "supported_intent_needs_llm"
+            ) + ";llm_failed_no_safe_top3"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
         if result.escalation or not result.selected_kb_ids:
             trace.decision = Decision.ESCALATE

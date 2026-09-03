@@ -18,10 +18,6 @@ class Settings(BaseSettings):
     USE_RERANKER: bool = False
     # Final LLM judge for supported middle-band matches.
     LLM_ENABLED: bool = True
-    # Kept for backwards compatibility with older deployments; Top-3 is always
-    # a real user-facing state when MatchMode.CATEGORY_CHOICE is selected.
-    USER_VISIBLE_LLM: bool = False
-    USER_VISIBLE_TOP3: bool = True
     # When True, TEMPLATE requires higher evidence/margin/specificity — rare auto-answers only.
     STRICT_TEMPLATE: bool = True
     WORKER_POLL_SECONDS: float = 0.5

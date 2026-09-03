@@ -22,6 +22,7 @@ class LLMResult:
     selected_kb_ids: list[str]
     escalation: bool = False
     reason: str | None = None
+    unavailable: bool = False
 
     @property
     def selected_kb_id(self) -> str | None:
@@ -255,4 +256,9 @@ class PolzaLLMClient:
 
         except Exception as exc:
             logger.exception("Polza LLM call/parse failed: %s", exc)
-            return LLMResult([], escalation=True, reason="llm_unavailable_or_invalid_output")
+            return LLMResult(
+                [],
+                escalation=False,
+                reason="llm_unavailable_or_invalid_output",
+                unavailable=True,
+            )

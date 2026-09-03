@@ -52,7 +52,8 @@ def test_polza_client_rejects_mixed_escalation(monkeypatch):
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
     client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
     result = asyncio.run(client.classify("q", [{"id":"kb_1"}]))
-    assert result.escalation is True
+    assert result.unavailable is True
+    assert result.escalation is False
     assert result.selected_kb_ids == []
 
 
@@ -80,3 +81,23 @@ def test_polza_client_sends_only_top7_and_compact_payload_for_sonnet5(monkeypatc
     assert [x["id"] for x in payload["candidates"]] == [f"kb_{i}" for i in range(1, 8)]
     assert "temperature" not in captured
     assert captured["max_tokens"] == 64
+
+
+def test_polza_client_marks_transport_or_empty_output_as_unavailable(monkeypatch):
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=""))]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    import sys, types
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
+    result = asyncio.run(client.classify("q", [{"id": "kb_1", "category": "x"}]))
+    assert result.unavailable is True
+    assert result.escalation is False
+    assert result.selected_kb_ids == []
