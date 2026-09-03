@@ -116,6 +116,12 @@ AUTO_SCORE = 0.97
 AUTO_MARGIN = 0.20
 LLM_SCORE = 0.48
 LLM_MARGIN = 0.030
+# A candidate must still have enough evidence to justify spending an LLM call.
+# Below this floor we ask for clarification or escalate instead of letting the
+# model turn a weak retrieval hit into a plausible-looking category.
+LLM_MIN_SUPPORTED_EVIDENCE = 0.24
+LLM_MIN_DOMAIN_SUPPORT = 0.12
+LLM_MIN_QUERY_QUALITY = 0.18
 HIGH_SCORE_LOW_MARGIN = 0.88
 LEXICAL_EVIDENCE_MIN = 0.32
 SEMANTIC_GAP_FOR_LLM = 0.025
@@ -4599,6 +4605,15 @@ class KnowledgeBase:
                 or domain_support >= 0.20
                 or ontology_alignment >= 0.40
             )
+        )
+
+        llm_candidate_support = (
+            llm_candidate_support
+            and quality.score >= LLM_MIN_QUERY_QUALITY
+            and top_score >= LLM_SCORE
+            and real_evidence >= LLM_MIN_SUPPORTED_EVIDENCE
+            and domain_support >= LLM_MIN_DOMAIN_SUPPORT
+            and intent_fit >= INTENT_FIT_LLM_MIN
         )
 
         if llm_candidate_support:

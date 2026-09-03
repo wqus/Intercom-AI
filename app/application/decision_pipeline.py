@@ -232,7 +232,7 @@ class DecisionPipeline:
             selected_ids.append(kb_id)
             business_answers.append(template)
 
-        trace.decision = Decision.ANSWER_TEMPLATE
+        trace.decision = Decision.ANSWER_LLM
         trace.kb_id = selected_ids[0]
         first_entry = self.kb.entries_by_id.get(selected_ids[0]) or {}
         trace.category = str(first_entry.get("category") or "") or trace.category
@@ -300,11 +300,7 @@ class DecisionPipeline:
             trace.choice_candidates = normalized
             trace.choice_candidate_ids = [x["kb_id"] for x in normalized]
             trace.decision_reason = trace.decision_reason or "ambiguous_supported_choice"
-            labels = "\n".join(f"{i}. {item['label']}" for i, item in enumerate(normalized, 1))
-            text = (
-                "Похоже, ваш вопрос может относиться к нескольким вариантам. "
-                "Выберите подходящий номер:\n\n" + labels
-            )
+            text = ResponseComposer.choice([item["label"] for item in normalized])
             return trace, [OutboundAction("reply", text)]
 
         if match.mode == MatchMode.LLM:

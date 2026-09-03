@@ -142,8 +142,9 @@ class SupportApplication:
     @staticmethod
     def _attempts_after_failed_clarification(state) -> int:
         """Return the number of failed user attempts accumulated so far."""
+        data = state.data if isinstance(getattr(state, "data", None), dict) else {}
         try:
-            return max(0, int(state.data.get("attempts", 0)))
+            return max(0, int(data.get("attempts", 0)))
         except (TypeError, ValueError):
             return 0
 
@@ -163,7 +164,8 @@ class SupportApplication:
         if len(token.split()) != 1:
             return False
 
-        kb_id = state.data.get("kb_id")
+        data = state.data if isinstance(state.data, dict) else {}
+        kb_id = data.get("kb_id")
         routes = self.pipeline.kb.get_short_clarification_routes(kb_id)
         target_id = routes.get(token)
         if not target_id:
@@ -187,14 +189,14 @@ class SupportApplication:
         try:
             normalized_state = ConversationStateKind(state.state)
         except (TypeError, ValueError):
-            # A state not understood by this deployment is not actionable.
-            # Never route it as a fresh question and never escalate merely
-            # because the state machine has no handler for it.
-            logger.warning(
-                "Ignoring unsupported conversation state entity=%s state=%r",
+            # Corrupt/unknown state must not silently consume the event. Reset to
+            # the safe root state and let the normal classifier recover the turn.
+            logger.error(
+                "Invalid conversation state entity=%s state=%r; resetting to IDLE",
                 message.entity_id, state.state,
             )
-            return True
+            await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
+            return False
 
         if normalized_state in _CLARIFICATION_STATES:
             if await self._resolve_short_clarification_reply(session, event, message, state):
@@ -218,6 +220,26 @@ class SupportApplication:
             return False
 
         if normalized_state == ConversationStateKind.CHOOSING:
+            # Persisted menus are part of the state-machine contract. Validate the
+            # shape before using it; a malformed menu must never reach the numeric
+            # parser or produce a misleading answer.
+            data = state.data if isinstance(state.data, dict) else {}
+            candidate_ids = data.get("candidate_ids")
+            snapshots = data.get("candidates")
+            if (
+                not isinstance(candidate_ids, list)
+                or not 2 <= len(candidate_ids) <= 3
+                or any(not str(item).strip() for item in candidate_ids)
+                or len({str(item).strip() for item in candidate_ids}) != len(candidate_ids)
+                or (snapshots is not None and not isinstance(snapshots, list))
+            ):
+                logger.error(
+                    "Invalid CHOOSING state entity=%s data=%r; resetting to IDLE",
+                    message.entity_id, state.data,
+                )
+                await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
+                return False
+
             # Defensive duplicate of the global operator gate. Keeping this
             # guard makes `_handle_state` safe when exercised directly and when
             # called by any future internal workflow that bypasses `handle()`.

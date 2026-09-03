@@ -8,7 +8,7 @@ from app.domain.models import InboundMessage, ProcessingResult, DecisionTrace, O
 class FakeState:
     def __init__(self, state=ConversationStateKind.IDLE, data=None):
         self.state = state
-        self.data = data or {}
+        self.data = data if data is not None else {}
 
 
 class FakeStates:
@@ -79,7 +79,7 @@ def install_repos(monkeypatch, initial_state):
     import app.application.support_service as module
     FakeStates.instances = type("Holder", (), {
         "state": initial_state[0],
-        "data": dict(initial_state[1]),
+        "data": initial_state[1] if initial_state[1] is None else dict(initial_state[1]),
         "replacements": [],
     })()
     monkeypatch.setattr(module, "StateRepository", FakeStates)
@@ -246,21 +246,25 @@ def test_choice_state_answers_from_persisted_snapshot(monkeypatch):
     assert FakeStates.instances.state == ConversationStateKind.IDLE
 
 
-def test_unknown_conversation_state_is_ignored(monkeypatch):
+def test_unknown_conversation_state_is_recovered_to_idle(monkeypatch):
     install_repos(monkeypatch, ("future_state_not_implemented", {}))
 
-    class NeverCallPipeline:
+    called = {"count": 0}
+    class Pipeline:
         async def decide(self, message):
-            raise AssertionError("unknown state must not reach classifier")
+            called["count"] += 1
+            from app.domain.models import ProcessingResult
+            return ProcessingResult()
 
-    app = SupportApplication(NeverCallPipeline(), FakeIntercom(), None, FakeOutbox())
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
     message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "нормальный вопрос")
 
     class Event: id = 101
 
-    # StateRepository in production is enum-backed, but the guard is validated
-    # with a fake legacy/future state value here.
+    # Unknown/corrupt state must not silently consume the event: it is reset to
+    # the root state and the current turn is re-evaluated normally.
     asyncio.run(app.handle(object(), Event(), message))
+    assert FakeStates.instances.state == ConversationStateKind.IDLE
 
 
 def test_choice_invalid_free_text_does_not_auto_escalate(monkeypatch):
@@ -561,3 +565,38 @@ def test_top3_persists_state_before_outbox_and_keeps_snapshot(monkeypatch):
     assert events[0][0] == "state"
     assert any(kind == "outbox" for kind, *_ in events)
     assert events.index(next(item for item in events if item[0] == "state")) < events.index(next(item for item in events if item[0] == "outbox"))
+
+
+def test_malformed_choosing_state_is_recovered_to_idle(monkeypatch):
+    install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {"candidate_ids": ["only_one"]}))
+
+    class Pipeline:
+        async def decide(self, message):
+            from app.domain.models import ProcessingResult
+            return ProcessingResult()
+
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "нормальный вопрос")
+
+    class Event: id = 102
+
+    asyncio.run(app.handle(object(), Event(), message))
+    assert FakeStates.instances.state == ConversationStateKind.IDLE
+
+
+def test_malformed_clarification_data_does_not_crash(monkeypatch):
+    install_repos(monkeypatch, (ConversationStateKind.REPHRASING, None))
+
+    called = {"count": 0}
+    class Pipeline:
+        async def decide(self, message):
+            called["count"] += 1
+            return ProcessingResult()
+
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "нормальный вопрос")
+
+    class Event: id = 103
+
+    asyncio.run(app.handle(object(), Event(), message))
+    assert called["count"] == 1

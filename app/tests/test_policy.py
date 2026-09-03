@@ -112,9 +112,10 @@ def test_llm_mode_selects_and_validates_template(monkeypatch):
         decision_reason="middle_band", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
-    assert trace.decision == Decision.ANSWER_TEMPLATE
+    assert trace.decision == Decision.ANSWER_LLM
     assert trace.llm_used is True
-    assert actions and actions[0].text == "Answer A"
+    assert actions and actions[0].kind == "business_answer"
+    assert actions[0].text == "Answer A"
 
 
 def test_llm_escalation_is_the_only_fallback(monkeypatch):

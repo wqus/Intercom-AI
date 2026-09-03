@@ -42,11 +42,19 @@ async def lifespan(app: FastAPI):
     await ensure_schema(engine)
 
     kb=KnowledgeBase(path=settings.KB_PATH, device=settings.EMBEDDING_DEVICE, use_reranker=settings.USE_RERANKER)
-    llm = PolzaLLMClient(
-        api_key=settings.POLZA_API_KEY,
-        model=settings.POLZA_MODEL,
-        temperature=settings.POLZA_TEMPERATURE,
-    ) if settings.LLM_ENABLED else None
+    llm = None
+    if settings.LLM_ENABLED:
+        if settings.POLZA_API_KEY:
+            llm = PolzaLLMClient(
+                api_key=settings.POLZA_API_KEY,
+                model=settings.POLZA_MODEL,
+                temperature=settings.POLZA_TEMPERATURE,
+            )
+        else:
+            logging.getLogger("main").warning(
+                "LLM_ENABLED=true but POLZA_API_KEY is empty; middle-band routing "
+                "will fail closed instead of preventing application startup."
+            )
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=5.0),
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
