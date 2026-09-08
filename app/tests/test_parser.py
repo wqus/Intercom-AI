@@ -182,3 +182,21 @@ def test_webhook_event_order_falls_back_to_notification_time():
         "topic": "conversation.user.replied",
         "data": {"item": {"source": {}}},
     }) == 456
+
+
+def test_ticket_created_remains_parseable_for_dedicated_ticket_workflow():
+    # The webhook layer gates ticket.created by PROCESS_TICKET_CREATED; parser itself
+    # remains backward-compatible for explicit ticket workflows.
+    payload = {
+        "id": "ticket-1",
+        "topic": "ticket.created",
+        "data": {"item": {
+            "id": "t-1",
+            "updated_at": "123",
+            "ticket_attributes": {"_default_description_": "Описание заявки"},
+        }},
+    }
+    msg = parse(payload)
+    assert msg is not None
+    assert msg.entity_id == "t-1"
+    assert msg.text == "Описание заявки"

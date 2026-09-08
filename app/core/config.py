@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     INTERCOM_ESCALATION_TAG_ID: str = ""
     DRY_RUN: bool = False
     LOG_LEVEL: str = "INFO"
+    LOG_WEBHOOK_PAYLOAD: bool = False
+    PROCESS_TICKET_CREATED: bool = False
     LOG_SENSITIVE_CONTENT: bool = False
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_GROUP_ID: str = ""

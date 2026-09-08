@@ -10,6 +10,26 @@ router = APIRouter()
 logger = logging.getLogger("webhook")
 
 
+def _redact_payload(value):
+    """Return a JSON-safe payload copy with credentials/secrets masked.
+
+    Raw webhook logging is a debug feature; customer message bodies are intentionally
+    retained so an operator can diagnose parser/entity mismatches.
+    """
+    secret_keys = {
+        "authorization", "token", "access_token", "api_key", "client_secret",
+        "x-hub-signature", "secret",
+    }
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            out[key] = "[REDACTED]" if str(key).lower() in secret_keys else _redact_payload(item)
+        return out
+    if isinstance(value, list):
+        return [_redact_payload(item) for item in value]
+    return value
+
+
 @router.api_route("/webhook/intercom", methods=["POST", "HEAD"])
 async def intercom_webhook(request: Request):
     if request.method == "HEAD":
@@ -28,8 +48,20 @@ async def intercom_webhook(request: Request):
         raise HTTPException(401, "invalid signature")
 
     topic = payload.get("topic", "")
+    if settings.LOG_WEBHOOK_PAYLOAD:
+        logger.info("webhook_payload | topic=%s | payload=%s", topic, json.dumps(_redact_payload(payload), ensure_ascii=False, separators=(",", ":")))
     if topic not in CONVERSATION_TOPICS | TICKET_TOPICS:
         return {"status": "ignored", "topic": topic}
+
+    # `ticket.created` is an entity lifecycle event, not a customer reply.
+    # In a Messenger conversation workflow Intercom can create a linked ticket;
+    # treating its default description as a fresh customer turn causes the bot to
+    # answer the ticket instead of the actual conversation. Customer ticket input
+    # is handled by `ticket.contact.replied`. Keep ticket.created visible in logs/DB
+    # only when explicitly enabled for a dedicated ticket workflow.
+    if topic == "ticket.created" and not settings.PROCESS_TICKET_CREATED:
+        logger.info("Ignoring ticket.created lifecycle event entity=%s", ((payload.get("data") or {}).get("item") or {}).get("id"))
+        return {"status": "ignored", "reason": "ticket_created_lifecycle"}
 
     message = parse(payload)
     if message is None:
