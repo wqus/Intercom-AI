@@ -1,6 +1,7 @@
 import time
 import logging
 import hashlib
+import time
 from app.domain.enums import Decision, EscalationReason
 from app.domain.models import DecisionTrace, InboundMessage, OutboundAction, ProcessingResult
 from app.domain.policy import escalation_ack, rephrase_prompt, high_risk_reply
@@ -78,6 +79,16 @@ class DecisionPipeline:
         # intents), because the model is the classifier rather than a reranker.
         if not taxonomy_mode:
             candidates = candidates[:10]
+        llm_started = time.perf_counter()
+        logger.info(
+            "llm_dispatch | taxonomy=%s | question_len=%d | question_sha256=%s | "
+            "catalog_size=%d | context_messages=%d",
+            taxonomy_mode,
+            len(question),
+            hashlib.sha256(question.encode("utf-8")).hexdigest()[:16],
+            len(candidates),
+            len(conversation_context or []),
+        )
         try:
             if taxonomy_mode:
                 result = await self.llm.classify(
@@ -99,8 +110,21 @@ class DecisionPipeline:
         except Exception as exc:
             logger.exception("LLM request failed: %s", exc)
             result = LLMResult([], unavailable=True, reason="llm_request_error", decision="escalate")
+        llm_elapsed_ms = (time.perf_counter() - llm_started) * 1000
         trace.llm_used = True
         trace.automated = True
+        logger.info(
+            "llm_router_result | taxonomy=%s | elapsed_ms=%.1f | decision=%s | "
+            "selected_kb_ids=%s | certainty=%s | unavailable=%s | escalation=%s | reason=%s",
+            taxonomy_mode,
+            llm_elapsed_ms,
+            getattr(result, "decision", None),
+            list(getattr(result, "selected_kb_ids", []) or []),
+            getattr(result, "certainty", None),
+            bool(getattr(result, "unavailable", False)),
+            bool(getattr(result, "escalation", False)),
+            getattr(result, "reason", None),
+        )
 
         if result.unavailable:
             # AI-first taxonomy mode has no semantic fallback: when the model is

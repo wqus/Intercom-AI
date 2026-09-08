@@ -493,6 +493,23 @@ class SupportApplication:
             if "unexpected keyword" not in str(exc) and "positional" not in str(exc):
                 raise
             result = await self.pipeline.decide(message)
+        logger.info(
+            "pipeline_result | entity=%s | event=%s | latency_ms=%.1f | "
+            "actions=%d | traces=%s",
+            message.entity_id, event.id, float(result.latency_ms or 0.0), len(result.actions),
+            [
+                {
+                    "decision": getattr(t.decision, "value", str(t.decision)),
+                    "kb_id": t.kb_id,
+                    "category": t.category,
+                    "reason": t.decision_reason,
+                    "llm_used": t.llm_used,
+                    "escalation_reason": getattr(t.escalation_reason, "value", t.escalation_reason),
+                }
+                for t in result.traces
+            ],
+        )
+
         # Application-level delivery invariant: the only legitimate empty-action
         # result is a contextual IGNORE. Any other empty result is a routing defect
         # or an integration failure and must become a visible human hand-off. This

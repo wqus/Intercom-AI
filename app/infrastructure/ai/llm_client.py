@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -364,14 +365,37 @@ class PolzaLLMClient:
         if self._supports_temperature:
             request_kwargs["temperature"] = 0.0
 
+        started = time.perf_counter()
+        prompt_chars = sum(
+            len(str(message.get("content") or ""))
+            for message in request_kwargs.get("messages", [])
+        )
+        logger.info(
+            "llm_request_start | model=%s | taxonomy=%s | question_len=%d | question_sha256=%s | "
+            "catalog_size=%d | context_messages=%d | prompt_chars=%d",
+            self.model,
+            taxonomy_mode,
+            len(question),
+            __import__("hashlib").sha256(question.encode("utf-8")).hexdigest()[:16],
+            len(candidates),
+            len(conversation_context or []),
+            prompt_chars,
+        )
         try:
             response = await self._client.chat.completions.create(**request_kwargs)
             try:
-                data = self._parse_json_content(self._extract_content(response))
+                content = self._extract_content(response)
+                data = self._parse_json_content(content)
             except ValueError:
+                logger.warning(
+                    "llm_response_parse_failed_retrying | model=%s | elapsed_ms=%.1f",
+                    self.model,
+                    (time.perf_counter() - started) * 1000,
+                )
                 request_kwargs["max_tokens"] = 1536
                 response = await self._client.chat.completions.create(**request_kwargs)
-                data = self._parse_json_content(self._extract_content(response))
+                content = self._extract_content(response)
+                data = self._parse_json_content(content)
 
             # Accept the v22 response shape during rolling deployments/tests.
             # Production prompts use the explicit decision contract below.
@@ -406,7 +430,23 @@ class PolzaLLMClient:
                 raise ValueError("ignore must not select candidates")
             if decision == "escalate" and selected:
                 raise ValueError("escalate must not select candidates")
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            usage = getattr(response, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+            completion_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
+            logger.info(
+                "llm_request_result | model=%s | taxonomy=%s | elapsed_ms=%.1f | "
+                "decision=%s | selected_kb_ids=%s | certainty=%s | reason=%s | "
+                "prompt_tokens=%s | completion_tokens=%s",
+                self.model, taxonomy_mode, elapsed_ms, decision, selected, certainty,
+                "model_decision", prompt_tokens, completion_tokens,
+            )
             return LLMResult(selected, escalation=decision == "escalate", reason="model_decision", decision=decision, certainty=certainty)
         except Exception as exc:
-            logger.exception("Polza semantic routing failed: %s", exc)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.exception(
+                "Polza semantic routing failed | model=%s | taxonomy=%s | elapsed_ms=%.1f | "
+                "question_len=%d | catalog_size=%d | error_type=%s | error=%s",
+                self.model, taxonomy_mode, elapsed_ms, len(question), len(candidates), type(exc).__name__, exc,
+            )
             return LLMResult([], escalation=False, reason="llm_unavailable_or_invalid_output", unavailable=True, decision="escalate")
