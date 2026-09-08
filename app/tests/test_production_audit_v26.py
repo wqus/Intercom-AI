@@ -39,6 +39,38 @@ def test_realistic_admin_initiated_source_selects_current_user_part():
     assert message.raw["_provider_part_id"] == "current"
 
 
+
+
+def test_real_intercom_replied_payload_does_not_use_stale_source_without_timestamp():
+    payload = {
+        "id": "notif-real-stale-source",
+        "topic": "conversation.user.replied",
+        "created_at": 1788878727,
+        "data": {"item": {
+            "id": "215475844381260",
+            "source": {
+                "type": "conversation",
+                "id": "3943732434",
+                "delivered_as": "customer_initiated",
+                "body": "Когда запуск потока?",
+                "author": {"type": "user", "id": "u1"},
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"id": "53444815449", "part_type": "conversation_attribute_updated_by_admin",
+                 "body": None, "created_at": 1788878685,
+                 "author": {"type": "bot", "id": "bot"}},
+                {"id": "53444880790", "part_type": "comment",
+                 "body": "Аа, понял. А с онлайн школами чо", "created_at": 1788878726,
+                 "author": {"type": "user", "id": "u1"}},
+            ]},
+        }},
+    }
+    message = parse(payload)
+    assert message is not None
+    assert message.text == "Аа, понял. А с онлайн школами чо"
+    assert message.raw["_provider_part_id"] == "53444880790"
+    assert message.event_key == "message:215475844381260:53444880790"
+
 def test_conversation_user_created_is_a_real_customer_turn():
     payload = {
         "id": "notif-created",
@@ -168,3 +200,34 @@ def test_tag_http_failure_is_not_reported_as_success(monkeypatch):
         assert exc.response.status_code == 500
     else:
         raise AssertionError("tag HTTP 500 must propagate to outbox")
+
+
+
+def test_real_later_conversation_reply_uses_current_part_even_when_source_is_stale():
+    payload = {
+        "id": "notif-real-later",
+        "topic": "conversation.user.replied",
+        "created_at": 1788878727,
+        "data": {"item": {
+            "id": "215475844381260",
+            "source": {
+                "type": "conversation",
+                "id": "3943732434",
+                "delivered_as": "customer_initiated",
+                "body": "Когда запуск потока?",
+                "author": {"type": "user", "id": "u1"},
+                # Real Intercom later-reply payload may omit source.created_at.
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"id": "53444880790", "part_type": "comment",
+                 "body": "Аа, понял. А с онлайн школами чо",
+                 "created_at": 1788878726,
+                 "author": {"type": "user", "id": "u1"}},
+            ]},
+        }},
+    }
+    message = parse(payload)
+    assert message is not None
+    assert message.text == "Аа, понял. А с онлайн школами чо"
+    assert message.raw["_provider_part_id"] == "53444880790"
+    assert message.event_key == "message:215475844381260:53444880790"

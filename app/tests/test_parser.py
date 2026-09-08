@@ -51,12 +51,15 @@ def test_conversation_parser_uses_latest_user_message():
             ]},
         }},
     }
+    payload["created_at"] = 201
     msg = parse(payload)
     assert msg is not None
-    # For `conversation.user.replied`, the source is the event's message. Do
-    # not replace it with a later historical user part.
-    assert msg.text == "Первое сообщение"
-    assert msg.updated_at == "100"
+    # For a later `conversation.user.replied`, Intercom may keep the original
+    # conversation source while the actual triggering message appears in
+    # conversation_parts. The current user part must win.
+    assert msg.text == "Более новое сообщение"
+    assert msg.updated_at == "200"
+    assert msg.raw["_provider_part_id"] is None or msg.raw["_provider_part_id"] == ""
 
 
 def test_attachments_belong_only_to_current_source_message():
@@ -82,6 +85,7 @@ def test_conversation_user_replied_prefers_event_source_over_later_history():
     payload = {
         "id": "evt-current",
         "topic": "conversation.user.replied",
+        "created_at": 201,
         "data": {"item": {
             "id": "conv-order",
             "source": {
@@ -202,7 +206,7 @@ def test_ticket_created_remains_parseable_for_dedicated_ticket_workflow():
     assert msg.text == "Описание заявки"
 
 
-def test_operator_reply_uses_source_instead_of_previous_user_message():
+def test_operator_reply_uses_current_user_part_when_source_is_stale_original_message():
     payload = {
         "id": "evt-operator",
         "topic": "conversation.user.replied",
@@ -210,9 +214,11 @@ def test_operator_reply_uses_source_instead_of_previous_user_message():
         "data": {"item": {
             "id": "conv-operator",
             "source": {
-                "body": "Оператор",
+                "type": "conversation",
+                "id": "conv-operator",
+                "body": "123 123 123",
+                "created_at": 1788876988,
                 "author": {"type": "user", "name": "User"},
-                "created_at": 1788877043,
             },
             "conversation_parts": {"conversation_parts": [
                 {"id": "old", "body": "123 123 123", "created_at": 1788876988, "author": {"type": "user"}},
@@ -224,6 +230,35 @@ def test_operator_reply_uses_source_instead_of_previous_user_message():
     assert msg is not None
     assert msg.text == "Оператор"
     assert msg.raw["_provider_part_id"] == "op-1"
+    assert msg.event_key == "message:conv-operator:op-1"
+
+
+def test_later_conversation_reply_does_not_reuse_original_source_id_as_dedup_key():
+    payload = {
+        "id": "notif-2",
+        "topic": "conversation.user.replied",
+        "created_at": 201,
+        "data": {"item": {
+            "id": "conv-1",
+            "source": {
+                "type": "conversation",
+                "id": "3943732434",
+                "body": "Когда запуск потока?",
+                "created_at": 100,
+                "author": {"type": "user"},
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"id": "part-2", "body": "Аа, понял. А с онлайн школами чо", "created_at": 200, "author": {"type": "user"}},
+            ]},
+        }},
+    }
+    msg = parse(payload)
+    assert msg is not None
+    assert msg.text == "Аа, понял. А с онлайн школами чо"
+    assert msg.raw["_provider_part_id"] == "part-2"
+    assert msg.event_key == "message:conv-1:part-2"
+    from app.infrastructure.intercom.parser import event_order_at
+    assert event_order_at(payload) == 200
 
 
 def test_conversation_and_ticket_events_share_part_idempotency_key():

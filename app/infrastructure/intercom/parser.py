@@ -96,13 +96,15 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,list[dict[str
     part = None
     provider_part_id = None
 
-    # Intercom's conversation.user.replied payloads are not completely uniform:
-    # sometimes `source` is the conversation source object (e.g. admin_initiated)
-    # and the actual triggering customer message is present in conversation_parts.
-    # When source itself is an explicit user message, it is authoritative.
-    if topic in {"conversation.user.created", "conversation.user.replied"} and source_author_type in {"user", None} and (source_body or source_attachments):
+    # `conversation.user.created`: source is the triggering customer message.
+    # `conversation.user.replied`: Intercom may keep `source` as the original
+    # conversation source even after many later replies, so prefer the newest
+    # customer conversation_part bounded by the webhook notification time.
+    # Never treat `source.id` as a message id for a `type=conversation` source: it
+    # is the underlying conversation/source id and would collapse every later
+    # reply onto the first event's idempotency key.
+    if topic == "conversation.user.created" and source_author_type in {"user", None} and (source_body or source_attachments):
         part = source
-        provider_part_id = source.get("id") or source.get("part_id")
 
     if part is None and topic in {"conversation.user.created", "conversation.user.replied"}:
         # Prefer the newest user part that is not newer than the webhook notification.
@@ -129,9 +131,32 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,list[dict[str
             part = candidates[-1][2]
             provider_part_id = part.get("id") or part.get("part_id")
 
-    # Compatibility for malformed payloads where source.author.type is absent.
-    # Trust source only if it is clearly message-like; otherwise keep the bounded
-    # history fallback above.
+            # If `source` has an explicit timestamp and is at least as new as the
+            # selected user-part, it can be the actual triggering message. This keeps
+            # compatibility with payloads where the triggering reply is represented
+            # only by `source`. When `source.created_at` is absent, however, it is not
+            # safe to prefer it: real Intercom later-reply payloads may keep `source`
+            # as the original conversation snapshot. In that shape the user-part is
+            # authoritative and must remain the current turn.
+            source_stamp = _part_time(source)
+            selected_stamp = _part_time(part)
+            if (
+                topic == "conversation.user.replied"
+                and (source_body or source_attachments)
+                and source_stamp is not None
+                and (selected_stamp is None or source_stamp >= selected_stamp)
+                and (notification_created is None or source_stamp <= notification_created)
+            ):
+                part = source
+                provider_part_id = None
+
+    # Compatibility for malformed payloads where a reply webhook has no
+    # conversation_parts. Source can be used as a text fallback, but its `id` is
+    # deliberately NOT used as a provider message id because source.type=conversation
+    # refers to the conversation/source object, not the triggering part.
+    if part is None and topic == "conversation.user.replied" and source_author_type in {"user", None} and (source_body or source_attachments):
+        part = source
+
     if part is None:
         return None
 
@@ -209,15 +234,16 @@ def event_order_at(payload: dict) -> int | None:
         source = item.get("source") or {}
         source_author_type = (source.get("author") or {}).get("type")
         source_has_message = bool(_strip(source.get("body", "")) or source.get("attachments"))
-        # Trust source.created_at when source is message-like and is not an
-        # explicitly administrative source. This also covers malformed payloads
-        # where Intercom omits author.type but source carries the user message.
-        if source_author_type not in {"admin", "bot", "teammate", "assistant"} and source_has_message:
+
+        # For a newly-created conversation, source is the actual triggering user
+        # message. For later replies, source may remain the original conversation
+        # source and must not win over the current user part.
+        if topic == "conversation.user.created" and source_author_type not in {"admin", "bot", "teammate", "assistant"} and source_has_message:
             value = _as_int(source.get("created_at"))
             if value is not None:
                 candidates.append(value)
 
-        # Real user message parts are the authoritative fallback. Prefer the
+        # Real user message parts are authoritative for replied events. Prefer the
         # newest user part at or before the notification creation timestamp.
         notification_created = _as_int(payload.get("created_at"))
         parts = (item.get("conversation_parts") or {}).get("conversation_parts", []) or []
@@ -237,6 +263,10 @@ def event_order_at(payload: dict) -> int | None:
             part_times.append(value)
         if part_times:
             candidates.append(max(part_times))
+        elif topic == "conversation.user.replied" and source_author_type not in {"admin", "bot", "teammate", "assistant"} and source_has_message:
+            value = _as_int(source.get("created_at"))
+            if value is not None:
+                candidates.append(value)
 
     if not candidates:
         for value in (payload.get("created_at"), item.get("updated_at")):
