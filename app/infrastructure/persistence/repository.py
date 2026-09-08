@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.infrastructure.persistence.models import (
@@ -15,7 +15,7 @@ class EventRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def enqueue(self, *, event_key: str, provider_event_id: str, topic: str, entity_id: str, payload: dict) -> bool:
+    async def enqueue(self, *, event_key: str, provider_event_id: str, topic: str, entity_id: str, payload: dict, event_order_at: int | None = None) -> bool:
         stmt = (
             pg_insert(InboundEvent)
             .values(
@@ -24,12 +24,20 @@ class EventRepository:
                 topic=topic,
                 entity_id=entity_id,
                 payload=payload,
+                event_order_at=event_order_at,
             )
             .on_conflict_do_nothing(index_elements=[InboundEvent.event_key])
         )
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount == 1
+
+    async def count_for_entity(self, entity_id: str) -> int:
+        """Return the number of inbound events already recorded for a conversation."""
+        result = await self.session.scalar(
+            select(func.count(InboundEvent.id)).where(InboundEvent.entity_id == entity_id)
+        )
+        return int(result or 0)
 
     async def claim_one(self) -> InboundEvent | None:
         now = datetime.now(timezone.utc)
@@ -66,20 +74,21 @@ class EventRepository:
         event.last_error = None
         await self.session.commit()
 
-    async def mark_failed(
+    async def mark_failed_by_id(
         self,
-        event: InboundEvent,
+        event_id: int,
         error: str,
         retry: bool = True,
         *,
-        attempt_count: int | None = None,
+        attempt_count: int = 0,
     ) -> None:
-        # Called after a rollback in the worker. Update the row directly so this
-        # method never needs to refresh expired ORM state from the rolled-back session.
-        if attempt_count is None:
-            attempt_count = int(getattr(event, "attempts", 0) or 0)
-        else:
-            attempt_count = int(attempt_count)
+        """Mark a failed event without touching an expired ORM instance.
+
+        This method is intentionally keyed by the scalar primary key captured before
+        the worker rolls the transaction back. It keeps retry handling independent of
+        SQLAlchemy's post-rollback attribute expiration.
+        """
+        attempt_count = int(attempt_count)
         status = EventStatus.NEW if retry and attempt_count < 5 else EventStatus.FAILED
         values = {
             "last_error": error[:4000],
@@ -92,10 +101,26 @@ class EventRepository:
             )
         await self.session.execute(
             update(InboundEvent)
-            .where(InboundEvent.id == event.id)
+            .where(InboundEvent.id == int(event_id))
             .values(**values)
         )
         await self.session.commit()
+
+    async def mark_failed(
+        self,
+        event: InboundEvent,
+        error: str,
+        retry: bool = True,
+        *,
+        attempt_count: int | None = None,
+    ) -> None:
+        """Backward-compatible wrapper for callers that still hold the ORM row."""
+        event_id = int(event.id)
+        if attempt_count is None:
+            attempt_count = int(getattr(event, "attempts", 0) or 0)
+        await self.mark_failed_by_id(
+            event_id, error, retry=retry, attempt_count=int(attempt_count)
+        )
 
 
 class StateRepository:
@@ -142,8 +167,16 @@ class StateRepository:
 
     async def replace(self, conversation_id: str, state: ConversationStateKind, data: dict) -> None:
         current = await self.get(conversation_id)
+        existing_data = current.data if isinstance(current.data, dict) else {}
+        # Ordering metadata is an infrastructure invariant and must survive domain
+        # state transitions (IDLE/CLARIFYING/CHOOSING/ESCALATED). Callers should not
+        # have to know about the watermark when replacing their business state.
+        ordering = existing_data.get("_ordering") if isinstance(existing_data.get("_ordering"), dict) else None
+        new_data = dict(data) if isinstance(data, dict) else {}
+        if ordering and "_ordering" not in new_data:
+            new_data["_ordering"] = ordering
         current.state = state
-        current.data = data
+        current.data = new_data
         await self.session.flush()
 
 

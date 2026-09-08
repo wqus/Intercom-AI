@@ -3,12 +3,13 @@ import logging
 import hashlib
 from app.domain.enums import Decision, EscalationReason
 from app.domain.models import DecisionTrace, InboundMessage, OutboundAction, ProcessingResult
-from app.domain.policy import escalation_ack, rephrase_prompt, oos_response, high_risk_reply
+from app.domain.policy import escalation_ack, rephrase_prompt, high_risk_reply
 from app.domain.response_composer import ResponseComposer
 from app.infrastructure.ai.knowledge_base import (
-    KnowledgeBase, MatchMode, MatchResult, contains_operator_request, is_non_query_message,
+    KnowledgeBase, MatchMode, MatchResult, contains_operator_request, detect_high_risk,
+    is_non_query_message,
 )
-from app.infrastructure.ai.llm_client import PolzaLLMClient
+from app.infrastructure.ai.llm_client import LLMResult, PolzaLLMClient
 from app.core.config import settings
 
 logger = logging.getLogger("decision_pipeline")
@@ -24,73 +25,6 @@ class DecisionPipeline:
     def _escalation_reply(text: str | None = None) -> str:
         """Compose a consistent human-handoff message."""
         return ResponseComposer.escalation_ack(text or escalation_ack())
-
-    @staticmethod
-    def _top3_fallback_actions(match: MatchResult) -> tuple[DecisionTrace, list[OutboundAction]] | None:
-        """Return the user-visible Top-3 menu as a safe fallback after LLM failure.
-
-        Only previously validated CATEGORY_CHOICE candidates are allowed here.
-        We never manufacture a menu from arbitrary nearest neighbours.
-        """
-        candidates = list(match.choice_candidates or [])
-        if len(candidates) < 2:
-            return None
-
-        normalized = []
-        seen_ids: set[str] = set()
-        for item in candidates[:3]:
-            if not isinstance(item, dict):
-                continue
-            kb_id = str(item.get("kb_id") or item.get("id") or "").strip()
-            label = str(
-                item.get("choice_label")
-                or item.get("label")
-                or item.get("category")
-                or kb_id
-            ).strip()
-            answer = str(item.get("template_answer") or item.get("answer") or "").strip()
-            if kb_id and label and kb_id not in seen_ids:
-                normalized.append({"kb_id": kb_id, "label": label, "answer": answer})
-                seen_ids.add(kb_id)
-
-        if len(normalized) < 2:
-            return None
-
-        trace = DecisionTrace(
-            decision=Decision.CHOICE,
-            question=match.subquestion or "",
-            kb_id=match.kb_id,
-            category=match.category,
-            score=match.score,
-            margin=match.margin,
-            embedding_score=match.embedding_score,
-            intent_fit_score=match.intent_fit_score,
-            family_fit_score=match.family_fit_score,
-            query_quality_score=match.query_quality_score,
-            semantic_score=getattr(match, "semantic_score", 0.0),
-            lexical_score=getattr(match, "lexical_score", 0.0),
-            fuzzy_score=getattr(match, "fuzzy_score", 0.0),
-            evidence_score=getattr(match, "evidence_score", 0.0),
-            real_intent_evidence=getattr(match, "real_intent_evidence", 0.0),
-            domain_support_score=getattr(match, "domain_support_score", 0.0),
-            ontology_alignment_score=getattr(match, "ontology_alignment_score", 0.0),
-            negative_contrast_score=getattr(match, "negative_contrast_score", 0.0),
-            contrastive_margin=getattr(match, "contrastive_margin", 0.0),
-            contrastive_competitor_id=getattr(match, "contrastive_competitor_id", None),
-            contrastive_reason=getattr(match, "contrastive_reason", ""),
-            decision_reason="llm_failed_fallback_to_top3",
-            choice_candidates=normalized,
-            choice_candidate_ids=[x["kb_id"] for x in normalized],
-            automated=True,
-            llm_used=True,
-        )
-
-        labels = "\n".join(f"{i}. {item['label']}" for i, item in enumerate(normalized, 1))
-        text = (
-            "Не удалось однозначно обработать ваш вопрос автоматически. "
-            "Выберите подходящий вариант:\n\n" + labels
-        )
-        return trace, [OutboundAction("reply", text)]
 
     def _trace(self, match: MatchResult, question: str) -> DecisionTrace:
         return DecisionTrace(
@@ -123,8 +57,11 @@ class DecisionPipeline:
         trace: DecisionTrace,
         question: str,
         match: MatchResult,
+        conversation_context: list[dict[str, str]] | None = None,
+        *,
+        taxonomy_mode: bool = False,
     ) -> tuple[DecisionTrace, list[OutboundAction]]:
-        """Use Polza only after deterministic routing cannot safely choose."""
+        """Use the semantic model as the primary router after deterministic policy guards."""
         assert self.llm is not None
 
         candidates = list(match.relevant_entries or [])
@@ -136,46 +73,132 @@ class DecisionPipeline:
             trace.decision_reason = (trace.decision_reason or "no_candidates") + ";llm_no_candidates"
             return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
-        # Keep the LLM candidate set intentionally narrow. The hybrid KB has
-        # already done retrieval/ranking; the LLM is only the final semantic judge.
-        candidates = candidates[:7]
-        result = await self.llm.classify(question, candidates)
+        # Legacy retrieval mode keeps the candidate set narrow. AI-first taxonomy
+        # mode intentionally sends the compact full intent directory (about 40–50
+        # intents), because the model is the classifier rather than a reranker.
+        if not taxonomy_mode:
+            candidates = candidates[:10]
+        try:
+            if taxonomy_mode:
+                result = await self.llm.classify(
+                    question, candidates, conversation_context, taxonomy_mode=True
+                )
+            else:
+                result = await self.llm.classify(question, candidates, conversation_context)
+        except TypeError as exc:
+            # Keep small test doubles / legacy adapters compatible while the
+            # production client supports conversation context.
+            if "positional" not in str(exc) and "argument" not in str(exc):
+                result = LLMResult([], unavailable=True, reason="llm_request_error", decision="escalate")
+            else:
+                try:
+                    result = await self.llm.classify(question, candidates)
+                except Exception as legacy_exc:
+                    logger.exception("LLM legacy request failed: %s", legacy_exc)
+                    result = LLMResult([], unavailable=True, reason="llm_request_error", decision="escalate")
+        except Exception as exc:
+            logger.exception("LLM request failed: %s", exc)
+            result = LLMResult([], unavailable=True, reason="llm_request_error", decision="escalate")
         trace.llm_used = True
         trace.automated = True
 
-        # Provider/network/parse failure: fail closed without escalating
-        # immediately. If the pre-existing safe Top-3 menu is available,
-        # expose it to the user as a deterministic fallback.
         if result.unavailable:
-            fallback = self._top3_fallback_actions(match)
-            if fallback is not None:
-                fallback_trace, fallback_actions = fallback
-                # Preserve all original trace metrics while changing only the
-                # externally visible route.
-                trace.decision = fallback_trace.decision
-                trace.choice_candidates = fallback_trace.choice_candidates
-                trace.choice_candidate_ids = fallback_trace.choice_candidate_ids
-                trace.decision_reason = (
-                    trace.decision_reason or "supported_middle_to_llm"
-                ) + ";llm_failed_fallback_to_top3"
-                return trace, fallback_actions
+            # AI-first taxonomy mode has no semantic fallback: when the model is
+            # unavailable or malformed, hand the conversation to an operator.
+            # Legacy retrieval mode keeps the old Top-3 technical fallback for
+            # backwards compatibility behind its feature flag.
+            if not taxonomy_mode:
+                fallback = list(match.top_candidates or [])[:3]
+                labels = [
+                    str(item.get("choice_label") or item.get("label") or item.get("category") or item.get("id") or "").strip()
+                    for item in fallback
+                ]
+                if len(fallback) == 3 and all(labels):
+                    trace.decision = Decision.CHOICE
+                    trace.choice_candidates = [
+                        {
+                            "kb_id": str(item.get("id")),
+                            "label": label,
+                            "answer": str(item.get("template_answer") or "").strip(),
+                        }
+                        for item, label in zip(fallback, labels)
+                    ]
+                    trace.choice_candidate_ids = [str(item.get("id")) for item in fallback]
+                    trace.escalation_reason = None
+                    trace.decision_reason = (trace.decision_reason or "ai_routing") + ";llm_error_top3_fallback"
+                    return trace, [OutboundAction("reply", ResponseComposer.choice(labels))]
 
             trace.decision = Decision.ESCALATE
             trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
-            trace.decision_reason = (
-                trace.decision_reason or "supported_intent_needs_llm"
-            ) + ";llm_failed_no_safe_top3"
+            trace.decision_reason = (trace.decision_reason or "ai_routing") + ";llm_unavailable"
             return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
-        if result.escalation or not result.selected_kb_ids:
+        if result.decision == "ignore":
+            if taxonomy_mode and str(getattr(result, "certainty", "")).lower() != "high":
+                trace.decision = Decision.ESCALATE
+                trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+                trace.decision_reason = "llm_ignore_requires_high_certainty"
+                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+            trace.decision = Decision.IGNORE
+            trace.decision_reason = (trace.decision_reason or "ai_routing") + ";llm_ignore"
+            return trace, []
+
+        if result.decision == "escalate":
             trace.decision = Decision.ESCALATE
             trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
             trace.decision_reason = (trace.decision_reason or "supported_intent_needs_llm") + ";llm_escalation"
             return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
+        # Validate the model's structured contract before touching KB/state.
+        # JSON-schema constrains the provider, but application-level invariants
+        # must still be enforced for mocks, legacy adapters and provider quirks.
+        selected_ids = [str(x).strip() for x in (result.selected_kb_ids or []) if str(x).strip()]
+        if taxonomy_mode and result.decision == "answer" and str(getattr(result, "certainty", "")).lower() != "high":
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = "llm_answer_requires_high_certainty"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+        if taxonomy_mode and result.decision == "clarify" and str(getattr(result, "certainty", "")).lower() == "low":
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = "llm_low_certainty_cannot_clarify"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+        if taxonomy_mode and result.decision == "ignore" and str(getattr(result, "certainty", "")).lower() != "high":
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = "llm_ignore_requires_high_certainty"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+        if result.decision == "choice" and not 2 <= len(selected_ids) <= 3:
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = "llm_invalid_choice_cardinality"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+        if result.decision == "clarify" and len(selected_ids) != 1:
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = "llm_invalid_clarify_cardinality"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+        if result.decision == "answer":
+            valid_answer_cardinality = (
+                len(selected_ids) == 1
+                if taxonomy_mode
+                else 1 <= len(selected_ids) <= 3
+            )
+            if not valid_answer_cardinality:
+                trace.decision = Decision.ESCALATE
+                trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+                trace.decision_reason = "llm_invalid_answer_cardinality"
+                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+        if len(selected_ids) != len(set(selected_ids)):
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = "llm_duplicate_candidate_ids"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
+        # Keep downstream loops tied to the normalized contract.
+        result.selected_kb_ids = selected_ids
+
         business_answers: list[str] = []
         selected_ids: list[str] = []
-        validation_reasons: list[str] = []
         candidate_set = {str(entry.get("id")) for entry in candidates}
 
         for kb_id in result.selected_kb_ids:
@@ -186,24 +209,18 @@ class DecisionPipeline:
                 trace.decision_reason = "llm_selected_unknown_candidate"
                 return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
-            valid, reason, _ = self.kb.validate_llm_selection(question, kb_id)
-            validation_reasons.append(reason)
-            if not valid:
-                trace.decision = Decision.ESCALATE
-                trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
-                trace.decision_reason = f"llm_selection_rejected:{kb_id}:{reason}"
-                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
-
             entry = self.kb.entries_by_id.get(kb_id)
             entry_data = entry or {}
             requires_clarification = bool(entry_data.get("requires_clarification"))
             clarification = str(entry_data.get("clarification_question") or "").strip()
             template = str(entry_data.get("template_answer") or "").strip()
 
-            # If the selected KB intent requires clarification, preserve that
-            # contract instead of silently treating its generic template_answer
-            # as a final answer. The next user turn must be routed with kb_id.
-            if requires_clarification:
+            # The model decides whether the current turn actually lacks the
+            # discriminator needed by a conditional intent. `requires_clarification`
+            # describes that the category has a clarification branch; it must not
+            # force an unnecessary question when the user already supplied the
+            # distinguishing fact.
+            if result.decision == "clarify":
                 if not clarification:
                     trace.decision = Decision.ESCALATE
                     trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
@@ -220,7 +237,7 @@ class DecisionPipeline:
                 trace.decision = Decision.CLARIFY
                 trace.kb_id = kb_id
                 trace.category = str(entry_data.get("category") or "") or trace.category
-                trace.decision_reason = "llm_selected_clarification:" + ";".join(validation_reasons)
+                trace.decision_reason = "llm_selected_clarification"
                 return trace, [OutboundAction("reply", ResponseComposer.rephrase(clarification))]
 
             if not template:
@@ -236,10 +253,16 @@ class DecisionPipeline:
         trace.kb_id = selected_ids[0]
         first_entry = self.kb.entries_by_id.get(selected_ids[0]) or {}
         trace.category = str(first_entry.get("category") or "") or trace.category
-        trace.decision_reason = "llm_selected_validated:" + ",".join(validation_reasons)
+        trace.decision_reason = (
+            "llm_selected_from_full_taxonomy" if taxonomy_mode
+            else "llm_selected_from_retrieved_candidates"
+        )
         return trace, [OutboundAction("business_answer", answer) for answer in business_answers]
 
-    async def decide_match(self, match: MatchResult, question: str) -> tuple[DecisionTrace, list[OutboundAction]]:
+    async def decide_match(
+        self, match: MatchResult, question: str,
+        conversation_context: list[dict[str, str]] | None = None,
+    ) -> tuple[DecisionTrace, list[OutboundAction]]:
         trace = self._trace(match, question)
 
         if match.mode == MatchMode.OPERATOR:
@@ -272,40 +295,22 @@ class DecisionPipeline:
             return trace, [OutboundAction("reply", ResponseComposer.rephrase(match.template_answer or rephrase_prompt()))]
 
         if match.mode == MatchMode.CATEGORY_CHOICE:
-            # User-visible Top-3 is a first-class routing outcome. It is used only
-            # for close, independently supported intents. Weak/OOS cases never
-            # reach this branch; middle-band cases use MatchMode.LLM instead.
-            candidates = list(match.choice_candidates or [])
-            if len(candidates) < 2:
-                trace.decision = Decision.ESCALATE
-                trace.automated = True
-                trace.llm_used = False
-                trace.escalation_reason = EscalationReason.NO_CATEGORY
-                trace.decision_reason = (trace.decision_reason or "choice_invalid") + ";choice_candidates_missing"
-                return trace, [OutboundAction("reply", self._escalation_reply(), True)]
-
-            trace.decision = Decision.CHOICE
+            # Legacy compatibility: retrieval must never emit a user-facing
+            # Top-3 by itself. Route the neighborhood through the LLM; the
+            # application creates Top-3 only when that LLM call fails.
+            if settings.LLM_ENABLED and self.llm and match.relevant_entries:
+                match.mode = MatchMode.LLM
+                return await self._decide_with_llm(trace, question, match, conversation_context)
+            trace.decision = Decision.ESCALATE
             trace.automated = True
             trace.llm_used = False
-            normalized = []
-            for item in candidates[:3]:
-                if not isinstance(item, dict):
-                    continue
-                kb_id = str(item.get("kb_id") or item.get("id") or "").strip()
-                label = str(item.get("choice_label") or item.get("label") or item.get("category") or kb_id).strip()
-                answer = str(item.get("template_answer") or item.get("answer") or "").strip()
-                if kb_id and label:
-                    normalized.append({"kb_id": kb_id, "label": label, "answer": answer})
-
-            trace.choice_candidates = normalized
-            trace.choice_candidate_ids = [x["kb_id"] for x in normalized]
-            trace.decision_reason = trace.decision_reason or "ambiguous_supported_choice"
-            text = ResponseComposer.choice([item["label"] for item in normalized])
-            return trace, [OutboundAction("reply", text)]
+            trace.escalation_reason = EscalationReason.NO_CATEGORY
+            trace.decision_reason = (trace.decision_reason or "choice_requires_llm") + ";llm_disabled_escalate"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
         if match.mode == MatchMode.LLM:
             if settings.LLM_ENABLED and self.llm and match.relevant_entries:
-                return await self._decide_with_llm(trace, question, match)
+                return await self._decide_with_llm(trace, question, match, conversation_context)
 
             trace.decision = Decision.ESCALATE
             trace.automated = True
@@ -352,19 +357,33 @@ class DecisionPipeline:
         trace.escalation_reason = EscalationReason.NO_CATEGORY
         return trace, [OutboundAction("reply", self._escalation_reply(), True)]
 
-    async def decide(self, message: InboundMessage) -> ProcessingResult:
+    async def decide(
+        self,
+        message: InboundMessage,
+        *,
+        is_first_message: bool = True,
+        conversation_context: list[dict[str, str]] | None = None,
+    ) -> ProcessingResult:
         started = time.perf_counter()
 
         raw_text = message.text or ""
-        logger.info(
-            "inbound_query | entity_id=%s | event_id=%s | channel=%s | text_len=%d | text_sha256=%s | text=%r",
+        log_values = (
             getattr(message, "entity_id", None),
             getattr(message, "event_id", None),
             getattr(message, "channel", None),
             len(raw_text),
             hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16],
-            raw_text,
         )
+        if settings.LOG_SENSITIVE_CONTENT:
+            logger.info(
+                "inbound_query | entity_id=%s | event_id=%s | channel=%s | text_len=%d | text_sha256=%s | text=%r",
+                *log_values, raw_text,
+            )
+        else:
+            logger.info(
+                "inbound_query | entity_id=%s | event_id=%s | channel=%s | text_len=%d | text_sha256=%s",
+                *log_values,
+            )
 
         # Operator request is an explicit user action and must survive the
         # generic one-word gate (e.g. a standalone "оператор").
@@ -382,17 +401,42 @@ class DecisionPipeline:
             result.latency_ms = (time.perf_counter() - started) * 1000
             return result
 
-        # Ignore generic acknowledgements/greetings and standalone one-word
-        # messages before expensive routing. Contextual one-word replies are
-        # consumed by SupportApplication state handlers before this method.
-        if is_non_query_message(message.text):
+        # Ignore is deliberately tiny: only a curated acknowledgement/noise
+        # phrase, only after the conversation already contains a user turn.
+        # Never short-circuit a pending clarification/menu context: a word such as
+        # "ок" or "да" may be the user's substantive response to the last bot turn.
+        has_pending_context = any(
+            isinstance(item, dict)
+            and str(item.get("role") or "").strip().lower() == "system"
+            and str(item.get("text") or "").startswith("PENDING_")
+            for item in (conversation_context or [])
+        )
+        if is_non_query_message(message.text) and not has_pending_context:
+            if not is_first_message:
+                trace = DecisionTrace(
+                    decision=Decision.IGNORE,
+                    question=message.text,
+                    decision_reason="noise:contextual_non_query",
+                    automated=True,
+                )
+                result = ProcessingResult(traces=[trace], actions=[])
+                result.latency_ms = (time.perf_counter() - started) * 1000
+                return result
+
+            # The first turn is never silently ignored. A greeting/acknowledgement
+            # without an actual support request cannot be answered from KB, so the
+            # safe policy is a human hand-off rather than a generic clarification.
             trace = DecisionTrace(
-                decision=Decision.IGNORE,
+                decision=Decision.ESCALATE,
                 question=message.text,
-                decision_reason="noise:non_query_or_single_word",
+                decision_reason="first_turn_non_query_escalate",
+                escalation_reason=EscalationReason.NO_CATEGORY,
                 automated=True,
             )
-            result = ProcessingResult(traces=[trace], actions=[])
+            result = ProcessingResult(
+                traces=[trace],
+                actions=[OutboundAction("reply", self._escalation_reply(), True)],
+            )
             result.latency_ms = (time.perf_counter() - started) * 1000
             return result
 
@@ -410,13 +454,82 @@ class DecisionPipeline:
             result.latency_ms = (time.perf_counter() - started) * 1000
             return result
 
+        # AI-first router: classify the current turn against the compact full
+        # taxonomy. This is the primary path when enabled. Deterministic high-risk
+        # patterns still bypass the model because those are policy, not semantics.
+        taxonomy_mode = bool(
+            getattr(settings, "LLM_ROUTER_MODE", "taxonomy").lower() == "taxonomy"
+            and settings.LLM_ENABLED
+            and self.llm
+            and hasattr(self.kb, "intent_catalog_for_llm")
+        )
+        if taxonomy_mode:
+            high_risk = detect_high_risk(message.text)
+            if high_risk:
+                reason_map = {
+                    "refund": EscalationReason.HIGH_RISK_REFUND,
+                    "personal_data": EscalationReason.HIGH_RISK_PERSONAL_DATA,
+                    "complaint": EscalationReason.HIGH_RISK_COMPLAINT,
+                }
+                trace = DecisionTrace(
+                    decision=Decision.ESCALATE,
+                    question=message.text,
+                    decision_reason=f"high_risk:{high_risk}",
+                    escalation_reason=reason_map.get(high_risk, EscalationReason.NO_CATEGORY),
+                )
+                reply = high_risk_reply(high_risk)
+                result = ProcessingResult(
+                    traces=[trace],
+                    actions=[OutboundAction("reply", self._escalation_reply(reply), True)],
+                )
+                result.latency_ms = (time.perf_counter() - started) * 1000
+                return result
+
+            catalog = self.kb.intent_catalog_for_llm()
+            match = MatchResult(
+                mode=MatchMode.LLM,
+                score=0.0,
+                category=None,
+                template_answer=None,
+                kb_id=None,
+                relevant_entries=catalog,
+                top_candidates=None,
+                subquestion=message.text,
+                decision_reason="ai_first_full_taxonomy",
+            )
+            trace, actions = await self._decide_with_llm(
+                self._trace(match, message.text),
+                message.text,
+                match,
+                conversation_context,
+                taxonomy_mode=True,
+            )
+            traces = [trace]
+            if actions:
+                result = ProcessingResult(traces=traces, actions=actions)
+            else:
+                result = ProcessingResult(traces=traces, actions=[])
+            result.latency_ms = (time.perf_counter() - started) * 1000
+            if result.actions or trace.decision == Decision.IGNORE:
+                return result
+            # Defensive final guard for an unexpected empty non-ignore outcome.
+            result.traces.append(DecisionTrace(
+                decision=Decision.ESCALATE,
+                question=message.text,
+                decision_reason="taxonomy_empty_outcome_guard",
+                escalation_reason=EscalationReason.INTERNAL_ERROR,
+                automated=True,
+            ))
+            result.actions = [OutboundAction("reply", self._escalation_reply(), True)]
+            return result
+
         matches = self.kb.match_many(message.text) or [self.kb.match(message.text)]
         traces: list[DecisionTrace] = []
         raw_actions: list[OutboundAction] = []
 
         for match in matches[:5]:
             question = match.subquestion or message.text
-            trace, actions = await self.decide_match(match, question)
+            trace, actions = await self.decide_match(match, question, conversation_context)
             question_text = question or ""
             logger.info(
                 "routing_decision | question_len=%d | question_sha256=%s | question=%r | mode=%s | decision=%s | kb_id=%s | score=%.4f | margin=%.4f | reason=%s",
@@ -463,6 +576,33 @@ class DecisionPipeline:
             actions.append(OutboundAction("reply", "\n\n".join(replies), needs_escalation))
         elif needs_escalation:
             actions.append(OutboundAction("reply", self._escalation_reply(), True))
+
+        # First-turn invariant: the curated ignore list is contextual only.
+        # If an internal matcher accidentally labels the very first message as
+        # noise, never silently consume it; convert it to a human fallback.
+        if is_first_message and any(t.decision == Decision.IGNORE for t in traces):
+            for t in traces:
+                if t.decision == Decision.IGNORE:
+                    t.decision = Decision.ESCALATE
+                    t.escalation_reason = EscalationReason.NO_CATEGORY
+                    t.decision_reason = "first_turn_noise_escalate"
+                    t.automated = True
+            actions = [OutboundAction("reply", self._escalation_reply(), True)]
+
+        # Hard application invariant: every non-ignored inbound turn must have
+        # at least one user-visible action. This is a final safety net against
+        # future routing branches accidentally returning an empty result.
+        if not actions and not any(t.decision == Decision.IGNORE for t in traces):
+            fallback_trace = DecisionTrace(
+                decision=Decision.ESCALATE,
+                question=message.text,
+                decision_reason="empty_outcome_guard",
+                escalation_reason=EscalationReason.INTERNAL_ERROR,
+                automated=True,
+            )
+            traces.append(fallback_trace)
+            actions = [OutboundAction("reply", self._escalation_reply(), True)]
+            logger.error("empty_processing_result_guard | entity_id=%s", message.entity_id)
 
         result = ProcessingResult(traces=traces, actions=actions)
         result.latency_ms = (time.perf_counter() - started) * 1000

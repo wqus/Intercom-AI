@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request, Response
 from app.core.config import settings
 from app.database.session import SessionLocal
-from app.infrastructure.intercom.parser import verify_signature, parse, CONVERSATION_TOPICS, TICKET_TOPICS
+from app.infrastructure.intercom.parser import verify_signature, parse, event_order_at as _event_order_at, CONVERSATION_TOPICS, TICKET_TOPICS
 from app.infrastructure.persistence.repository import EventRepository, EscalatedConversationRepository
 
 router = APIRouter()
@@ -48,6 +48,7 @@ async def intercom_webhook(request: Request):
             topic=message.topic,
             entity_id=message.entity_id,
             payload=payload,
+            event_order_at=_event_order_at(payload),
         )
 
     logger.info(

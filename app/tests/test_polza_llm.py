@@ -29,10 +29,11 @@ def test_polza_client_schema_is_dynamic(monkeypatch):
     client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
     result = asyncio.run(client.classify("не могу записаться", [{"id":"kb_1"},{"id":"kb_2"}]))
     assert result.selected_kb_ids == ["kb_2"]
+    assert result.certainty == "high"
     schema = captured["response_format"]["json_schema"]["schema"]
-    assert schema["properties"]["result"]["items"]["enum"] == ["kb_1", "kb_2", "escalation"]
-    assert schema["properties"]["result"]["minItems"] == 1
-    assert schema["properties"]["result"]["maxItems"] == 3
+    assert schema["properties"]["decision"]["enum"] == ["answer", "clarify", "escalate"]
+    assert schema["properties"]["certainty"]["enum"] == ["high", "medium", "low"]
+    assert schema["properties"]["selected_kb_ids"]["items"]["enum"] == ["kb_1", "kb_2"]
     assert "answer" not in schema["properties"]
     assert "reason" not in schema["properties"]
 
@@ -53,11 +54,11 @@ def test_polza_client_rejects_mixed_escalation(monkeypatch):
     client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
     result = asyncio.run(client.classify("q", [{"id":"kb_1"}]))
     assert result.unavailable is True
-    assert result.escalation is False
+    assert result.decision == "escalate"
     assert result.selected_kb_ids == []
 
 
-def test_polza_client_sends_only_top7_and_compact_payload_for_sonnet5(monkeypatch):
+def test_polza_client_sends_top10_and_compact_payload_for_sonnet5(monkeypatch):
     captured = {}
 
     class FakeCompletions:
@@ -78,9 +79,9 @@ def test_polza_client_sends_only_top7_and_compact_payload_for_sonnet5(monkeypatc
     result = asyncio.run(client.classify("q", candidates))
     assert result.selected_kb_ids == ["kb_3"]
     payload = json.loads(captured["messages"][1]["content"])
-    assert [x["id"] for x in payload["candidates"]] == [f"kb_{i}" for i in range(1, 8)]
+    assert [x["id"] for x in payload["candidates"]] == [f"kb_{i}" for i in range(1, 10)]
     assert "temperature" not in captured
-    assert captured["max_tokens"] == 256
+    assert captured["max_tokens"] == 768
 
 
 def test_polza_client_marks_transport_or_empty_output_as_unavailable(monkeypatch):
@@ -99,7 +100,7 @@ def test_polza_client_marks_transport_or_empty_output_as_unavailable(monkeypatch
     client = PolzaLLMClient("key", "anthropic/claude-sonnet-5")
     result = asyncio.run(client.classify("q", [{"id": "kb_1", "category": "x"}]))
     assert result.unavailable is True
-    assert result.escalation is False
+    assert result.decision == "escalate"
     assert result.selected_kb_ids == []
 
 
@@ -145,8 +146,8 @@ def test_polza_client_retries_when_first_content_is_empty(monkeypatch):
     result = asyncio.run(client.classify("q", [{"id": "kb_1"}]))
     assert result.selected_kb_ids == ["kb_1"]
     assert len(calls) == 2
-    assert calls[0]["max_tokens"] == 256
-    assert calls[1]["max_tokens"] == 512
+    assert calls[0]["max_tokens"] == 768
+    assert calls[1]["max_tokens"] == 1536
 
 
 def test_polza_client_extracts_text_parts(monkeypatch):
@@ -192,4 +193,36 @@ def test_polza_client_retries_when_first_content_is_malformed(monkeypatch):
     result = asyncio.run(client.classify("q", [{"id": "kb_1"}]))
     assert result.selected_kb_ids == ["kb_1"]
     assert len(calls) == 2
-    assert calls[1]["max_tokens"] == 512
+    assert calls[1]["max_tokens"] == 1536
+
+
+def test_luna_pro_uses_structured_router_schema_and_omits_temperature(monkeypatch):
+    captured = {}
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            payload = {"decision": "answer", "selected_kb_ids": ["kb_1"], "certainty": "high"}
+            message = SimpleNamespace(content=json.dumps(payload))
+            choice = SimpleNamespace(message=message)
+            return SimpleNamespace(choices=[choice])
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    import sys, types
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    client = PolzaLLMClient("key", "openai/gpt-5.6-luna-pro")
+    result = asyncio.run(client.classify(
+        "код",
+        [{"id": "kb_1", "category": "Регистрация", "when_to_use": ["Проблемы с регистрацией"]}],
+        [{"role": "user", "text": "Не могу зарегистрироваться"}],
+        taxonomy_mode=True,
+    ))
+    assert result.decision == "answer"
+    assert result.certainty == "high"
+    assert captured["response_format"]["json_schema"]["schema"]["properties"]["certainty"]
+    assert "temperature" not in captured
+    payload = json.loads(captured["messages"][1]["content"])
+    assert payload["conversation_history"][0]["text"] == "Не могу зарегистрироваться"
+

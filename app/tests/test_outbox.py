@@ -1,3 +1,4 @@
+import httpx
 import asyncio
 
 from app.application.outbox_worker import OutboxWorker
@@ -69,3 +70,96 @@ def test_outbox_escalation_tag_delivery():
     assert status == "sent"
     assert error is None
     assert intercom.tags == [("c1", "conversation")]
+
+
+def test_stale_processing_actions_are_not_reclaimed():
+    import inspect
+    from app.infrastructure.persistence.outbox import OutboundRepository
+
+    source = inspect.getsource(OutboundRepository.claim_one)
+    assert "OutboundAction.status == \"processing\"" not in source
+    assert "mark_stale_unknown" in inspect.getsource(OutboundRepository)
+
+
+def _http_error(status: int) -> httpx.HTTPStatusError:
+    import httpx
+    request = httpx.Request("POST", "https://api.intercom.io/conversations/c1/reply")
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+
+def test_intercom_5xx_reconciled_as_sent_when_reply_is_visible():
+    import asyncio
+    from types import SimpleNamespace
+    import httpx
+
+    class ReconIntercom(FakeIntercom):
+        async def reply_exists(self, entity_id, text, after_epoch=None):
+            self.reconcile_args = (entity_id, text, after_epoch)
+            return True
+
+    class Repo:
+        def __init__(self):
+            self.calls = []
+        async def mark_sent(self, action): self.calls.append(("sent", action))
+        async def mark_unknown(self, action, error): self.calls.append(("unknown", error))
+        async def mark_retry(self, action, error): self.calls.append(("retry", error))
+        async def mark_skipped(self, action, error): self.calls.append(("skipped", error))
+
+    action_obj = SimpleNamespace(
+        id=7,
+        action_type="intercom_reply",
+        payload={"entity_id": "c1", "channel": "conversation", "text": "hello"},
+        created_at=None,
+    )
+    worker = OutboxWorker(ReconIntercom(), FakeTelegram())
+    repo = Repo()
+    asyncio.run(worker._handle_http_status_error(action_obj, repo, _http_error(503)))
+    assert [c[0] for c in repo.calls] == ["sent"]
+
+
+def test_intercom_5xx_without_reconciled_reply_becomes_unknown_not_retry():
+    import asyncio
+    from types import SimpleNamespace
+
+    class ReconIntercom(FakeIntercom):
+        async def reply_exists(self, entity_id, text, after_epoch=None):
+            return False
+
+    class Repo:
+        def __init__(self):
+            self.calls = []
+        async def mark_sent(self, action): self.calls.append(("sent", action))
+        async def mark_unknown(self, action, error): self.calls.append(("unknown", error))
+        async def mark_retry(self, action, error): self.calls.append(("retry", error))
+        async def mark_skipped(self, action, error): self.calls.append(("skipped", error))
+
+    action_obj = SimpleNamespace(
+        id=8,
+        action_type="intercom_reply",
+        payload={"entity_id": "c1", "channel": "conversation", "text": "hello"},
+        created_at=None,
+    )
+    worker = OutboxWorker(ReconIntercom(), FakeTelegram())
+    repo = Repo()
+    asyncio.run(worker._handle_http_status_error(action_obj, repo, _http_error(500)))
+    assert [c[0] for c in repo.calls] == ["unknown"]
+    assert "delivery requires reconciliation" in repo.calls[0][1]
+
+
+def test_intercom_429_remains_retryable():
+    import asyncio
+    from types import SimpleNamespace
+
+    class Repo:
+        def __init__(self): self.calls = []
+        async def mark_sent(self, action): self.calls.append(("sent", action))
+        async def mark_unknown(self, action, error): self.calls.append(("unknown", error))
+        async def mark_retry(self, action, error): self.calls.append(("retry", error))
+        async def mark_skipped(self, action, error): self.calls.append(("skipped", error))
+
+    action_obj = SimpleNamespace(id=9, action_type="intercom_reply", payload={"channel": "conversation"})
+    worker = OutboxWorker(FakeIntercom(), FakeTelegram())
+    repo = Repo()
+    asyncio.run(worker._handle_http_status_error(action_obj, repo, _http_error(429)))
+    assert [c[0] for c in repo.calls] == ["retry"]

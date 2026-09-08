@@ -21,6 +21,9 @@ class InboundEvent(Base):
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Provider-side action time used to reject stale/out-of-order webhook events.
+    # Nullable for legacy rows or events whose provider payload lacks a timestamp.
+    event_order_at: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 class ConversationState(Base):

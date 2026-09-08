@@ -51,16 +51,23 @@ class EventWorker:
                                 await repo.mark_done(event)
                                 continue
 
-                            await self.application.handle(session, event, message)
+                            handled = await self.application.handle(session, event, message)
+                            # A stale/out-of-order event is intentionally consumed but
+                            # must never mutate state or enter the outbound path.
                             await repo.mark_done(event)
                         except Exception as exc:
+                            # Capture primary-key/attempt state BEFORE rollback. SQLAlchemy
+                            # expires ORM attributes on rollback; accessing event.id after
+                            # rollback can trigger an implicit SELECT and hide the original
+                            # processing error (or fail again if the DB connection is unhealthy).
+                            event_id = event.id
                             attempt_count = int(event.attempts or 0)
-                            logger.exception("Event processing failed event=%s", event.id)
+                            logger.exception("Event processing failed event=%s", event_id)
                             # Never let partially written conversation state or an
                             # escalation block leak into the retry transaction.
                             await session.rollback()
-                            await repo.mark_failed(
-                                event, str(exc), retry=True, attempt_count=attempt_count
+                            await repo.mark_failed_by_id(
+                                event_id, str(exc), retry=True, attempt_count=attempt_count
                             )
             except Exception:
                 logger.exception("Worker loop failure")

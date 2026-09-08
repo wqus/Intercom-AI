@@ -25,14 +25,14 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not settings.DRY_RUN:
-        missing = [
-            name for name, value in {
-                "INTERCOM_TOKEN": settings.INTERCOM_TOKEN,
-                "INTERCOM_ADMIN_ID": settings.INTERCOM_ADMIN_ID,
-                "INTERCOM_CLIENT_SECRET": settings.INTERCOM_CLIENT_SECRET,
-            }.items()
-            if not value
-        ]
+        required = {
+            "INTERCOM_TOKEN": settings.INTERCOM_TOKEN,
+            "INTERCOM_ADMIN_ID": settings.INTERCOM_ADMIN_ID,
+            "INTERCOM_CLIENT_SECRET": settings.INTERCOM_CLIENT_SECRET,
+        }
+        if settings.LLM_ENABLED:
+            required["POLZA_API_KEY"] = settings.POLZA_API_KEY
+        missing = [name for name, value in required.items() if not value]
         if missing:
             raise RuntimeError(
                 "Live mode requires Intercom configuration: " + ", ".join(missing)
@@ -41,20 +41,24 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     await ensure_schema(engine)
 
-    kb=KnowledgeBase(path=settings.KB_PATH, device=settings.EMBEDDING_DEVICE, use_reranker=settings.USE_RERANKER)
+    router_mode = str(settings.LLM_ROUTER_MODE or "taxonomy").strip().lower()
+    if router_mode not in {"taxonomy", "legacy"}:
+        raise RuntimeError("LLM_ROUTER_MODE must be either 'taxonomy' or 'legacy'")
+    if router_mode == "taxonomy" and not settings.LLM_ENABLED:
+        raise RuntimeError("LLM_ENABLED must remain true when LLM_ROUTER_MODE=taxonomy")
+    kb=KnowledgeBase(
+        path=settings.KB_PATH,
+        device=settings.EMBEDDING_DEVICE,
+        use_reranker=settings.USE_RERANKER,
+        enable_retrieval=(router_mode == "legacy"),
+    )
     llm = None
     if settings.LLM_ENABLED:
-        if settings.POLZA_API_KEY:
-            llm = PolzaLLMClient(
-                api_key=settings.POLZA_API_KEY,
-                model=settings.POLZA_MODEL,
-                temperature=settings.POLZA_TEMPERATURE,
-            )
-        else:
-            logging.getLogger("main").warning(
-                "LLM_ENABLED=true but POLZA_API_KEY is empty; middle-band routing "
-                "will fail closed instead of preventing application startup."
-            )
+        llm = PolzaLLMClient(
+            api_key=settings.POLZA_API_KEY,
+            model=settings.POLZA_MODEL,
+            temperature=settings.POLZA_TEMPERATURE,
+        )
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=5.0),
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
@@ -84,6 +88,6 @@ async def lifespan(app: FastAPI):
     await telegram_client.aclose()
     await engine.dispose()
 
-app=FastAPI(title="Terra Intercom AI Support v22.11 Production", lifespan=lifespan)
+app=FastAPI(title="Terra Intercom AI Support v25 Production", lifespan=lifespan)
 app.include_router(webhook_router)
 

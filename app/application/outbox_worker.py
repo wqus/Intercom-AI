@@ -61,6 +61,50 @@ class OutboxWorker:
 
         return "skipped", f"Unknown outbound action type: {action_type}"
 
+    async def _handle_http_status_error(self, action, repo, exc: httpx.HTTPStatusError) -> None:
+        """Apply provider-specific failure semantics without blind duplicate sends."""
+        status_code = exc.response.status_code if exc.response is not None else 0
+        if 500 <= status_code <= 599:
+            # Intercom's reply POST does not document an idempotency key. A 5xx can
+            # therefore be ambiguous. Reconcile conversation replies before deciding
+            # whether delivery happened; otherwise quarantine as unknown.
+            if action.action_type == "intercom_reply" and action.payload.get("channel") == "conversation":
+                try:
+                    after_epoch = None
+                    created_at = getattr(action, "created_at", None)
+                    if created_at is not None:
+                        after_epoch = int(created_at.timestamp()) - 5
+                    confirmed = await self.intercom.reply_exists(
+                        str(action.payload["entity_id"]),
+                        str(action.payload["text"]),
+                        after_epoch=after_epoch,
+                    )
+                except Exception as reconcile_exc:
+                    logger.error(
+                        "Outbound reconciliation failed action=%s: %s",
+                        action.id, reconcile_exc,
+                    )
+                    confirmed = False
+                if confirmed:
+                    await repo.mark_sent(action)
+                else:
+                    await repo.mark_unknown(
+                        action,
+                        f"Intercom {status_code} after reply POST; delivery requires reconciliation",
+                    )
+            else:
+                await repo.mark_unknown(
+                    action,
+                    f"Provider {status_code} after outbound write; delivery requires reconciliation",
+                )
+            return
+        if status_code == 429:
+            # Rate limiting is retryable and is distinct from ambiguous server-side
+            # failures of a create operation.
+            await repo.mark_retry(action, str(exc))
+            return
+        await repo.mark_skipped(action, str(exc))
+
     async def _run(self) -> None:
         # Import the database session lazily so pure delivery tests and tooling do
         # not require a live SQL driver at module-import time.
@@ -71,6 +115,7 @@ class OutboxWorker:
             try:
                 async with SessionLocal() as session:
                     repo = OutboundRepository(session)
+                    await repo.mark_stale_unknown()
                     action = await repo.claim_one()
                     if action:
                         processed = True
@@ -94,16 +139,7 @@ class OutboxWorker:
                             )
                             await repo.mark_unknown(action, str(exc))
                         except httpx.HTTPStatusError as exc:
-                            status_code = exc.response.status_code if exc.response is not None else 0
-                            if 500 <= status_code <= 599 or status_code == 429:
-                                logger.warning(
-                                    "Outbound provider retryable error action=%s status=%s",
-                                    action.id,
-                                    status_code,
-                                )
-                                await repo.mark_retry(action, str(exc))
-                            else:
-                                await repo.mark_skipped(action, str(exc))
+                            await self._handle_http_status_error(action, repo, exc)
                         except Exception as exc:
                             logger.exception("Outbound delivery failed action=%s", action.id)
                             await repo.mark_retry(action, str(exc))

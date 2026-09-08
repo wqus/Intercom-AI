@@ -101,3 +101,84 @@ def test_conversation_user_replied_prefers_event_source_over_later_history():
     assert msg is not None
     assert msg.text == "1"
     assert msg.updated_at == "200"
+
+
+def test_attachment_only_user_message_is_not_dropped():
+    payload = {
+        "id": "evt-attachment-only",
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "conv-attachment-only",
+            "source": {
+                "body": "",
+                "author": {"type": "user"},
+                "created_at": "300",
+                "attachments": [{"id": "a1"}],
+            },
+            "conversation_parts": {"conversation_parts": []},
+        }},
+    }
+    msg = parse(payload)
+    assert msg is not None
+    assert msg.text == ""
+    assert msg.has_attachments is True
+
+
+def test_conversation_context_excludes_current_and_future_parts():
+    from app.infrastructure.intercom.parser import _conversation_context
+    current = {"id":"current", "body":"код", "created_at":30, "author":{"type":"user"}}
+    item = {"conversation_parts": {"conversation_parts": [
+        {"id":"u1","body":"Не могу зарегистрироваться","created_at":10,"author":{"type":"user"}},
+        {"id":"a1","body":"На каком этапе?","created_at":20,"author":{"type":"admin"}},
+        current,
+        {"id":"u2","body":"Сколько стоит?","created_at":40,"author":{"type":"user"}},
+    ]}}
+    result = _conversation_context(item, "код", current)
+    assert result == [
+        {"role":"user","text":"Не могу зарегистрироваться"},
+        {"role":"assistant","text":"На каком этапе?"},
+    ]
+
+
+def test_conversation_user_replied_uses_source_when_author_type_missing():
+    payload = {
+        "id": "evt-current",
+        "topic": "conversation.user.replied",
+        "data": {
+            "item": {
+                "id": "conv-1",
+                "source": {"body": "Сколько стоит обучение?", "created_at": 200},
+                "conversation_parts": {
+                    "conversation_parts": [
+                        {
+                            "id": "old-user",
+                            "body": "Не могу зарегистрироваться.",
+                            "created_at": 100,
+                            "author": {"type": "user", "name": "User"},
+                        }
+                    ]
+                },
+            }
+        },
+    }
+    message = parse(payload)
+    assert message is not None
+    assert message.text == "Сколько стоит обучение?"
+
+
+def test_webhook_event_order_uses_source_message_time():
+    from app.infrastructure.intercom.parser import event_order_at as _event_order_at
+    assert _event_order_at({
+        "created_at": 999,
+        "topic": "conversation.user.replied",
+        "data": {"item": {"source": {"created_at": 123}}},
+    }) == 123
+
+
+def test_webhook_event_order_falls_back_to_notification_time():
+    from app.infrastructure.intercom.parser import event_order_at as _event_order_at
+    assert _event_order_at({
+        "created_at": 456,
+        "topic": "conversation.user.replied",
+        "data": {"item": {"source": {}}},
+    }) == 456

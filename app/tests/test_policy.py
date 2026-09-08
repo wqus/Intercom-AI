@@ -31,7 +31,7 @@ class NoiseKB:
 def test_noise_is_ignored_without_reply_or_escalation():
     pipeline = DecisionPipeline(NoiseKB(), FakeLLM())
     msg = InboundMessage("1","k","t","c",Channel.CONVERSATION,"Бесполезное сообщение")
-    result = asyncio.run(pipeline.decide(msg))
+    result = asyncio.run(pipeline.decide(msg, is_first_message=False))
     assert result.traces[0].decision == Decision.IGNORE
     assert result.actions == []
 
@@ -57,12 +57,12 @@ def test_meta_noise_produces_no_reply():
     )
 
     import asyncio
-    result = asyncio.run(pipeline.decide(msg))
+    result = asyncio.run(pipeline.decide(msg, is_first_message=False))
     assert result.traces[0].decision.value == "ignore"
     assert result.actions == []
 
 
-def test_category_choice_is_user_visible_and_not_llm(monkeypatch):
+def test_top3_is_only_fallback_after_llm_error(monkeypatch):
     from app.application import decision_pipeline as module
     monkeypatch.setattr(module.settings, "LLM_ENABLED", True)
 
@@ -70,23 +70,25 @@ def test_category_choice_is_user_visible_and_not_llm(monkeypatch):
         entries_by_id = {}
     class FakeLLM:
         async def classify(self, *_args, **_kwargs):
-            raise AssertionError("Top-3 choice must not call LLM")
+            raise RuntimeError("provider unavailable")
 
     pipeline = DecisionPipeline(FakeKB(), FakeLLM())
     from app.infrastructure.ai.knowledge_base import MatchResult, MatchMode
     match = MatchResult(
-        MatchMode.CATEGORY_CHOICE, 0.8, "Cat A", None, "kb_1", [],
-        choice_candidates=[
-            {"kb_id":"kb_1","choice_label":"A","template_answer":"A answer"},
-            {"kb_id":"kb_2","choice_label":"B","template_answer":"B answer"},
+        MatchMode.LLM, 0.8, "Cat A", None, "kb_1",
+        [{"id":"kb_1","category":"A"},{"id":"kb_2","category":"B"},{"id":"kb_3","category":"C"}],
+        top_candidates=[
+            {"id":"kb_1","choice_label":"A"},
+            {"id":"kb_2","choice_label":"B"},
+            {"id":"kb_3","choice_label":"C"},
         ],
-        decision_reason="ambiguous", subquestion="q"
+        decision_reason="ai_first", subquestion="q"
     )
     trace, actions = __import__('asyncio').run(pipeline.decide_match(match, 'q'))
     assert trace.decision == Decision.CHOICE
-    assert trace.llm_used is False
-    assert trace.choice_candidate_ids == ["kb_1", "kb_2"]
-    assert actions and "1. A" in (actions[0].text or "") and "2. B" in (actions[0].text or "")
+    assert trace.llm_used is True
+    assert trace.choice_candidate_ids == ["kb_1", "kb_2", "kb_3"]
+    assert actions and "1. A" in (actions[0].text or "") and "3. C" in (actions[0].text or "")
 
 def test_llm_mode_selects_and_validates_template(monkeypatch):
     from app.application import decision_pipeline as module
@@ -219,14 +221,18 @@ def test_standalone_one_word_is_ignored_but_operator_is_not():
     from app.domain.enums import Decision, Channel, EscalationReason
     from app.domain.models import InboundMessage
 
+    from app.infrastructure.ai.knowledge_base import is_non_query_message
+    assert is_non_query_message("Спасибо")
+    assert not is_non_query_message("Телеграм")
+
     class FakeKB:
         def match_many(self, text):
-            raise AssertionError("KB must not be reached")
+            raise AssertionError("This test must not classify the acknowledgement")
 
     pipeline = DecisionPipeline(FakeKB(), object())
-    one_word = asyncio.run(pipeline.decide(InboundMessage("e","k","t","c",Channel.CONVERSATION,"Телеграм")))
-    assert one_word.traces[0].decision == Decision.IGNORE
-    assert one_word.actions == []
+    acknowledgement = asyncio.run(pipeline.decide(InboundMessage("e","k","t","c",Channel.CONVERSATION,"Спасибо"), is_first_message=False))
+    assert acknowledgement.traces[0].decision == Decision.IGNORE
+    assert acknowledgement.actions == []
 
     operator = asyncio.run(pipeline.decide(InboundMessage("e2","k2","t","c2",Channel.CONVERSATION,"оператор")))
     assert operator.traces[0].decision == Decision.ESCALATE

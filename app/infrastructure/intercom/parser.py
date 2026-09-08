@@ -16,7 +16,59 @@ def verify_signature(body: bytes, signature: str) -> bool:
 def _strip(value: str) -> str:
     return re.sub(r"<[^>]+>", "", value or "").strip()
 
-def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
+
+def _conversation_context(item: dict, current_text: str, current_part: dict | None = None) -> list[dict[str, str]]:
+    """Build a safe chronological history for the routing model.
+
+    Only messages that are known to be from the customer or assistant are exposed.
+    The current source message and any message newer than that source are excluded
+    to prevent delayed webhooks from leaking future conversation state into routing.
+    """
+    parts = item.get("conversation_parts", {}).get("conversation_parts", []) or []
+    context: list[dict[str, str]] = []
+
+    def _stamp(part: dict) -> int | None:
+        value = part.get("created_at")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    current_id = None
+    if isinstance(current_part, dict):
+        current_id = current_part.get("id") or current_part.get("part_id")
+    current_stamp = _stamp(current_part or {})
+    current_norm = _strip(current_text)
+
+    rows: list[tuple[int, int, dict]] = []
+    for idx, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+        body = _strip(part.get("body", ""))
+        if not body:
+            continue
+        part_id = part.get("id") or part.get("part_id")
+        stamp = _stamp(part)
+        if current_id and part_id and part_id == current_id:
+            continue
+        if current_part is not None and part is current_part:
+            continue
+        # If IDs are absent, exclude an exact source-text/timestamp duplicate.
+        if current_stamp is not None and stamp is not None and stamp > current_stamp:
+            continue
+        if current_stamp is not None and stamp == current_stamp and body == current_norm:
+            continue
+        author_type = (part.get("author", {}) or {}).get("type")
+        if author_type not in {"user", "admin", "bot", "teammate", "assistant"}:
+            continue
+        role = "user" if author_type == "user" else "assistant"
+        rows.append((stamp if stamp is not None else -1, idx, {"role": role, "text": body}))
+
+    rows.sort(key=lambda x: (x[0], x[1]))
+    context.extend(row[2] for row in rows)
+    return context[-12:]
+
+def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,list[dict[str,str]]] | None:
     item = payload.get("data", {}).get("item", {}) or {}
     cid = str(item.get("id") or "")
     if not cid:
@@ -32,7 +84,14 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     # the conversation; selecting the newest historical message would then run
     # the classifier against the wrong text and can bypass an active Top-3 state.
     source_author_type = (source.get("author", {}) or {}).get("type")
-    if topic == "conversation.user.replied" and source.get("body") and source_author_type == "user":
+    if (
+        topic == "conversation.user.replied"
+        and (source.get("body") or source.get("attachments"))
+        and source_author_type in {"user", None}
+    ):
+        # The webhook topic itself says this is a customer reply. When the
+        # provider omits author.type, the triggering source is still safer than
+        # guessing from an older user message in conversation_parts.
         part = source
     else:
         user_parts = [
@@ -43,7 +102,7 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
             # Compatibility fallback for payloads where the current source is
             # absent or incomplete. Preserve payload order in this fallback.
             part = user_parts[-1]
-        elif topic == "conversation.user.replied" and source.get("body") and not source_author_type:
+        elif topic == "conversation.user.replied" and (source.get("body") or source.get("attachments")) and not source_author_type:
             # Compatibility fallback only when author.type is genuinely absent.
             # An explicit admin/bot author must never be treated as a customer reply.
             part = source
@@ -54,7 +113,7 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     attachments = bool(part.get("attachments"))
     author = part.get("author", {}) or {}
     last_message_at = part.get("created_at") or item.get("updated_at") or ""
-    return cid, text, attachments, author.get("name", ""), author.get("email", ""), str(last_message_at)
+    return cid, text, attachments, author.get("name", ""), author.get("email", ""), str(last_message_at), _conversation_context(item, text, part)
 
 def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     item=payload.get("data",{}).get("item",{})
@@ -73,6 +132,25 @@ def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     text=_strip(attrs.get("_default_description_",""))
     return (tid,text,False,"","",str(item.get("updated_at",""))) if tid else None
 
+
+def event_order_at(payload: dict) -> int | None:
+    """Extract provider-side action time for per-conversation ordering."""
+    topic = str(payload.get("topic") or "")
+    item = ((payload.get("data") or {}).get("item") or {})
+    candidates = []
+    if topic.startswith("conversation."):
+        candidates.append(((item.get("source") or {}).get("created_at")))
+    if topic.startswith("ticket."):
+        candidates.append(((item.get("ticket_part") or {}).get("created_at")))
+    candidates.append(payload.get("created_at"))
+    for value in candidates:
+        try:
+            if value is not None and str(value).strip() != "":
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
 def parse(payload: dict) -> InboundMessage | None:
     topic=payload.get("topic","")
     event_id=str(payload.get("id") or "")
@@ -84,9 +162,13 @@ def parse(payload: dict) -> InboundMessage | None:
         channel=Channel.TICKET
     else:
         return None
-    if not data or not data[1]:
+    # A message may contain only an attachment. It is still a real user turn
+    # and must reach the attachment/escalation policy instead of being silently
+    # discarded at the parser boundary.
+    if not data or (not data[1] and not data[2]):
         return None
-    entity_id,text,attachments,name,email,updated_at=data
+    entity_id,text,attachments,name,email,updated_at,*rest=data
+    context = rest[0] if rest and isinstance(rest[0], list) else []
     fallback_key = hashlib.sha1(
         f"{entity_id}:{updated_at}:{text}".encode("utf-8")
     ).hexdigest()
@@ -101,6 +183,6 @@ def parse(payload: dict) -> InboundMessage | None:
         user_email=email,
         updated_at=updated_at,
         has_attachments=attachments,
-        raw=payload,
+        raw={**payload, "_conversation_context": context},
     )
 

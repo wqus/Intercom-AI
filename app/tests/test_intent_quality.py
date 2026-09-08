@@ -75,9 +75,9 @@ def test_llm_prompt_is_conservative_and_has_no_generation_fields():
     }])
 
     assert "escalation" in prompt
-    assert "Нельзя возвращать `none`" in prompt
+    assert "нельзя придумывать новые id" in prompt.lower()
     assert "НЕ отвечаешь пользователю" in prompt
-    assert '"question"' in payload
+    assert '"current_question"' in payload
     assert '"candidates"' in payload
     assert "embedding_score" not in payload
     assert "_context_only" not in payload
@@ -124,9 +124,9 @@ def test_exact_one_word_acknowledgement_is_non_query():
     assert q.reason == "meta_noise"
 
 
-def test_one_word_domain_term_is_ignored():
+def test_one_word_domain_term_is_routable_not_ignored():
     from app.infrastructure.ai.knowledge_base import is_non_query_message, _query_quality
-    assert is_non_query_message("Оплата")
+    assert not is_non_query_message("Оплата")
     q = _query_quality("Оплата")
     assert not q.meta_noise
     assert q.reason == "single_word"
@@ -153,7 +153,7 @@ def test_attachment_acknowledgement_is_ignored_before_attachment_escalation():
 
     pipeline = DecisionPipeline(NeverKB(), object())
     msg = InboundMessage("e","k","t","c",Channel.TICKET,"Спасибо",has_attachments=True)
-    result = asyncio.run(pipeline.decide(msg))
+    result = asyncio.run(pipeline.decide(msg, is_first_message=False))
     assert result.traces[0].decision.value == "ignore"
     assert result.actions == []
 
@@ -223,10 +223,10 @@ def test_oos_external_target_requires_domain_sensitive_context():
     assert kb._oos_reason(q, ranked, quality) is None or isinstance(kb._oos_reason(q, ranked, quality), str)
 
 
-def test_all_standalone_one_word_business_terms_are_ignored():
+def test_standalone_one_word_business_terms_are_routable():
     from app.infrastructure.ai.knowledge_base import is_non_query_message
     for term in ("Оплата", "Наставник", "Сертификат", "Телеграм"):
-        assert is_non_query_message(term)
+        assert not is_non_query_message(term)
 
 
 def test_negated_mentor_application_does_not_trigger_kb_023():

@@ -47,3 +47,16 @@ def test_cpu_only_torch_dependency_is_pinned_for_production():
     assert "--extra-index-url https://download.pytorch.org/whl/cpu" in requirements
     assert "torch==2.13.0+cpu" in requirements
     assert "torch==2.13.0\n" not in requirements
+
+
+def test_event_repository_count_for_entity_uses_sqlalchemy_count_expression():
+    from app.infrastructure.persistence.repository import EventRepository
+    from sqlalchemy.sql import Select
+
+    class Session:
+        async def scalar(self, stmt):
+            assert isinstance(stmt, Select)
+            return 3
+
+    import asyncio
+    assert asyncio.run(EventRepository(Session()).count_for_entity("conv")) == 3

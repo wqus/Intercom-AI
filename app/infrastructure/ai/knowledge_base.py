@@ -36,8 +36,8 @@ EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 RERANKER_MODEL_NAME = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 
 RETRIEVAL_TOP_K = 20
-FINAL_CANDIDATES = 8
-LLM_TOP_K = 7
+FINAL_CANDIDATES = 10
+LLM_TOP_K = 10
 NEGATIVE_SEMANTIC_WEIGHT = 0.14
 OBJECT_MISMATCH_PENALTY = 0.22
 STATE_MISMATCH_PENALTY = 0.16
@@ -114,14 +114,14 @@ GENERIC_RERANK_WEIGHT = 0.10
 # auto-answering.
 AUTO_SCORE = 0.97
 AUTO_MARGIN = 0.20
-LLM_SCORE = 0.48
+LLM_SCORE = 0.28
 LLM_MARGIN = 0.030
 # A candidate must still have enough evidence to justify spending an LLM call.
 # Below this floor we ask for clarification or escalate instead of letting the
 # model turn a weak retrieval hit into a plausible-looking category.
-LLM_MIN_SUPPORTED_EVIDENCE = 0.24
-LLM_MIN_DOMAIN_SUPPORT = 0.12
-LLM_MIN_QUERY_QUALITY = 0.18
+LLM_MIN_SUPPORTED_EVIDENCE = 0.10
+LLM_MIN_DOMAIN_SUPPORT = 0.05
+LLM_MIN_QUERY_QUALITY = 0.05
 HIGH_SCORE_LOW_MARGIN = 0.88
 LEXICAL_EVIDENCE_MIN = 0.32
 SEMANTIC_GAP_FOR_LLM = 0.025
@@ -142,7 +142,13 @@ RERANK_WEIGHT = 0.10
 
 # Safety thresholds: TEMPLATE ultra-strict; Top-3 is a rare, evidence-backed ambiguity mode.
 INTENT_FIT_TEMPLATE_MIN = 0.90
-INTENT_FIT_LLM_MIN = 0.38
+INTENT_FIT_LLM_MIN = 0.18
+# AI-first routing: retrieval only needs to produce a plausible semantic neighborhood.
+# These are deliberately low floors; obvious OOS is handled separately.
+AI_MIN_RETRIEVAL_SCORE = 0.28
+AI_MIN_SEMANTIC_SCORE = 0.42
+AI_MIN_INTENT_FIT = 0.18
+AI_MIN_DOMAIN_SUPPORT = 0.05
 INTENT_FIT_HARD_MISMATCH = 0.25
 MIN_QUERY_QUALITY_TEMPLATE = 0.36
 MIN_QUERY_QUALITY_LLM = 0.18
@@ -158,11 +164,11 @@ REPHRASE_QUERY_QUALITY_MAX = 0.50
 # A coherent message is OOS only when we have both weak supported-domain evidence
 # and no defensible intent evidence. Rare in-domain questions should fall through
 # to REPHRASE/CHOICE rather than being rejected by the scope gate.
-OOS_TOP_SCORE_MAX = 0.56
-OOS_INTENT_FIT_MAX = 0.36
-OOS_REAL_EVIDENCE_MAX = 0.30
-OOS_DOMAIN_SUPPORT_MAX = 0.18
-OOS_QUERY_QUALITY_MIN = 0.34
+OOS_TOP_SCORE_MAX = 0.45
+OOS_INTENT_FIT_MAX = 0.25
+OOS_REAL_EVIDENCE_MAX = 0.22
+OOS_DOMAIN_SUPPORT_MAX = 0.08
+OOS_QUERY_QUALITY_MIN = 0.50
 OOS_EXTERNAL_TARGET = True
 OOS_MIN_DOMAIN_TERM_HITS = 0
 
@@ -543,20 +549,16 @@ def detect_high_risk(text: str) -> str | None:
 
 
 def is_non_query_message(text: str) -> bool:
-    """Return True for non-support input, including standalone one-word messages.
+    """Return True only for explicitly curated acknowledgement/noise phrases.
 
-    One-word input is not sufficient evidence for a KB intent. Contextual
-    exceptions (Top-3 numeric choices and known clarification replies) are
-    handled by the state/orchestration layer before this gate is reached.
+    Length is intentionally NOT a criterion. A one-word support request such as
+    ``оплата`` or ``регистрация`` must remain routable. The caller is responsible
+    for enforcing the conversation-position rule (IGNORE only after turn one).
     """
     q = normalize_light(text)
     if not q:
         return True
-    if q in _NON_QUERY_EXACT or q in META_NOISE_PATTERNS:
-        return True
-    if len(tokenize(q)) == 1:
-        return True
-    return False
+    return q in _NON_QUERY_EXACT or q in META_NOISE_PATTERNS
 
 
 def _quality_gate(text: str) -> tuple[bool, str]:
@@ -564,16 +566,10 @@ def _quality_gate(text: str) -> tuple[bool, str]:
     return quality.valid, quality.reason
 
 
-META_NOISE_PATTERNS: tuple[str, ...] = (
-    "бесполезное сообщение",
-    "не несущее смысла",
-    "не имеет смысла",
-    "просто сообщение",
-    "бессмысленное сообщение",
-    "это бесполезно",
-    "просто набор слов",
-    "набор бессмысленных",
-)
+# Do not infer noise from arbitrary phrases. User-visible content such as
+# "это бесполезно" can itself be a complaint or a support signal. The ignore
+# gate is intentionally whitelist-only.
+META_NOISE_PATTERNS: tuple[str, ...] = ()
 
 # Exact acknowledgements/greetings are ignored as non-support messages.
 _NON_QUERY_EXACT: set[str] = set()
@@ -916,6 +912,7 @@ class KnowledgeBase:
         reranker_model_name: str = RERANKER_MODEL_NAME,
         device: str = "cpu",
         use_reranker: bool = False,
+        enable_retrieval: bool = True,
     ) -> None:
         self.entries: list[dict] = []
         self.entries_by_id: dict[str, dict] = {}
@@ -930,26 +927,36 @@ class KnowledgeBase:
         self.default_answer = "Уточните, пожалуйста, подробнее ваш вопрос."
         self.model = None
         self.reranker = None
-
-        if SentenceTransformer is None:
-            raise RuntimeError("sentence-transformers is required for production inference")
-
-        logger.info("Loading embedding model: %s", model_name)
-        self.model = SentenceTransformer(model_name, device=device)
-
-        if use_reranker:
-            if CrossEncoder is None:
-                raise RuntimeError("sentence-transformers CrossEncoder is unavailable")
-            logger.info("Loading OPTIONAL generic reranker: %s", reranker_model_name)
-            self.reranker = CrossEncoder(reranker_model_name, device=device, max_length=512)
+        self.retrieval_enabled = bool(enable_retrieval)
 
         self._load(path)
-        self._build_indexes()
+        if self.retrieval_enabled:
+            if SentenceTransformer is None:
+                raise RuntimeError("sentence-transformers is required for retrieval mode")
+            logger.info("Loading embedding model: %s", model_name)
+            self.model = SentenceTransformer(model_name, device=device)
+
+            if use_reranker:
+                if CrossEncoder is None:
+                    raise RuntimeError("sentence-transformers CrossEncoder is unavailable")
+                logger.info("Loading OPTIONAL generic reranker: %s", reranker_model_name)
+                self.reranker = CrossEncoder(reranker_model_name, device=device, max_length=512)
+
+            self._build_indexes()
 
         logger.info(
-            "KB v12 loaded | categories=%d | phrase_records=%d | reranker=%s",
-            len(self.entries), len(self.phrase_records), self.reranker is not None,
+            "KB loaded | categories=%d | retrieval=%s | phrase_records=%d | reranker=%s",
+            len(self.entries), self.retrieval_enabled, len(self.phrase_records), self.reranker is not None,
         )
+
+    def intent_catalog_for_llm(self) -> list[dict]:
+        """Return the compact full taxonomy used by the AI-first router.
+
+        The LLM does not need examples, negative phrases, embeddings, scores or
+        approved answer text to select among a few dozen intents. Keeping the
+        catalog compact makes the router both cheaper and easier to reason about.
+        """
+        return [dict(entry) for entry in self.entries if str(entry.get("id") or "").strip()]
 
     # --------------------------------------------------------
     # LOAD / INDEX
@@ -1014,6 +1021,8 @@ class KnowledgeBase:
             entry["_positive_norm"] = [normalize_light(p) for p in entry["positive_examples"] if isinstance(p, str)]
             self.entries.append(entry)
             self.entries_by_id[entry_id] = entry
+
+        self._validate_kb_contracts()
 
         # Build hard negatives automatically from the KB's own curated
         # conflict graph. This gives us supervised-looking contrastive evidence
@@ -1250,6 +1259,62 @@ class KnowledgeBase:
                     raise ValueError(
                         f"KB {entry['id']}: constraints.{key} must be a list"
                     )
+
+    def _validate_kb_contracts(self) -> None:
+        """Fail fast on KB defects that can make routing ambiguous or unroutable.
+
+        The KB is executable policy: malformed contracts should stop startup
+        rather than silently degrading classification quality in production.
+        Exact positive-example collisions are especially dangerous because they
+        create deterministic evidence for two different intents.
+        """
+        required_fields = (
+            "category", "template_answer", "definition", "family",
+            "intent_type", "positive_examples", "when_to_use", "when_not_to_use",
+        )
+        owners: dict[str, str] = {}
+        errors: list[str] = []
+        known_ids = set(self.entries_by_id)
+
+        for entry in self.entries:
+            entry_id = str(entry.get("id") or "")
+            for field in required_fields:
+                value = entry.get(field)
+                if value is None or value == "" or (isinstance(value, list) and not value):
+                    errors.append(f"{entry_id}:missing_{field}")
+            if not isinstance(entry.get("constraints"), dict):
+                errors.append(f"{entry_id}:invalid_constraints")
+            positives = entry.get("positive_examples") or []
+            for phrase in positives:
+                key = normalize_light(str(phrase))
+                if not key:
+                    errors.append(f"{entry_id}:empty_positive_example")
+                    continue
+                previous = owners.get(key)
+                if previous and previous != entry_id:
+                    errors.append(f"duplicate_positive:{key!r}:{previous},{entry_id}")
+                else:
+                    owners[key] = entry_id
+
+            for conflict_id in entry.get("conflict_ids", []) or []:
+                conflict_id = str(conflict_id)
+                if conflict_id not in known_ids:
+                    errors.append(f"{entry_id}:unknown_conflict:{conflict_id}")
+                elif conflict_id == entry_id:
+                    errors.append(f"{entry_id}:self_conflict")
+            for item in entry.get("confused_with", []) or []:
+                conflict_id = item if isinstance(item, str) else item.get("kb_id") if isinstance(item, dict) else None
+                if conflict_id:
+                    conflict_id = str(conflict_id)
+                    if conflict_id not in known_ids:
+                        errors.append(f"{entry_id}:unknown_confused_with:{conflict_id}")
+                    elif conflict_id == entry_id:
+                        errors.append(f"{entry_id}:self_confused_with")
+
+        if errors:
+            preview = "; ".join(errors[:20])
+            suffix = " ..." if len(errors) > 20 else ""
+            raise ValueError(f"Knowledge-base contract validation failed ({len(errors)}): {preview}{suffix}")
 
     def _build_indexes(self) -> None:
         passages: list[str] = []
@@ -2160,8 +2225,8 @@ class KnowledgeBase:
             OOS_EXTERNAL_TARGET
             and external_target
             and not scope["direct_supported"]
-            and scope["best_domain_support"] < 0.40
-            and scope["strong_intent_evidence"] < 0.42
+            and scope["best_domain_support"] < 0.20
+            and scope["strong_intent_evidence"] < 0.28
         ):
             return "oos:external_target"
 
@@ -2179,13 +2244,15 @@ class KnowledgeBase:
         coherent_for_oos = (
             quality.score >= OOS_QUERY_QUALITY_MIN
             or (quality.tokens >= 3 and quality.question_signal >= 0.35 and not quality.meta_noise)
+            or (scope["best_score"] <= 0.45 and scope["strong_intent_evidence"] <= 0.22)
+            or (scope["best_score"] <= 0.45 and scope["best_domain_support"] <= 0.08 and scope["best_ontology"] <= 0.55)
         )
         if (
             coherent_for_oos
             and scope["best_score"] <= OOS_TOP_SCORE_MAX
             and scope["strong_intent_evidence"] <= OOS_REAL_EVIDENCE_MAX
             and scope["best_domain_support"] <= OOS_DOMAIN_SUPPORT_MAX
-            and scope["best_semantic"] < 0.82
+            and scope["best_semantic"] < 0.75
             and scope["best_ontology"] < 0.62
         ):
             return "oos:no_supported_intent"
@@ -4090,6 +4157,8 @@ class KnowledgeBase:
           evidence, or strong semantic+intent agreement;
         * ambiguous/unsupported requests abstain instead of inventing a category.
         """
+        if not self.retrieval_enabled:
+            raise RuntimeError("KnowledgeBase retrieval is disabled in taxonomy mode")
         question = (question or "").strip()
         question = strip_leading_greeting(question)
 
@@ -4135,17 +4204,6 @@ class KnowledgeBase:
                 [],
                 subquestion=question,
                 decision_reason=f"high_risk:{high_risk}",
-            )
-
-        # Standalone one-word queries are never classified in an idle context.
-        # Stateful exceptions (Top-3 / explicit clarification choices) are
-        # resolved by SupportApplication before the classifier is called.
-        if len(tokenize(question)) == 1:
-            return MatchResult(
-                MatchMode.NO_MATCH, 0.0, None, None, None, [],
-                subquestion=question,
-                decision_reason="noise:single_word",
-                query_quality_score=0.0,
             )
 
         if not self.entries:
@@ -4205,27 +4263,6 @@ class KnowledgeBase:
                     # hybrid classifier where competing intents are ranked and
                     # compared contrastively.
                     hard_id = None
-                else:
-                    if entry.get("requires_clarification"):
-                        return MatchResult(
-                            MatchMode.CLARIFICATION, 0.995, entry.get("category"),
-                            entry.get("clarification_question"), hard_id,
-                            [self._clean_entry_for_llm(entry)], entry=entry,
-                            second_score=0.0, margin=0.995, fuzzy_score=1.0,
-                            intent_fit_score=fit, intent_fit_reason=fit_reason,
-                            family_fit_score=family_fit, query_quality_score=quality.score,
-                            subquestion=question, decision_reason="hard_rule",
-                        )
-                    return MatchResult(
-                        MatchMode.TEMPLATE, 0.995, entry.get("category"),
-                        (entry.get("template_answer") or ""),
-                        hard_id, [self._clean_entry_for_llm(entry)], entry=entry,
-                        second_score=0.0, margin=0.995, fuzzy_score=1.0,
-                        intent_fit_score=fit, intent_fit_reason=fit_reason,
-                        family_fit_score=family_fit,
-                        query_quality_score=quality.score,
-                        subquestion=question, decision_reason="hard_rule",
-                    )
         # 2. Obvious non-query/noise is rejected before expensive retrieval.
         # Short but semantically meaningful messages are not rejected here if
         # they have a strong fuzzy match.
@@ -4237,43 +4274,9 @@ class KnowledgeBase:
                 query_quality_score=quality.score,
             )
 
+        # Fuzzy matching is retrieval evidence only. It never bypasses the
+        # semantic LLM.
         fuzzy = self._fuzzy_candidates(question)
-        if fuzzy:
-            top_f = fuzzy[0]
-            second_f = fuzzy[1]["score"] if len(fuzzy) > 1 else 0.0
-            fuzzy_gap = top_f["score"] - second_f
-            if (
-                top_f["score"] >= 98.0
-                and fuzzy_gap >= 8.0
-                and not top_f["negative_hits"]
-            ):
-                entry = top_f["entry"]
-                fit, fit_reason = self._intent_fit(
-                    question, entry, fuzzy_phrase=top_f["score"] / 100.0,
-                )
-                family_fit = self._family_fit(question, entry)
-                mode = MatchMode.CLARIFICATION if entry.get("requires_clarification") else MatchMode.TEMPLATE
-                answer = (
-                    entry.get("clarification_question")
-                    if mode == MatchMode.CLARIFICATION
-                    else (entry.get("template_answer") or "")
-                )
-                eligible, eligibility_reason = self._template_eligibility(
-                    question, entry, intent_fit=fit, family_fit=family_fit,
-                    fuzzy_score=top_f["score"] / 100.0,
-                    hard_rule=False,
-                )
-                if fit >= 0.55 and family_fit >= 0.25 and answer and eligible:
-                    return MatchResult(
-                        mode, top_f["score"] / 100.0, entry.get("category"), answer,
-                        entry.get("id"), [self._clean_entry_for_llm(entry)], entry=entry,
-                        second_score=second_f / 100.0, margin=fuzzy_gap / 100.0,
-                        fuzzy_score=top_f["score"] / 100.0,
-                        intent_fit_score=fit, intent_fit_reason=fit_reason,
-                        family_fit_score=family_fit,
-                        query_quality_score=quality.score,
-                        subquestion=question, decision_reason="near_duplicate_phrase",
-                    )
 
         # 3. Hybrid retrieval + evidence-first ranking.
         candidates = self._retrieve_candidates(question)
@@ -4409,214 +4412,10 @@ class KnowledgeBase:
             and contrastive_margin < CONTRASTIVE_AUTO_MARGIN
         )
         if both_supported and margin < 0.08:
-            choices = self._category_choice_candidates(ranked, question=question)
-            if len(choices) >= 2:
-                return MatchResult(
-                    MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
-                    entry.get("id"), relevant_entries, entry=entry,
-                    second_score=second_score, margin=margin,
-                    semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
-                    evidence_score=float(top.get("evidence_score", 0.0)),
-                    real_intent_evidence=real_evidence,
-                    embedding_score=embedding, intent_fit_score=intent_fit,
-                    intent_fit_reason=str(top.get("intent_fit_reason", "")),
-                    family_fit_score=family_fit, query_quality_score=quality.score,
-                    subquestion=question, decision_reason="ambiguous_conflict",
-                    choice_candidates=choices, top_candidates=top_candidates,
-                    domain_support_score=float(top.get("domain_support_score", 0.0)),
-                    ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
-                    negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
-                    contrastive_margin=contrastive_margin,
-                    contrastive_competitor_id=top.get("contrastive_competitor_id"),
-                    contrastive_reason=str(top.get("contrastive_reason", "")),
-                )
-
-        # 5.1. Intent-first deterministic override.
-        # Some support queries have a modest aggregate score because several
-        # intents share vocabulary, while their intent contract is explicit.
-        domain_support = float(top.get("domain_support_score", 0.0))
-        ontology_alignment = float(top.get("ontology_alignment_score", 0.0))
-        second_real = float(second.get("real_intent_evidence", 0.0)) if second else 0.0
-        secondary_ambiguity = (
-            second is not None
-            and second_real >= SECONDARY_EVIDENCE_MIN
-            and margin < SECONDARY_EVIDENCE_MARGIN
-        )
-        deterministic_intent_safe = (
-            intent_fit >= 0.93
-            and domain_support >= 0.34
-            and ontology_alignment >= 0.66
-            and real_evidence >= 0.34
-            and not contradiction
-            and not second_is_conflict
-            and not secondary_ambiguity
-            and (direct_support or lexical >= 0.55 or fuzzy_score >= 0.90)
-        )
-        deterministic_eligible, deterministic_reason = self._template_eligibility(
-            question, entry, intent_fit=intent_fit, family_fit=family_fit,
-            fuzzy_score=fuzzy_score, contrastive_margin=contrastive_margin,
-            second_is_conflict=second_is_conflict,
-        )
-        if (
-            deterministic_intent_safe
-            and deterministic_eligible
-            and entry.get("template_answer")
-            and top_score >= AUTO_SCORE
-            and real_evidence >= MIN_TEMPLATE_EVIDENCE
-        ):
-            return MatchResult(
-                MatchMode.TEMPLATE, top_score, entry.get("category"),
-                (entry.get("template_answer") or ""),
-                entry.get("id"), relevant_entries, entry=entry,
-                second_score=second_score, margin=margin, embedding_score=embedding,
-                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
-                evidence_score=float(top.get("evidence_score", 0.0)),
-                real_intent_evidence=real_evidence, intent_fit_score=intent_fit,
-                intent_fit_reason=str(top.get("intent_fit_reason", "")),
-                family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason="deterministic_high_intent",
-                top_candidates=top_candidates, domain_support_score=domain_support,
-                ontology_alignment_score=ontology_alignment,
-                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
-                contrastive_margin=contrastive_margin,
-                contrastive_competitor_id=top.get("contrastive_competitor_id"),
-                contrastive_reason=str(top.get("contrastive_reason", "")),
-            )
-
-        # 5. If the evidence points to a supported intent, allow automatic
-        # routing even when the query itself is short/grammatically rough.
-        # Quality therefore influences OOS/noise detection, not basic intent
-        # classification.
-        direct_semantic_support = (
-            embedding >= 0.87
-            and semantic >= 0.70
-            and intent_fit >= 0.72
-            and family_fit >= 0.48
-            and margin >= 0.08
-        )
-        direct_lexical_support = (
-            (direct_support or lexical >= 0.55 or fuzzy_score >= 0.92)
-            and intent_fit >= 0.62
-            and family_fit >= 0.34
-            and real_evidence >= 0.42
-            and margin >= (0.045 if second_is_conflict else 0.03)
-        )
-        safe_auto = (
-            (not second_is_conflict or margin >= 0.075)
-            and (not second_is_conflict or contrastive_margin >= CONTRASTIVE_AUTO_MARGIN)
-            and not secondary_ambiguity
-        ) and (direct_lexical_support or direct_semantic_support)
-
-        safe_template_eligible, safe_template_reason = self._template_eligibility(
-            question, entry, intent_fit=intent_fit, family_fit=family_fit,
-            fuzzy_score=fuzzy_score, contrastive_margin=contrastive_margin,
-            second_is_conflict=second_is_conflict,
-        )
-
-        # Entries that normally require clarification are still judged by the
-        # LLM in the middle band. The final response remains pre-approved KB text.
-        # TEMPLATE only when aggregate score is near-certain (ultra-niche).
-        if (
-            safe_auto
-            and safe_template_eligible
-            and entry.get("template_answer")
-            and top_score >= AUTO_SCORE
-            and margin >= AUTO_MARGIN * 0.75
-            and intent_fit >= INTENT_FIT_TEMPLATE_MIN
-            and real_evidence >= MIN_TEMPLATE_EVIDENCE
-        ):
-            reason = (
-                "strong_semantic_intent_match"
-                if direct_semantic_support and not direct_lexical_support
-                else "strong_lexical_intent_match"
-            )
-            return MatchResult(
-                MatchMode.TEMPLATE, top_score, entry.get("category"),
-                (entry.get("template_answer") or ""),
-                entry.get("id"), relevant_entries, entry=entry,
-                second_score=second_score, margin=margin, embedding_score=embedding,
-                intent_fit_score=intent_fit,
-                intent_fit_reason=str(top.get("intent_fit_reason", "")),
-                family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason=reason,
-                top_candidates=top_candidates,
-                domain_support_score=float(top.get("domain_support_score", 0.0)),
-                ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
-                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
-                contrastive_margin=contrastive_margin,
-                contrastive_competitor_id=top.get("contrastive_competitor_id"),
-                contrastive_reason=str(top.get("contrastive_reason", "")),
-            )
-
-        # 6. Middle band: anything that is not ultra-safe TEMPLATE and is not
-        # genuinely weak/OOS goes to the LLM judge. Retrieval still supplies
-        # the top candidates; the LLM is the final semantic decision-maker.
-        choices = self._category_choice_candidates(ranked, question=question)
-
-        domain_support = float(top.get("domain_support_score", 0.0))
-        ontology_alignment = float(top.get("ontology_alignment_score", 0.0))
-        # 6a. User-visible Top-3 is reserved for evidence-backed ambiguity.
-        # These candidates are genuinely plausible and close enough that asking
-        # the user is safer than guessing, but they are not weak/OOS cases.
-        choice_is_supported = (
-            len(choices) >= 2
-            and second is not None
-            and margin <= CATEGORY_CHOICE_MAX_MARGIN
-            and second_real >= CATEGORY_CHOICE_MIN_REAL_EVIDENCE
-            and intent_fit >= CATEGORY_CHOICE_MIN_INTENT_FIT
-            and top_score >= CATEGORY_CHOICE_MIN_SCORE
-            and not contradiction
-        )
-        if choice_is_supported and margin >= 0.08 and not secondary_ambiguity:
-            return MatchResult(
-                MatchMode.CATEGORY_CHOICE, top_score, entry.get("category"), None,
-                entry.get("id"), relevant_entries, entry=entry,
-                second_score=second_score, margin=margin,
-                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
-                evidence_score=float(top.get("evidence_score", 0.0)),
-                real_intent_evidence=real_evidence,
-                embedding_score=embedding, intent_fit_score=intent_fit,
-                intent_fit_reason=str(top.get("intent_fit_reason", "")),
-                family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason="supported_ambiguity_to_top3",
-                choice_candidates=choices[:3], top_candidates=top_candidates,
-                domain_support_score=domain_support, ontology_alignment_score=ontology_alignment,
-                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
-                contrastive_margin=contrastive_margin,
-                contrastive_competitor_id=top.get("contrastive_competitor_id"),
-                contrastive_reason=str(top.get("contrastive_reason", "")),
-            )
-
-        # 6b. Everything supported but not strong enough for TEMPLATE and not
-        # suitable for user-visible Top-3 goes to the LLM judge.
-        llm_candidate_support = (
-            not contradiction
-            and family_fit >= 0.25
-            and (
-                top_score >= 0.40
-                or direct_support
-                or lexical >= 0.28
-            )
-            and (
-                direct_support
-                or lexical >= 0.28
-                or real_evidence >= 0.28
-                or intent_fit >= 0.40
-                or domain_support >= 0.20
-                or ontology_alignment >= 0.40
-            )
-        )
-
-        llm_candidate_support = (
-            llm_candidate_support
-            and quality.score >= LLM_MIN_QUERY_QUALITY
-            and top_score >= LLM_SCORE
-            and real_evidence >= LLM_MIN_SUPPORTED_EVIDENCE
-            and domain_support >= LLM_MIN_DOMAIN_SUPPORT
-            and intent_fit >= INTENT_FIT_LLM_MIN
-        )
-
-        if llm_candidate_support:
+            # Known conflict is evidence for sending the neighborhood to the
+            # semantic judge, not permission to manufacture a deterministic
+            # Top-3. The LLM must decide whether the user truly needs a choice,
+            # a single answer, clarification, or escalation.
             return MatchResult(
                 MatchMode.LLM, top_score, entry.get("category"), None,
                 entry.get("id"), relevant_entries, entry=entry,
@@ -4627,40 +4426,8 @@ class KnowledgeBase:
                 embedding_score=embedding, intent_fit_score=intent_fit,
                 intent_fit_reason=str(top.get("intent_fit_reason", "")),
                 family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason=(
-                    "ambiguous_candidates_to_llm" if len(choices) >= 2
-                    else "supported_middle_to_llm"
-                ),
-                choice_candidates=choices if len(choices) >= 2 else None,
-                top_candidates=top_candidates,
-                domain_support_score=domain_support,
-                ontology_alignment_score=ontology_alignment,
-                negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
-                contrastive_margin=contrastive_margin,
-                contrastive_competitor_id=top.get("contrastive_competitor_id"),
-                contrastive_reason=str(top.get("contrastive_reason", "")),
-            )
-
-        # 8. Very unclear / insufficient-context cases get one explicit
-        # clarification attempt. True open-set/OOS cases were already returned
-        # by the OOS gate above and remain immediate escalation.
-        if (
-            quality.score < REPHRASE_QUERY_QUALITY_MAX
-            or top_score < REPHRASE_SCORE_MAX
-            or intent_fit <= REPHRASE_INTENT_FIT_MAX
-        ):
-            reason = "insufficient_context" if quality.score < 0.34 else "low_confidence"
-            return MatchResult(
-                MatchMode.REPHRASE, top_score, None, None, None, relevant_entries,
-                second_score=second_score, margin=margin,
-                semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
-                evidence_score=float(top.get("evidence_score", 0.0)),
-                real_intent_evidence=real_evidence, embedding_score=embedding,
-                intent_fit_score=intent_fit, intent_fit_reason=str(top.get("intent_fit_reason", "")),
-                family_fit_score=family_fit, query_quality_score=quality.score,
-                subquestion=question, decision_reason=reason,
-                choice_candidates=None,
-                top_candidates=top_candidates,
+                subquestion=question, decision_reason="ai_first_known_conflict",
+                choice_candidates=None, top_candidates=top_candidates,
                 domain_support_score=float(top.get("domain_support_score", 0.0)),
                 ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
                 negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
@@ -4669,7 +4436,34 @@ class KnowledgeBase:
                 contrastive_reason=str(top.get("contrastive_reason", "")),
             )
 
-        reason = "unsupported_or_ambiguous"
+        # 5. AI-FIRST ROUTING
+        # Retrieval is a candidate generator, not a classifier. Once the
+        # message survives explicit noise/contradiction/OOS guards, the semantic
+        # model gets the ranked neighborhood even when confidence is low.
+        # This is what guarantees that short but meaningful requests such as
+        # "оплата" or "доступ" reach the LLM instead of being prematurely
+        # rejected by numeric thresholds.
+        return MatchResult(
+            MatchMode.LLM, top_score, entry.get("category"), None,
+            entry.get("id"), relevant_entries, entry=entry,
+            second_score=second_score, margin=margin,
+            semantic_score=semantic, lexical_score=lexical, fuzzy_score=fuzzy_score,
+            evidence_score=float(top.get("evidence_score", 0.0)),
+            real_intent_evidence=real_evidence, embedding_score=embedding,
+            intent_fit_score=intent_fit, intent_fit_reason=str(top.get("intent_fit_reason", "")),
+            family_fit_score=family_fit, query_quality_score=quality.score,
+            subquestion=question, decision_reason="ai_first_semantic_judge",
+            choice_candidates=None, top_candidates=top_candidates,
+            domain_support_score=float(top.get("domain_support_score", 0.0)),
+            ontology_alignment_score=ontology_alignment,
+            negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
+            contrastive_margin=contrastive_margin,
+            contrastive_competitor_id=top.get("contrastive_competitor_id"),
+            contrastive_reason=str(top.get("contrastive_reason", "")),
+        )
+
+        # No defensible retrieval neighborhood remains. This is a genuine
+        # abstention, not an instruction to silently ignore the user.
         return MatchResult(
             MatchMode.NO_MATCH, top_score, None, None, None, relevant_entries,
             second_score=second_score, margin=margin,
@@ -4678,9 +4472,8 @@ class KnowledgeBase:
             real_intent_evidence=real_evidence, embedding_score=embedding,
             intent_fit_score=intent_fit, intent_fit_reason=str(top.get("intent_fit_reason", "")),
             family_fit_score=family_fit, query_quality_score=quality.score,
-            subquestion=question, decision_reason=reason,
-            choice_candidates=None,
-            top_candidates=top_candidates,
+            subquestion=question, decision_reason="no_defensible_retrieval_neighborhood",
+            choice_candidates=None, top_candidates=top_candidates,
             domain_support_score=float(top.get("domain_support_score", 0.0)),
             ontology_alignment_score=float(top.get("ontology_alignment_score", 0.0)),
             negative_contrast_score=float(top.get("negative_contrast_score", 0.0)),
@@ -4689,7 +4482,9 @@ class KnowledgeBase:
             contrastive_reason=str(top.get("contrastive_reason", "")),
         )
 
-    def validate_llm_selection(self, question: str, kb_id: str) -> tuple[bool, str, dict[str, float]]:
+    def validate_llm_selection(
+        self, question: str, kb_id: str, evidence: dict[str, Any] | None = None,
+    ) -> tuple[bool, str, dict[str, float]]:
         """Re-check an LLM-selected intent with deterministic business evidence.
 
         The model can choose among candidates, but it cannot bypass hard KB
@@ -4742,12 +4537,27 @@ class KnowledgeBase:
             or signal_pos
             or fuzzy >= 0.82
         )
-        safe = (
-            intent_fit >= 0.48
-            and family_fit >= 0.25
-            and domain_support >= 0.18
-            and alignment >= 0.35
+        evidence = evidence or {}
+        retrieval_semantic = float(evidence.get("semantic_score", 0.0) or 0.0)
+        retrieval_score = float(evidence.get("final_score", 0.0) or 0.0)
+        semantic_backed = (
+            retrieval_semantic >= 0.70
+            and intent_fit >= 0.45
+            and family_fit >= 0.15
+            and alignment >= 0.25
+        )
+        lexical_backed = (
+            intent_fit >= 0.28
+            and family_fit >= 0.18
+            and domain_support >= 0.08
+            and alignment >= 0.25
             and supported
+        )
+        safe = lexical_backed or semantic_backed or (
+            retrieval_score >= 0.62
+            and intent_fit >= 0.38
+            and alignment >= 0.30
+            and domain_support >= 0.08
         )
         reason = "llm_selection_valid" if safe else (
             f"llm_selection_weak:{intent_reason};{alignment_reason}"
@@ -4903,6 +4713,8 @@ class KnowledgeBase:
         turning explanatory sentences such as ``"нет кнопки записи"`` into a
         separate intent and losing the context supplied by the preceding sentence.
         """
+        if not self.retrieval_enabled:
+            raise RuntimeError("KnowledgeBase retrieval is disabled in taxonomy mode")
         question = (question or "").strip()
         if not question:
             return [self.match(question)]

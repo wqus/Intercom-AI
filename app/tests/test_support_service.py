@@ -117,3 +117,63 @@ def test_escalation_preserves_pipeline_escalation_reply(monkeypatch):
         assert any("Структурированный ответ оператору." in str(a.get("payload", {}).get("text", "")) for a in outbox.actions)
     finally:
         module.StateRepository, module.InteractionRepository, module.EscalatedConversationRepository = originals
+
+
+def test_handle_rejects_strictly_older_provider_event(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from app.application.support_service import SupportApplication
+    from app.domain.models import InboundMessage
+    from app.domain.enums import Channel, ConversationStateKind
+
+    class State:
+        state = ConversationStateKind.IDLE
+        data = {"_ordering": {"last_event_order_at": 200}}
+
+    class States:
+        async def get(self, conversation_id, for_update=False):
+            return State()
+
+    class Escalations:
+        async def is_escalated(self, conversation_id): return False
+
+    class Session:
+        async def flush(self): pass
+
+    class Pipeline:
+        async def decide(self, *args, **kwargs): raise AssertionError("stale event reached pipeline")
+
+    monkeypatch.setattr("app.application.support_service.StateRepository", lambda session: States())
+    monkeypatch.setattr("app.application.support_service.EscalatedConversationRepository", lambda session: Escalations())
+
+    app = SupportApplication(Pipeline(), object(), None, object())
+    event = SimpleNamespace(id=11, event_order_at=100)
+    message = InboundMessage(
+        event_id="evt-11", event_key="k", topic="conversation.user.replied", entity_id="c1",
+        channel=Channel.CONVERSATION, text="old",
+    )
+    handled = asyncio.run(app.handle(Session(), event, message))
+    assert handled is False
+
+
+def test_state_replace_preserves_ordering_watermark():
+    import asyncio
+    from app.infrastructure.persistence.repository import StateRepository
+    from app.domain.enums import ConversationStateKind
+
+    class State:
+        state = ConversationStateKind.IDLE
+        data = {"_ordering": {"last_event_order_at": 123}, "candidate_ids": ["a"]}
+
+    class Session:
+        def add(self, obj): pass
+        async def flush(self): pass
+
+    repo = StateRepository(Session())
+    state = State()
+    async def fake_get(conversation_id):
+        return state
+    repo.get = fake_get
+    asyncio.run(repo.replace("c1", ConversationStateKind.CHOOSING, {"candidate_ids": ["b"]}))
+    assert state.data["candidate_ids"] == ["b"]
+    assert state.data["_ordering"]["last_event_order_at"] == 123

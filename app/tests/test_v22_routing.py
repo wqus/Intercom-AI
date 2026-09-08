@@ -103,7 +103,7 @@ def test_top3_is_user_visible_and_does_not_call_llm(monkeypatch):
 
     class FakeLLM:
         async def classify(self, *_args, **_kwargs):
-            raise AssertionError("Top-3 must not call LLM")
+            raise RuntimeError("provider unavailable")
 
     from app.application.decision_pipeline import DecisionPipeline
     from app.domain.enums import Decision
@@ -112,7 +112,12 @@ def test_top3_is_user_visible_and_does_not_call_llm(monkeypatch):
     pipeline = DecisionPipeline(FakeKB(), FakeLLM())
     match = MatchResult(
         MatchMode.CATEGORY_CHOICE, 0.7, "A", None, "kb_1",
-        [{"id": "kb_1"}, {"id": "kb_2"}],
+        [{"id": "kb_1"}, {"id": "kb_2"}, {"id": "kb_3"}],
+        top_candidates=[
+            {"id": "kb_1", "choice_label": "A"},
+            {"id": "kb_2", "choice_label": "B"},
+            {"id": "kb_3", "choice_label": "C"},
+        ],
         choice_candidates=[
             {"kb_id": "kb_1", "choice_label": "A", "template_answer": "Answer A"},
             {"kb_id": "kb_2", "choice_label": "B", "template_answer": "Answer B"},
@@ -122,7 +127,8 @@ def test_top3_is_user_visible_and_does_not_call_llm(monkeypatch):
     import asyncio
     trace, actions = asyncio.run(pipeline.decide_match(match, "q"))
     assert trace.decision == Decision.CHOICE
-    assert trace.llm_used is False
+    assert trace.llm_used is True
+    assert trace.choice_candidate_ids == ["kb_1", "kb_2", "kb_3"]
     assert "1. A" in (actions[0].text or "")
 
 

@@ -93,6 +93,13 @@ async def ensure_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await ensure_escalation_blocklist(conn)
         await ensure_outbound_actions(conn)
+        await conn.execute(text(
+            "ALTER TABLE inbound_events ADD COLUMN IF NOT EXISTS event_order_at INTEGER NULL"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_inbound_events_entity_order "
+            "ON inbound_events (entity_id, event_order_at)"
+        ))
         for column, sql_type in SUPPORT_INTERACTION_ANALYTICS_COLUMNS.items():
             await conn.execute(
                 text(

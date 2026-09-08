@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 
 from app.domain.enums import Channel, ConversationStateKind, Decision, EscalationReason
+from app.core.config import settings
 from app.domain.models import InboundMessage
 from app.domain.policy import escalation_ack
 from app.domain.response_composer import ResponseComposer
 from app.application.decision_pipeline import DecisionPipeline
 from app.infrastructure.intercom.client import IntercomGateway
 from app.infrastructure.persistence.repository import (
+    EventRepository,
     EscalatedConversationRepository,
     StateRepository,
     InteractionRepository,
@@ -141,10 +143,11 @@ class SupportApplication:
 
     @staticmethod
     def _attempts_after_failed_clarification(state) -> int:
-        """Return the number of failed user attempts accumulated so far."""
+        """Return consecutive clarification requests already consumed."""
         data = state.data if isinstance(getattr(state, "data", None), dict) else {}
+        raw = data.get("clarification_attempts", data.get("attempts", 0))
         try:
-            return max(0, int(data.get("attempts", 0)))
+            return max(0, int(raw))
         except (TypeError, ValueError):
             return 0
 
@@ -201,11 +204,17 @@ class SupportApplication:
         if normalized_state in _CLARIFICATION_STATES:
             if await self._resolve_short_clarification_reply(session, event, message, state):
                 return True
+            # Acknowledgements must never turn an exhausted clarification flow into
+            # a pointless operator hand-off. They are not substantive turns; keep the
+            # pending state intact and wait for the user's next real answer.
+            from app.infrastructure.ai.knowledge_base import is_non_query_message
+            if is_non_query_message(message.text):
+                return True
             # The initial clarification/rephrase already counts as request #1.
             # Two failed follow-up messages may receive request #2; the next failed
             # message is escalated before the pipeline can produce another reply.
             attempts = self._attempts_after_failed_clarification(state)
-            if attempts >= 2:
+            if attempts >= max(1, int(settings.MAX_CLARIFICATION_ATTEMPTS)):
                 await self._escalate(
                     session,
                     message,
@@ -253,6 +262,13 @@ class SupportApplication:
                 return True
 
             candidate_ids = state.data.get("candidate_ids", [])
+            # Acknowledgements such as "спасибо" are not a new support request.
+            # CHOOSING is necessarily a later conversation turn, so the same
+            # curated ignore policy applies here without consuming menu state.
+            from app.infrastructure.ai.knowledge_base import is_non_query_message
+            if is_non_query_message(message.text):
+                return True
+
             # Deterministic numeric/ordinal selection is resolved BEFORE any
             # generic classifier call. The persisted candidate snapshot is the
             # source of truth for the answer, not the current KB ranking.
@@ -261,45 +277,15 @@ class SupportApplication:
                 max_index=len(candidate_ids),
             )
             if not indices:
-                # The choice prompt itself invites either a number OR a short
-                # clarification ("Напишите номер или кратко уточните свой
-                # вопрос"). Previously any non-numeric reply here was treated
-                # as an invalid answer and only ever got a "please send a
-                # number" retry (or an escalation) — so the prompt's own
-                # second option never actually worked. Give the normal
-                # pipeline one chance to resolve the free text; only fall
-                # back to the numeric retry/escalation flow if it can't
-                # produce anything actionable either.
-                probe = await self.pipeline.decide(message)
-                if any(
-                    t.decision in {Decision.ANSWER_TEMPLATE, Decision.CHOICE, Decision.CLARIFY}
-                    for t in probe.traces
-                ):
-                    return False
-
-                # A non-choice message is not evidence that a human operator is
-                # required. Keep the menu state intact and stay silent rather than
-                # escalating on arbitrary/nearby text. A real free-text question
-                # that the classifier can answer is handled above via `probe`.
-                attempts = self._attempts_after_failed_clarification(state)
-                if attempts >= 2:
-                    # Do not turn repeated non-choice/nearby text into a human
-                    # escalation. The menu has gone stale; silently close this
-                    # transient state so the next message starts cleanly.
-                    await StateRepository(session).replace(message.entity_id, ConversationStateKind.IDLE, {})
-                    return True
-
-                state.data["attempts"] = attempts + 1
-                await session.flush()
-                if attempts == 0:
-                    await self._enqueue_reply(
-                        session,
-                        message,
-                        event,
-                        "Пожалуйста, укажите номер варианта (например, 1 или 2).",
-                        suffix="choice_retry",
-                    )
-                return True
+                # Free text is a real support turn, not an invalid menu action.
+                # Do not call the pipeline here and then call it again in handle():
+                # that would perform duplicate LLM/retrieval work and could produce
+                # two different decisions for the same message. Returning False
+                # lets the normal pipeline process this turn exactly once.
+                # The pending choice is preserved unless the classifier produces a
+                # new ANSWER/CHOICE/CLARIFY outcome; an unresolved message is
+                # escalated by the pipeline rather than silently consumed.
+                return False
 
             snapshots = list(state.data.get("candidates") or [])
             answers = []
@@ -338,16 +324,74 @@ class SupportApplication:
 
         return False
 
+    @staticmethod
+    def _routing_context_for_state(state) -> list[dict[str, str]]:
+        """Expose pending state to the semantic router without changing domain APIs.
+
+        State is routing metadata, not customer-authored conversation text. It is
+        therefore represented explicitly and kept compact so the LLM can use the
+        pending question/menu without confusing it with a user message.
+        """
+        try:
+            kind = ConversationStateKind(state.state)
+        except (TypeError, ValueError):
+            return []
+        data = state.data if isinstance(state.data, dict) else {}
+        if kind == ConversationStateKind.CLARIFYING:
+            return [{
+                "role": "system",
+                "text": (
+                    "PENDING_CLARIFICATION: kb_id={kb}; attempts={attempts}; original_question={question}"
+                    .format(
+                        kb=str(data.get("kb_id") or ""),
+                        attempts=str(data.get("clarification_attempts", data.get("attempts", 0)) or 0),
+                        question=str(data.get("original_question") or ""),
+                    )
+                ),
+            }]
+        if kind == ConversationStateKind.CHOOSING:
+            ids = [str(x).strip() for x in (data.get("candidate_ids") or []) if str(x).strip()]
+            original = str(data.get("original_question") or "")
+            return [{
+                "role": "system",
+                "text": (
+                    "PENDING_CHOICE: candidate_ids={ids}; original_question={question}"
+                    .format(ids=", ".join(ids), question=original)
+                ),
+            }]
+        return []
+
+
+    @staticmethod
+    def _should_reset_state_after_result(current_state, traces) -> bool:
+        """Whether a completed turn may clear persisted conversational state.
+
+        IGNORE is intentionally non-consuming while a clarification/rephrase is
+        pending: acknowledgements must not erase the routing anchor needed for the
+        next substantive answer. In IDLE/CHOOSING, IGNORE may safely leave state as
+        -is because those paths are already handled by their own state machine rules.
+        """
+        stateful = {Decision.CLARIFY, Decision.CHOICE, Decision.REPHRASE}
+        if any(t.decision in stateful for t in traces):
+            return False
+        if all(t.decision == Decision.IGNORE for t in traces):
+            try:
+                pending = ConversationStateKind(current_state) in _CLARIFICATION_STATES
+            except (TypeError, ValueError):
+                pending = False
+            return not pending
+        return True
+
     async def handle(
         self,
         session,
         event: InboundEvent,
         message: InboundMessage,
-    ) -> None:
+    ) -> bool:
         escalations = EscalatedConversationRepository(session)
         if await escalations.is_escalated(message.entity_id):
             logger.info("Ignoring event for escalated conversation entity=%s", message.entity_id)
-            return
+            return True
 
         # Strict routing order is an invariant:
         # 1) active escalation blocklist; 2) explicit operator request;
@@ -361,7 +405,7 @@ class SupportApplication:
                 event,
                 EscalationReason.USER_REQUESTED_OPERATOR,
             )
-            return
+            return True
 
         states = StateRepository(session)
         # Serialize all stateful decisions for a conversation. Without a row lock,
@@ -369,8 +413,38 @@ class SupportApplication:
         # concurrently and both observe the same clarification counter.
         state = await states.get(message.entity_id, for_update=True)
 
+        # Intercom does not guarantee webhook delivery order. The conversation
+        # state row is already locked above, so store the provider action time in
+        # the same transaction before any stateful branch can return. A later
+        # event therefore establishes a monotonic per-conversation watermark.
+        # Equal timestamps are deliberately accepted because the provider does not
+        # provide a reliable tie-breaker; row locking serializes those events.
+        incoming_order_at = getattr(event, "event_order_at", None)
+        state_data = state.data if isinstance(state.data, dict) else {}
+        ordering = state_data.get("_ordering") if isinstance(state_data.get("_ordering"), dict) else {}
+        last_order_at = ordering.get("last_event_order_at")
+        if incoming_order_at is not None and last_order_at is not None:
+            try:
+                if int(incoming_order_at) < int(last_order_at):
+                    logger.info(
+                        "stale_webhook_ignored entity=%s event=%s order_at=%s last_order_at=%s",
+                        message.entity_id, event.id, incoming_order_at, last_order_at,
+                    )
+                    return False
+            except (TypeError, ValueError):
+                logger.warning("invalid event ordering metadata entity=%s event=%s", message.entity_id, event.id)
+
+        if incoming_order_at is not None and (last_order_at is None or int(incoming_order_at) >= int(last_order_at)):
+            state_data = dict(state_data)
+            state_data["_ordering"] = {
+                **ordering,
+                "last_event_order_at": int(incoming_order_at),
+            }
+            state.data = state_data
+            await session.flush()
+
         if await self._handle_state(session, event, message, state):
-            return
+            return True
 
         # A state-row transition and the permanent escalation table are both checked
         # defensively. This makes ESCALATED safe even if an older deployment left only
@@ -386,9 +460,60 @@ class SupportApplication:
                 last_message_at=message.updated_at,
                 source_event_id=event.id,
             )
-            return
+            return True
 
-        result = await self.pipeline.decide(message)
+        # The current inbound event is already stored before the worker reaches
+        # this point. Therefore count==1 means this is the first user turn.
+        # Ignore is allowed only on later turns; short domain words must still
+        # reach the AI-first pipeline.
+        try:
+            inbound_count = await EventRepository(session).count_for_entity(message.entity_id)
+            is_first_message = inbound_count <= 1
+        except AttributeError:
+            # Lightweight test doubles / non-SQL sessions may not expose scalar().
+            # In production the database count above is authoritative.
+            data = state.data if isinstance(getattr(state, "data", None), dict) else {}
+            is_first_message = not bool(data.get("seen_user_message"))
+        context = message.raw.get("_conversation_context", []) if isinstance(message.raw, dict) else []
+        if not isinstance(context, list):
+            context = []
+        # Preserve chronological conversation context and add explicit pending
+        # state metadata for clarification/menu continuations. The metadata is
+        # never treated as customer-authored text by the prompt.
+        context = list(context)[-7:] + self._routing_context_for_state(state)
+        try:
+            result = await self.pipeline.decide(
+                message,
+                is_first_message=is_first_message,
+                conversation_context=context,
+            )
+        except TypeError as exc:
+            # Compatibility for small legacy pipeline adapters. The production
+            # pipeline supports both context arguments.
+            if "unexpected keyword" not in str(exc) and "positional" not in str(exc):
+                raise
+            result = await self.pipeline.decide(message)
+        # Application-level delivery invariant: the only legitimate empty-action
+        # result is a contextual IGNORE. Any other empty result is a routing defect
+        # or an integration failure and must become a visible human hand-off. This
+        # guard lives above the classifier so future modules cannot accidentally
+        # introduce a new silent path.
+        non_ignore_traces = [t for t in result.traces if t.decision != Decision.IGNORE]
+        if not result.actions and non_ignore_traces:
+            logger.error(
+                "empty_result_before_outbox | entity=%s | event=%s | decisions=%s",
+                message.entity_id, event.id,
+                [getattr(t.decision, "value", str(t.decision)) for t in result.traces],
+            )
+            result.traces.append(DecisionTrace(
+                decision=Decision.ESCALATE,
+                question=message.text,
+                decision_reason="support_empty_result_guard",
+                escalation_reason=EscalationReason.INTERNAL_ERROR,
+                automated=True,
+            ))
+            result.actions = [OutboundAction("reply", ResponseComposer.escalation_ack(escalation_ack()), True)]
+
         interaction_repo = InteractionRepository(session)
         await interaction_repo.add_many(event.id, message.entity_id, message.channel.value, result)
 
@@ -464,7 +589,7 @@ class SupportApplication:
                     await self._escalate(
                         session, message, event, EscalationReason.NO_CATEGORY,
                     )
-                    return
+                    return True
 
                 ids = [item["kb_id"] for item in normalized]
                 await states.replace(message.entity_id, ConversationStateKind.CHOOSING, {
@@ -483,11 +608,13 @@ class SupportApplication:
                 if trace.decision == Decision.CLARIFY and trace.kb_id:
                     await states.replace(message.entity_id, ConversationStateKind.CLARIFYING, {
                         "kb_id": trace.kb_id,
+                        "clarification_attempts": attempts,
                         "attempts": attempts,
                         "original_question": trace.question,
                     })
                 else:
                     await states.replace(message.entity_id, ConversationStateKind.REPHRASING, {
+                        "clarification_attempts": attempts,
                         "attempts": attempts,
                         "original_question": trace.question,
                     })
@@ -521,7 +648,7 @@ class SupportApplication:
                 escalation_reason or EscalationReason.NO_CATEGORY,
                 reply_text=escalation_reply,
             )
-            return
+            return True
 
         reply_index = 0
         for action in result.actions:
@@ -535,10 +662,10 @@ class SupportApplication:
                     suffix=f"reply:{reply_index}",
                 )
 
-        # A successful non-clarification outcome ends the clarification flow and
-        # therefore resets the persisted attempts counter to zero.
-        if result.traces and not any(
-            t.decision in {Decision.CLARIFY, Decision.CHOICE, Decision.REPHRASE}
-            for t in result.traces
-        ):
+        # A successful non-clarification support outcome ends the clarification
+        # flow and resets the counter. IGNORE is different: an acknowledgement such
+        # as "спасибо" must not destroy an already-pending clarification state,
+        # otherwise the next substantive user answer loses its routing anchor.
+        if result.traces and self._should_reset_state_after_result(current_state, result.traces):
             await states.replace(message.entity_id, ConversationStateKind.IDLE, {})
+        return True

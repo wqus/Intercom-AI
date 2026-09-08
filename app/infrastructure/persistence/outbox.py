@@ -43,19 +43,17 @@ class OutboundRepository:
 
     async def claim_one(self) -> OutboundAction | None:
         now = datetime.now(timezone.utc)
-        stale_before = now - timedelta(minutes=15)
+        # A stale `processing` action is delivery-ambiguous: the provider may
+        # already have accepted the write before this worker crashed. Reclaiming
+        # it automatically can therefore duplicate a customer-facing reply.
+        #
+        # Stale actions are quarantined by `mark_stale_unknown()` instead of
+        # being retried. Only explicitly pending actions are claimable.
         stmt = (
             select(OutboundAction)
             .where(
-                (
-                    (OutboundAction.status == "pending")
-                    & (OutboundAction.available_at <= now)
-                )
-                |
-                (
-                    (OutboundAction.status == "processing")
-                    & (OutboundAction.locked_at <= stale_before)
-                )
+                (OutboundAction.status == "pending")
+                & (OutboundAction.available_at <= now)
             )
             .order_by(OutboundAction.created_at)
             .with_for_update(skip_locked=True)
@@ -69,6 +67,32 @@ class OutboundRepository:
             action.locked_at = now
             await self.session.commit()
         return action
+
+    async def mark_stale_unknown(self, *, older_than_minutes: int = 15) -> int:
+        """Quarantine abandoned processing actions instead of replaying them.
+
+        A worker crash after a provider accepted an external write but before
+        `mark_sent()` makes delivery ambiguous. Keeping the action `processing`
+        forever is operationally poor, but automatically replaying it is unsafe.
+        Marking it `unknown` preserves the event for manual reconciliation without
+        risking a duplicate customer-facing message.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=int(older_than_minutes))
+        result = await self.session.execute(
+            update(OutboundAction)
+            .where(
+                (OutboundAction.status == "processing")
+                & (OutboundAction.locked_at.is_not(None))
+                & (OutboundAction.locked_at <= cutoff)
+            )
+            .values(
+                status="unknown",
+                locked_at=None,
+                last_error="stale processing action quarantined; delivery requires reconciliation",
+            )
+        )
+        await self.session.commit()
+        return int(result.rowcount or 0)
 
     async def mark_sent(self, action: OutboundAction) -> None:
         action.status = "sent"

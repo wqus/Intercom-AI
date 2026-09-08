@@ -267,36 +267,43 @@ def test_unknown_conversation_state_is_recovered_to_idle(monkeypatch):
     assert FakeStates.instances.state == ConversationStateKind.IDLE
 
 
-def test_choice_invalid_free_text_does_not_auto_escalate(monkeypatch):
+def test_choice_free_text_is_routed_once_and_never_silent(monkeypatch):
     install_repos(monkeypatch, (ConversationStateKind.CHOOSING, {
         "candidate_ids": ["kb_005", "kb_006"],
         "candidates": [
             {"kb_id": "kb_005", "label": "Выйти", "answer": "A"},
             {"kb_id": "kb_006", "label": "Перейти", "answer": "B"},
         ],
-        "attempts": 2,
+        "attempts": 0,
     }))
     class KB:
         def parse_category_choice(self, text, max_index):
             return []
     class Pipeline:
         kb = KB()
-        async def decide(self, message):
+        def __init__(self): self.calls = 0
+        async def decide(self, message, **kwargs):
+            self.calls += 1
             return ProcessingResult(
-                traces=[DecisionTrace(decision=Decision.IGNORE, question=message.text)],
-                actions=[],
+                traces=[DecisionTrace(
+                    decision=Decision.ESCALATE,
+                    question=message.text,
+                    escalation_reason=EscalationReason.NO_CATEGORY,
+                )],
+                actions=[OutboundAction("reply", "FALLBACK", True)],
             )
-    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
+    pipeline = Pipeline()
+    outbox = FakeOutbox()
+    app = SupportApplication(pipeline, FakeIntercom(), None, outbox)
     message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "это вообще про другое")
     class Event: id = 100
-
     class Session:
         async def flush(self):
             return None
     asyncio.run(app.handle(Session(), Event(), message))
-    assert FakeStates.instances.state == ConversationStateKind.IDLE
-    assert FakeStates.instances.data == {}
-
+    assert pipeline.calls == 1
+    assert FakeStates.instances.state == ConversationStateKind.ESCALATED
+    assert any(a["payload"]["text"] == "FALLBACK" for a in outbox.actions if a["action_type"] == "intercom_reply")
 
 
 def test_top3_round_trip_always_resolves_numeric_choice(monkeypatch):
@@ -600,3 +607,24 @@ def test_malformed_clarification_data_does_not_crash(monkeypatch):
 
     asyncio.run(app.handle(object(), Event(), message))
     assert called["count"] == 1
+
+
+
+def test_ack_during_exhausted_clarification_is_ignored_without_escalation(monkeypatch):
+    install_repos(monkeypatch, (ConversationStateKind.CLARIFYING, {"kb_id": "kb_005", "attempts": 2}))
+
+    class Pipeline:
+        class KB:
+            def get_short_clarification_routes(self, kb_id):
+                return {}
+        kb = KB()
+        async def decide(self, message):
+            raise AssertionError("acknowledgement must not re-enter the classifier")
+
+    app = SupportApplication(Pipeline(), FakeIntercom(), None, FakeOutbox())
+    message = InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "спасибо")
+    class Event: id = 804
+
+    asyncio.run(app.handle(object(), Event(), message))
+    assert FakeStates.instances.state == ConversationStateKind.CLARIFYING
+    assert FakeStates.instances.data["attempts"] == 2
