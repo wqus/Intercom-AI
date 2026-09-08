@@ -1514,6 +1514,45 @@ class KnowledgeBase:
         ):
             return "kb_041"
 
+        # Launch attendance has two distinct supported intents: arriving late
+        # and skipping the Launch entirely to obtain a code. Keep both before
+        # generic missed-event/event-access rules so the code requirement wins.
+        event_code_without_attendance = (
+            has_any("запуск", "мероприят")
+            and (
+                has_phrase(
+                    "можно ли не приходить на запуск", "можно не посещать запуск",
+                    "обязательно ли посещать запуск", "обязательно ли присутствовать",
+                    "можно получить код без посещения", "можно получить код без запуска",
+                    "нужен ли запуск для получения кода", "обязательно ли идти на запуск",
+                    "можно пропустить запуск", "можно ли пропустить мероприятие",
+                    "код без посещения", "код без присутствия",
+                    "нужен ли запуск чтобы получить код",
+                )
+                or (
+                    has_any("код")
+                    and (
+                        has_any("обязательно", "пропуст")
+                        or has_phrase("не приходить", "не посещать", "не присутствовать", "не быть на запуске", "не быть на мероприятии")
+                        or has_phrase("без посещения", "без присутствия")
+                    )
+                )
+            )
+        )
+        if event_code_without_attendance:
+            return "kb_049"
+
+        late_launch_signal = (
+            has_any("запуск", "мероприят")
+            and has_any("опозда", "позже", "поздн", "после начал")
+            and not has_any("код", "не посещ", "не приход")
+        ) or has_phrase(
+            "можно после 15", "после 15", "прийти после 15", "приехать после начала",
+            "можно прийти после начала", "можно прийти позже", "можно приехать позже",
+        )
+        if late_launch_signal:
+            return "kb_048"
+
         # Explicit missed-event questions are common and should outrank generic
         # stream/registration retrieval. Keep this narrow so ordinary event
         # planning questions do not get misrouted.
