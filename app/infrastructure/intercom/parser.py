@@ -68,7 +68,7 @@ def _conversation_context(item: dict, current_text: str, current_part: dict | No
     context.extend(row[2] for row in rows)
     return context[-12:]
 
-def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,list[dict[str,str]]] | None:
+def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,list[dict[str,str]],str|None] | None:
     item = payload.get("data", {}).get("item", {}) or {}
     cid = str(item.get("id") or "")
     if not cid:
@@ -77,43 +77,89 @@ def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,list[dict[str
     source = item.get("source", {}) or {}
     parts = item.get("conversation_parts", {}).get("conversation_parts", []) or []
     topic = payload.get("topic", "")
+    notification_created = None
+    try:
+        notification_created = int(payload.get("created_at"))
+    except (TypeError, ValueError):
+        pass
 
-    # For `conversation.user.replied`, `source` is the message that triggered
-    # this webhook. Prefer it over the full conversation history. A delayed or
-    # retried webhook can arrive after later user messages are already present in
-    # the conversation; selecting the newest historical message would then run
-    # the classifier against the wrong text and can bypass an active Top-3 state.
-    source_author_type = (source.get("author", {}) or {}).get("type")
-    if (
-        topic == "conversation.user.replied"
-        and (source.get("body") or source.get("attachments"))
-        and source_author_type in {"user", None}
-    ):
-        # The webhook topic itself says this is a customer reply. When the
-        # provider omits author.type, the triggering source is still safer than
-        # guessing from an older user message in conversation_parts.
-        part = source
-    else:
-        user_parts = [
-            p for p in parts
-            if (p.get("author", {}) or {}).get("type") == "user" and p.get("body")
-        ]
-        if user_parts:
-            # Compatibility fallback for payloads where the current source is
-            # absent or incomplete. Preserve payload order in this fallback.
-            part = user_parts[-1]
-        elif topic == "conversation.user.replied" and (source.get("body") or source.get("attachments")) and not source_author_type:
-            # Compatibility fallback only when author.type is genuinely absent.
-            # An explicit admin/bot author must never be treated as a customer reply.
-            part = source
-        else:
+    def _part_time(part: dict) -> int | None:
+        try:
+            return int(part.get("created_at")) if part.get("created_at") is not None else None
+        except (TypeError, ValueError):
             return None
+
+    source_author_type = (source.get("author", {}) or {}).get("type")
+    source_body = _strip(source.get("body", ""))
+    source_attachments = bool(source.get("attachments"))
+
+    part = None
+    provider_part_id = None
+
+    # Intercom's conversation.user.replied payloads are not completely uniform:
+    # sometimes `source` is the conversation source object (e.g. admin_initiated)
+    # and the actual triggering customer message is present in conversation_parts.
+    # When source itself is an explicit user message, it is authoritative.
+    if topic in {"conversation.user.created", "conversation.user.replied"} and source_author_type in {"user", None} and (source_body or source_attachments):
+        part = source
+        provider_part_id = source.get("id") or source.get("part_id")
+
+    if part is None and topic in {"conversation.user.created", "conversation.user.replied"}:
+        # Prefer the newest user part that is not newer than the webhook notification.
+        # This avoids replaying a later message already present in Intercom history.
+        candidates = []
+        for idx, candidate in enumerate(parts):
+            if not isinstance(candidate, dict):
+                continue
+            author_type = (candidate.get("author", {}) or {}).get("type")
+            if author_type != "user":
+                continue
+            body = _strip(candidate.get("body", ""))
+            attachments = bool(candidate.get("attachments"))
+            if not body and not attachments:
+                continue
+            stamp = _part_time(candidate)
+            if notification_created is not None and stamp is not None and stamp > notification_created:
+                continue
+            # When source is an explicit admin/bot object, do not accidentally select
+            # a stale user part unless its timestamp is consistent with this event.
+            candidates.append((stamp if stamp is not None else -1, idx, candidate))
+        if candidates:
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            part = candidates[-1][2]
+            provider_part_id = part.get("id") or part.get("part_id")
+
+    # Compatibility for malformed payloads where source.author.type is absent.
+    # Trust source only if it is clearly message-like; otherwise keep the bounded
+    # history fallback above.
+    if part is None:
+        return None
 
     text = _strip(part.get("body", ""))
     attachments = bool(part.get("attachments"))
     author = part.get("author", {}) or {}
     last_message_at = part.get("created_at") or item.get("updated_at") or ""
-    return cid, text, attachments, author.get("name", ""), author.get("email", ""), str(last_message_at), _conversation_context(item, text, part)
+    context = _conversation_context(item, text, part)
+
+    # If source itself has no part id, but the matching historical part does, use
+    # that provider part id as a cross-topic idempotency anchor. This is critical
+    # when Intercom emits both conversation.user.replied and ticket.contact.replied
+    # for the same customer comment.
+    if not provider_part_id:
+        target_stamp = _part_time(part)
+        for candidate in parts:
+            if not isinstance(candidate, dict):
+                continue
+            if _strip(candidate.get("body", "")) != text:
+                continue
+            if target_stamp is not None and _part_time(candidate) != target_stamp:
+                continue
+            candidate_author = (candidate.get("author", {}) or {}).get("type")
+            if candidate_author == "user" and candidate.get("id"):
+                provider_part_id = candidate.get("id")
+                break
+
+    return cid, text, attachments, author.get("name", ""), author.get("email", ""), str(last_message_at), context, (str(provider_part_id) if provider_part_id else None)
 
 def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
     item=payload.get("data",{}).get("item",{})
@@ -126,30 +172,79 @@ def _ticket(payload: dict) -> tuple[str,str,bool,str,str,str] | None:
         author=part.get("author",{}) or {}
         attachments=bool(part.get("attachments"))
         last_message_at = part.get("created_at") or item.get("updated_at") or ""
-        return tid,text,attachments,author.get("name",""),author.get("email",""),str(last_message_at)
+        return tid,text,attachments,author.get("name",""),author.get("email",""),str(last_message_at),[],str(part.get("id") or part.get("part_id") or "") or None
     tid=str(item.get("id") or "")
     attrs=item.get("ticket_attributes",{}) or {}
     text=_strip(attrs.get("_default_description_",""))
-    return (tid,text,False,"","",str(item.get("updated_at",""))) if tid else None
+    return (tid,text,False,"","",str(item.get("updated_at","")),[],None) if tid else None
 
 
 def event_order_at(payload: dict) -> int | None:
-    """Extract provider-side action time for per-conversation ordering."""
+    """Extract the timestamp of the actual triggering customer action.
+
+    Intercom conversation webhooks may expose an unrelated conversation `source`
+    object (for example `admin_initiated`) even when the topic is
+    `conversation.user.replied`. The ordering watermark must therefore prefer the
+    triggering user part, not blindly trust `source.created_at`.
+    """
     topic = str(payload.get("topic") or "")
     item = ((payload.get("data") or {}).get("item") or {})
-    candidates = []
-    if topic.startswith("conversation."):
-        candidates.append(((item.get("source") or {}).get("created_at")))
-    if topic.startswith("ticket."):
-        candidates.append(((item.get("ticket_part") or {}).get("created_at")))
-    candidates.append(payload.get("created_at"))
-    for value in candidates:
+
+    def _as_int(value):
         try:
             if value is not None and str(value).strip() != "":
                 return int(value)
         except (TypeError, ValueError):
-            continue
-    return None
+            return None
+        return None
+
+    candidates: list[int] = []
+
+    if topic == "ticket.contact.replied":
+        value = _as_int(((item.get("ticket_part") or {}).get("created_at")))
+        if value is not None:
+            candidates.append(value)
+
+    if topic in {"conversation.user.created", "conversation.user.replied"}:
+        source = item.get("source") or {}
+        source_author_type = (source.get("author") or {}).get("type")
+        source_has_message = bool(_strip(source.get("body", "")) or source.get("attachments"))
+        # Trust source.created_at when source is message-like and is not an
+        # explicitly administrative source. This also covers malformed payloads
+        # where Intercom omits author.type but source carries the user message.
+        if source_author_type not in {"admin", "bot", "teammate", "assistant"} and source_has_message:
+            value = _as_int(source.get("created_at"))
+            if value is not None:
+                candidates.append(value)
+
+        # Real user message parts are the authoritative fallback. Prefer the
+        # newest user part at or before the notification creation timestamp.
+        notification_created = _as_int(payload.get("created_at"))
+        parts = (item.get("conversation_parts") or {}).get("conversation_parts", []) or []
+        part_times: list[int] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if (part.get("author") or {}).get("type") != "user":
+                continue
+            if not (_strip(part.get("body", "")) or part.get("attachments")):
+                continue
+            value = _as_int(part.get("created_at"))
+            if value is None:
+                continue
+            if notification_created is not None and value > notification_created:
+                continue
+            part_times.append(value)
+        if part_times:
+            candidates.append(max(part_times))
+
+    if not candidates:
+        for value in (payload.get("created_at"), item.get("updated_at")):
+            parsed = _as_int(value)
+            if parsed is not None:
+                candidates.append(parsed)
+
+    return max(candidates) if candidates else None
 
 def parse(payload: dict) -> InboundMessage | None:
     topic=payload.get("topic","")
@@ -169,12 +264,19 @@ def parse(payload: dict) -> InboundMessage | None:
         return None
     entity_id,text,attachments,name,email,updated_at,*rest=data
     context = rest[0] if rest and isinstance(rest[0], list) else []
+    provider_part_id = rest[1] if len(rest) > 1 else None
     fallback_key = hashlib.sha1(
         f"{entity_id}:{updated_at}:{text}".encode("utf-8")
     ).hexdigest()
+    dedup_anchor = provider_part_id or fallback_key
+    event_key = (
+        f"message:{entity_id}:{dedup_anchor}"
+        if provider_part_id
+        else f"{topic}:{entity_id}:{event_id or fallback_key}"
+    )
     return InboundMessage(
         event_id=event_id,
-        event_key=f"{topic}:{entity_id}:{event_id or fallback_key}",
+        event_key=event_key,
         topic=topic,
         entity_id=entity_id,
         channel=channel,
@@ -183,6 +285,6 @@ def parse(payload: dict) -> InboundMessage | None:
         user_email=email,
         updated_at=updated_at,
         has_attachments=attachments,
-        raw={**payload, "_conversation_context": context},
+        raw={**payload, "_conversation_context": context, "_provider_part_id": provider_part_id},
     )
 

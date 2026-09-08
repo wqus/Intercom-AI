@@ -117,6 +117,13 @@ class OutboundRepository:
             action.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         await self.session.commit()
 
+    async def mark_failed(self, action: OutboundAction, error: str) -> None:
+        """Persist a terminal delivery failure without pretending it was skipped."""
+        action.status = "failed"
+        action.locked_at = None
+        action.last_error = error[:4000]
+        await self.session.commit()
+
     async def mark_unknown(self, action: OutboundAction, error: str) -> None:
         # For timeout/network ambiguity we deliberately do NOT auto-retry an external
         # write: the provider may already have accepted it. Manual reconciliation is

@@ -33,9 +33,29 @@ class EventRepository:
         return result.rowcount == 1
 
     async def count_for_entity(self, entity_id: str) -> int:
-        """Return the number of inbound events already recorded for a conversation."""
+        """Return the number of inbound events already recorded for an entity."""
         result = await self.session.scalar(
             select(func.count(InboundEvent.id)).where(InboundEvent.entity_id == entity_id)
+        )
+        return int(result or 0)
+
+    async def count_customer_events_for_entity(self, entity_id: str) -> int:
+        """Count only customer-originated message topics for first-turn semantics.
+
+        Lifecycle events such as ticket.created must not make a later actual customer
+        reply look like a non-first turn, especially when a ticket is linked to the
+        same Intercom entity as a conversation.
+        """
+        customer_topics = (
+            "conversation.user.created",
+            "conversation.user.replied",
+            "ticket.contact.replied",
+        )
+        result = await self.session.scalar(
+            select(func.count(InboundEvent.id)).where(
+                InboundEvent.entity_id == entity_id,
+                InboundEvent.topic.in_(customer_topics),
+            )
         )
         return int(result or 0)
 

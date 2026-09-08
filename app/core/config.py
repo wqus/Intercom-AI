@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     DRY_RUN: bool = False
     LOG_LEVEL: str = "INFO"
     LOG_WEBHOOK_PAYLOAD: bool = False
+    FETCH_FULL_CONTEXT: bool = True
+    CONTEXT_FETCH_TIMEOUT: float = 5.0
     PROCESS_TICKET_CREATED: bool = False
     LOG_SENSITIVE_CONTENT: bool = False
     TELEGRAM_BOT_TOKEN: str = ""

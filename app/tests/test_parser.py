@@ -166,13 +166,13 @@ def test_conversation_user_replied_uses_source_when_author_type_missing():
     assert message.text == "Сколько стоит обучение?"
 
 
-def test_webhook_event_order_uses_source_message_time():
+def test_webhook_event_order_falls_back_to_notification_time_when_source_has_no_message():
     from app.infrastructure.intercom.parser import event_order_at as _event_order_at
     assert _event_order_at({
         "created_at": 999,
         "topic": "conversation.user.replied",
         "data": {"item": {"source": {"created_at": 123}}},
-    }) == 123
+    }) == 999
 
 
 def test_webhook_event_order_falls_back_to_notification_time():
@@ -200,3 +200,106 @@ def test_ticket_created_remains_parseable_for_dedicated_ticket_workflow():
     assert msg is not None
     assert msg.entity_id == "t-1"
     assert msg.text == "Описание заявки"
+
+
+def test_operator_reply_uses_source_instead_of_previous_user_message():
+    payload = {
+        "id": "evt-operator",
+        "topic": "conversation.user.replied",
+        "created_at": 1788877044,
+        "data": {"item": {
+            "id": "conv-operator",
+            "source": {
+                "body": "Оператор",
+                "author": {"type": "user", "name": "User"},
+                "created_at": 1788877043,
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"id": "old", "body": "123 123 123", "created_at": 1788876988, "author": {"type": "user"}},
+                {"id": "op-1", "body": "Оператор", "created_at": 1788877043, "author": {"type": "user"}},
+            ]},
+        }},
+    }
+    msg = parse(payload)
+    assert msg is not None
+    assert msg.text == "Оператор"
+    assert msg.raw["_provider_part_id"] == "op-1"
+
+
+def test_conversation_and_ticket_events_share_part_idempotency_key():
+    conv_payload = {
+        "id": "conv-event",
+        "topic": "conversation.user.replied",
+        "created_at": 1788876990,
+        "data": {"item": {
+            "id": "same-entity",
+            "source": {"type": "admin_issued", "author": {"type": "admin"}},
+            "conversation_parts": {"conversation_parts": [
+                {"id": "shared-part", "body": "123 12", "created_at": 1788876988, "author": {"type": "user"}},
+            ]},
+        }},
+    }
+    ticket_payload = {
+        "id": "ticket-event",
+        "topic": "ticket.contact.replied",
+        "created_at": 1788876990,
+        "data": {"item": {
+            "id": "same-entity",
+            "ticket": {"id": "same-entity"},
+            "ticket_part": {"id": "shared-part", "body": "123 12", "created_at": 1788876988, "author": {"type": "user"}},
+        }},
+    }
+    conv = parse(conv_payload)
+    ticket = parse(ticket_payload)
+    assert conv is not None and ticket is not None
+    assert conv.event_key == ticket.event_key
+
+
+def test_event_order_uses_actual_user_part_when_conversation_source_is_admin_initiated():
+    from app.infrastructure.intercom.parser import event_order_at
+    payload = {
+        "id": "evt-real",
+        "topic": "conversation.user.replied",
+        "created_at": 1788877044,
+        "data": {"item": {
+            "source": {
+                "type": "admin_initiated",
+                "created_at": 1788775828,
+                "author": {"type": "admin", "id": "7848715"},
+                "body": "",
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"id": "old", "created_at": 1788876988, "body": "old", "author": {"type": "user"}},
+                {"id": "current", "created_at": 1788877043, "body": "Оператор", "author": {"type": "user"}},
+            ]},
+        }},
+    }
+    assert event_order_at(payload) == 1788877043
+
+
+def test_realistic_admin_initiated_source_uses_current_user_part_for_ordering_and_text():
+    from app.infrastructure.intercom.parser import event_order_at
+    payload = {
+        "id": "notif-realistic",
+        "created_at": 1788877044,
+        "topic": "conversation.user.replied",
+        "data": {"item": {
+            "id": "215475824210454",
+            "source": {
+                "type": "admin_initiated",
+                "id": "215475824210454",
+                "delivered_as": "admin_initiated",
+                "body": "",
+                "author": {"type": "admin", "id": "7848715"},
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"id": "old", "part_type": "comment", "body": "старое", "created_at": 1788876988, "author": {"type": "user", "id": "u1"}},
+                {"id": "current", "part_type": "comment", "body": "Оператор", "created_at": 1788877043, "author": {"type": "user", "id": "u1"}},
+            ]},
+        }},
+    }
+    msg = parse(payload)
+    assert msg is not None
+    assert msg.text == "Оператор"
+    assert msg.raw["_provider_part_id"] == "current"
+    assert event_order_at(payload) == 1788877043

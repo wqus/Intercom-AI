@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from app.domain.enums import Channel, ConversationStateKind, Decision, EscalationReason
 from app.core.config import settings
@@ -394,19 +395,11 @@ class SupportApplication:
             return True
 
         # Strict routing order is an invariant:
-        # 1) active escalation blocklist; 2) explicit operator request;
-        # 3) persisted conversational state; 4) fresh classifier.
-        # A numeric reply such as `1` must never reach the classifier while a
-        # CHOOSING state exists, and `оператор` must always escalate directly.
-        if contains_operator_request(message.text):
-            await self._escalate(
-                session,
-                message,
-                event,
-                EscalationReason.USER_REQUESTED_OPERATOR,
-            )
-            return True
-
+        # 1) active escalation blocklist; 2) state row lock + event ordering;
+        # 3) explicit operator request; 4) persisted conversational state;
+        # 5) fresh classifier.
+        # Ordering must happen BEFORE the operator fast-path so a delayed old event
+        # cannot escalate a conversation that has already advanced on a newer event.
         states = StateRepository(session)
         # Serialize all stateful decisions for a conversation. Without a row lock,
         # two workers can process two inbound messages for the same conversation
@@ -443,6 +436,15 @@ class SupportApplication:
             state.data = state_data
             await session.flush()
 
+        if contains_operator_request(message.text):
+            await self._escalate(
+                session,
+                message,
+                event,
+                EscalationReason.USER_REQUESTED_OPERATOR,
+            )
+            return True
+
         if await self._handle_state(session, event, message, state):
             return True
 
@@ -467,7 +469,7 @@ class SupportApplication:
         # Ignore is allowed only on later turns; short domain words must still
         # reach the AI-first pipeline.
         try:
-            inbound_count = await EventRepository(session).count_for_entity(message.entity_id)
+            inbound_count = await EventRepository(session).count_customer_events_for_entity(message.entity_id)
             is_first_message = inbound_count <= 1
         except AttributeError:
             # Lightweight test doubles / non-SQL sessions may not expose scalar().
@@ -477,6 +479,59 @@ class SupportApplication:
         context = message.raw.get("_conversation_context", []) if isinstance(message.raw, dict) else []
         if not isinstance(context, list):
             context = []
+
+        # Intercom webhooks frequently contain only the triggering conversation
+        # part, not the complete dialogue history. The LLM router must nevertheless
+        # understand short follow-ups such as "код"/"не приходит" in context.
+        # Fetch the authoritative conversation/ticket resource when available and
+        # fall back to webhook-local context if the read is temporarily unavailable.
+        provider_part_id = None
+        if isinstance(message.raw, dict):
+            provider_part_id = message.raw.get("_provider_part_id")
+        try:
+            before_epoch = int(message.updated_at) if str(message.updated_at or "").isdigit() else None
+        except (TypeError, ValueError):
+            before_epoch = None
+
+        context_fetch_started = time.perf_counter()
+        try:
+            if settings.FETCH_FULL_CONTEXT and message.channel == Channel.CONVERSATION and hasattr(self.intercom, "get_conversation_context"):
+                fetched = await self.intercom.get_conversation_context(
+                    message.entity_id,
+                    current_part_id=str(provider_part_id) if provider_part_id else None,
+                    before_epoch=before_epoch,
+                    limit=12,
+                )
+                if fetched:
+                    context = fetched
+                logger.info(
+                    "conversation_context_fetched | entity=%s | event=%s | messages=%d | elapsed_ms=%.1f",
+                    message.entity_id, event.id, len(fetched),
+                    (time.perf_counter() - context_fetch_started) * 1000,
+                )
+            elif settings.FETCH_FULL_CONTEXT and message.channel == Channel.TICKET and hasattr(self.intercom, "get_ticket_context"):
+                fetched = await self.intercom.get_ticket_context(
+                    message.entity_id,
+                    current_part_id=str(provider_part_id) if provider_part_id else None,
+                    before_epoch=before_epoch,
+                    limit=12,
+                )
+                if fetched:
+                    context = fetched
+                logger.info(
+                    "ticket_context_fetched | entity=%s | event=%s | messages=%d | elapsed_ms=%.1f",
+                    message.entity_id, event.id, len(fetched),
+                    (time.perf_counter() - context_fetch_started) * 1000,
+                )
+        except Exception as exc:
+            # Context enrichment is best-effort. A read failure must not turn an
+            # otherwise valid current message into a silent drop; the bounded
+            # webhook context remains available to the classifier.
+            logger.warning(
+                "context_fetch_failed | entity=%s | event=%s | channel=%s | error_type=%s | error=%s",
+                message.entity_id, event.id, message.channel.value, type(exc).__name__, exc,
+            )
+
         # Preserve chronological conversation context and add explicit pending
         # state metadata for clarification/menu continuations. The metadata is
         # never treated as customer-authored text by the prompt.

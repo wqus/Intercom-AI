@@ -94,8 +94,8 @@ def test_intercom_5xx_reconciled_as_sent_when_reply_is_visible():
     import httpx
 
     class ReconIntercom(FakeIntercom):
-        async def reply_exists(self, entity_id, text, after_epoch=None):
-            self.reconcile_args = (entity_id, text, after_epoch)
+        async def reply_exists(self, entity_id, text, after_epoch=None, channel="conversation"):
+            self.reconcile_args = (entity_id, text, after_epoch, channel)
             return True
 
     class Repo:
@@ -163,3 +163,62 @@ def test_intercom_429_remains_retryable():
     repo = Repo()
     asyncio.run(worker._handle_http_status_error(action_obj, repo, _http_error(429)))
     assert [c[0] for c in repo.calls] == ["retry"]
+
+
+def test_intercom_4xx_is_terminal_failed_not_skipped():
+    import asyncio
+    from types import SimpleNamespace
+
+    class Repo:
+        def __init__(self): self.calls = []
+        async def mark_failed(self, action, error): self.calls.append(("failed", error))
+        async def mark_sent(self, action): self.calls.append(("sent", action))
+        async def mark_unknown(self, action, error): self.calls.append(("unknown", error))
+        async def mark_retry(self, action, error): self.calls.append(("retry", error))
+        async def mark_skipped(self, action, error): self.calls.append(("skipped", error))
+
+    action_obj = SimpleNamespace(
+        id=10,
+        action_type="intercom_reply",
+        payload={"entity_id": "c1", "channel": "conversation", "text": "hello"},
+    )
+    worker = OutboxWorker(FakeIntercom(), FakeTelegram())
+    repo = Repo()
+    asyncio.run(worker._handle_http_status_error(action_obj, repo, _http_error(400)))
+    assert [c[0] for c in repo.calls] == ["failed"]
+
+
+def test_intercom_reply_uses_correct_endpoint_and_admin_payload(monkeypatch):
+    import asyncio
+    import httpx
+    from types import SimpleNamespace
+    from app.infrastructure.intercom.client import IntercomGateway
+
+    calls = []
+    async def handler(request):
+        calls.append((str(request.url), await request.aread(), dict(request.headers)))
+        if "/tickets/" in str(request.url):
+            return httpx.Response(200, json={"type": "ticket_part", "id": "tp-1", "part_type": "comment"})
+        return httpx.Response(200, json={"type": "conversation", "id": "c-1"})
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            gateway = IntercomGateway(client)
+            await gateway.send_reply("c-1", "conversation", "hello")
+            await gateway.send_reply("t-1", "ticket", "hello")
+
+    import app.infrastructure.intercom.client as client_module
+    monkeypatch.setattr(client_module.settings, "DRY_RUN", False)
+    monkeypatch.setattr(client_module.settings, "INTERCOM_TOKEN", "token")
+    monkeypatch.setattr(client_module.settings, "INTERCOM_ADMIN_ID", "admin-1")
+    asyncio.run(run())
+
+    assert calls[0][0] == "https://api.intercom.io/conversations/c-1/reply"
+    assert calls[1][0] == "https://api.intercom.io/tickets/t-1/reply"
+    for _, raw, _ in calls:
+        payload = __import__("json").loads(raw)
+        assert payload["message_type"] == "comment"
+        assert payload["type"] == "admin"
+        assert payload["admin_id"] == "admin-1"
+        assert payload["body"] == "hello"

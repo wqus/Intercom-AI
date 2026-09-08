@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import time
 
 import httpx
 
@@ -35,11 +35,20 @@ class OutboxWorker:
     async def _deliver(self, action) -> tuple[str, str | None]:
         payload = action.payload or {}
         action_type = action.action_type
+        started = time.perf_counter()
+        logger.info(
+            "outbox_delivery_start | action=%s | action_type=%s | entity=%s | channel=%s | attempt=%s",
+            action.id, action_type, getattr(action, "entity_id", None) or payload.get("entity_id"), getattr(action, "channel", None) or payload.get("channel"), getattr(action, "attempts", None),
+        )
         if action_type == "intercom_reply":
             await self.intercom.send_reply(
                 str(payload["entity_id"]),
                 str(payload["channel"]),
                 str(payload["text"]),
+            )
+            logger.info(
+                "outbox_delivery_success | action=%s | action_type=%s | entity=%s | elapsed_ms=%.1f",
+                action.id, action_type, getattr(action, "entity_id", None) or payload.get("entity_id"), (time.perf_counter() - started) * 1000,
             )
             return "sent", None
 
@@ -48,14 +57,21 @@ class OutboxWorker:
                 str(payload["entity_id"]),
                 str(payload["channel"]),
             )
+            logger.info(
+                "outbox_delivery_success | action=%s | action_type=%s | entity=%s | elapsed_ms=%.1f",
+                action.id, action_type, getattr(action, "entity_id", None) or payload.get("entity_id"), (time.perf_counter() - started) * 1000,
+            )
             return "sent", None
 
         if action_type == "telegram_escalation":
-            configured = self.telegram.is_configured()
-            if not configured:
+            if not self.telegram.is_configured():
                 return "skipped", "Telegram is not configured"
             ok = await self.telegram.notify_escalation(**payload)
             if ok:
+                logger.info(
+                    "outbox_delivery_success | action=%s | action_type=%s | entity=%s | elapsed_ms=%.1f",
+                    action.id, action_type, getattr(action, "entity_id", None) or payload.get("entity_id"), (time.perf_counter() - started) * 1000,
+                )
                 return "sent", None
             return "retry", "Telegram delivery returned False"
 
@@ -64,25 +80,24 @@ class OutboxWorker:
     async def _handle_http_status_error(self, action, repo, exc: httpx.HTTPStatusError) -> None:
         """Apply provider-specific failure semantics without blind duplicate sends."""
         status_code = exc.response.status_code if exc.response is not None else 0
+        action_type = action.action_type
+        channel = str((action.payload or {}).get("channel") or action.channel or "")
+
         if 500 <= status_code <= 599:
-            # Intercom's reply POST does not document an idempotency key. A 5xx can
-            # therefore be ambiguous. Reconcile conversation replies before deciding
-            # whether delivery happened; otherwise quarantine as unknown.
-            if action.action_type == "intercom_reply" and action.payload.get("channel") == "conversation":
+            if action_type == "intercom_reply":
                 try:
-                    after_epoch = None
                     created_at = getattr(action, "created_at", None)
-                    if created_at is not None:
-                        after_epoch = int(created_at.timestamp()) - 5
+                    after_epoch = int(created_at.timestamp()) - 5 if created_at is not None else None
                     confirmed = await self.intercom.reply_exists(
                         str(action.payload["entity_id"]),
                         str(action.payload["text"]),
+                        channel=channel,
                         after_epoch=after_epoch,
                     )
                 except Exception as reconcile_exc:
                     logger.error(
-                        "Outbound reconciliation failed action=%s: %s",
-                        action.id, reconcile_exc,
+                        "outbox_reconciliation_failed | action=%s | type=%s | channel=%s | error_type=%s | error=%s",
+                        action.id, action_type, channel, type(reconcile_exc).__name__, reconcile_exc,
                     )
                     confirmed = False
                 if confirmed:
@@ -92,22 +107,33 @@ class OutboxWorker:
                         action,
                         f"Intercom {status_code} after reply POST; delivery requires reconciliation",
                     )
-            else:
-                await repo.mark_unknown(
-                    action,
-                    f"Provider {status_code} after outbound write; delivery requires reconciliation",
-                )
+                return
+
+            # Tag updates and operator notifications are not customer-facing message
+            # creates. Their 5xx failures are safe to retry and preferable to losing
+            # escalation metadata/operator visibility.
+            if action_type in {"intercom_escalation_tag", "telegram_escalation"}:
+                await repo.mark_retry(action, f"Provider HTTP {status_code}: {exc}")
+                return
+
+            await repo.mark_unknown(action, f"Provider {status_code} after outbound write")
             return
+
         if status_code == 429:
-            # Rate limiting is retryable and is distinct from ambiguous server-side
-            # failures of a create operation.
             await repo.mark_retry(action, str(exc))
             return
-        await repo.mark_skipped(action, str(exc))
+
+        if 400 <= status_code <= 499:
+            await repo.mark_failed(action, f"Provider returned HTTP {status_code}: {exc}")
+            logger.error(
+                "outbox_delivery_permanent_failure | action=%s | type=%s | channel=%s | status=%s",
+                action.id, action_type, channel, status_code,
+            )
+            return
+
+        await repo.mark_retry(action, str(exc))
 
     async def _run(self) -> None:
-        # Import the database session lazily so pure delivery tests and tooling do
-        # not require a live SQL driver at module-import time.
         from app.database.session import SessionLocal
 
         while not self._stop.is_set():
@@ -115,7 +141,9 @@ class OutboxWorker:
             try:
                 async with SessionLocal() as session:
                     repo = OutboundRepository(session)
-                    await repo.mark_stale_unknown()
+                    quarantined = await repo.mark_stale_unknown()
+                    if quarantined:
+                        logger.error("outbox_stale_quarantined | count=%s", quarantined)
                     action = await repo.claim_one()
                     if action:
                         processed = True
@@ -128,21 +156,32 @@ class OutboxWorker:
                             else:
                                 await repo.mark_retry(action, error or "delivery failed")
                         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
-                            # A network timeout is delivery-ambiguous: the provider may
-                            # already have accepted the write. Do not blindly retry a
-                            # customer-facing action and risk a duplicate message.
-                            logger.error(
-                                "Outbound delivery uncertain action=%s type=%s: %s",
-                                action.id,
-                                action.action_type,
-                                exc,
-                            )
-                            await repo.mark_unknown(action, str(exc))
+                            # Customer-facing Intercom writes are ambiguous on network
+                            # failure. Telegram/tag writes are retryable because losing
+                            # the operator signal/metadata is worse than a duplicate.
+                            if action.action_type == "intercom_reply":
+                                await repo.mark_unknown(action, str(exc))
+                                logger.error(
+                                    "outbox_delivery_unknown | action=%s | type=%s | entity=%s | error=%s",
+                                    action.id, action.action_type, action.entity_id, exc,
+                                )
+                            else:
+                                await repo.mark_retry(action, str(exc))
+                                logger.warning(
+                                    "outbox_delivery_retry | action=%s | type=%s | entity=%s | error=%s",
+                                    action.id, action.action_type, action.entity_id, exc,
+                                )
                         except httpx.HTTPStatusError as exc:
                             await self._handle_http_status_error(action, repo, exc)
                         except Exception as exc:
-                            logger.exception("Outbound delivery failed action=%s", action.id)
-                            await repo.mark_retry(action, str(exc))
+                            # Unknown application errors are ambiguous only for actual
+                            # external writes; keep the durable action for manual
+                            # reconciliation rather than marking it sent.
+                            if action.action_type == "intercom_reply":
+                                await repo.mark_unknown(action, str(exc))
+                            else:
+                                await repo.mark_retry(action, str(exc))
+                            logger.exception("Outbox delivery failed action=%s", action.id)
             except Exception:
                 logger.exception("Outbox worker loop failure")
             if not processed:
