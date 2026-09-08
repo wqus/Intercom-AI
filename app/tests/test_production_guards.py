@@ -60,3 +60,54 @@ def test_event_repository_count_for_entity_uses_sqlalchemy_count_expression():
 
     import asyncio
     assert asyncio.run(EventRepository(Session()).count_for_entity("conv")) == 3
+
+
+def test_ticket_created_is_processed_as_initial_customer_request():
+    from app.infrastructure.intercom.parser import parse
+    payload = {
+        "id": "notif-ticket-created",
+        "topic": "ticket.created",
+        "created_at": 1788895801,
+        "data": {"item": {
+            "id": "215475848641277",
+            "updated_at": 1788895800,
+            "ticket_attributes": {
+                "_default_title_": "Проверка",
+                "_default_description_": "Перейти в другую шк хочу",
+            },
+        }},
+    }
+    message = parse(payload)
+    assert message is not None
+    assert message.channel.value == "ticket"
+    assert message.text == "Перейти в другую шк хочу"
+
+
+def test_same_ticket_comment_and_conversation_part_have_one_global_event_key():
+    from app.infrastructure.intercom.parser import parse
+    conv = parse({
+        "id": "conv-event",
+        "topic": "conversation.user.replied",
+        "created_at": 200,
+        "data": {"item": {
+            "id": "conversation-1",
+            "source": {"type": "admin_initiated", "author": {"type": "admin"}},
+            "conversation_parts": {"conversation_parts": [
+                {"id": "part-global-1", "body": "хочу в другую школу", "created_at": 199,
+                 "author": {"type": "user"}},
+            ]},
+        }},
+    })
+    ticket = parse({
+        "id": "ticket-event",
+        "topic": "ticket.contact.replied",
+        "created_at": 200,
+        "data": {"item": {
+            "id": "ticket-1",
+            "ticket": {"id": "ticket-1"},
+            "ticket_part": {"id": "part-global-1", "body": "хочу в другую школу", "created_at": 199,
+                            "author": {"type": "user"}},
+        }},
+    })
+    assert conv is not None and ticket is not None
+    assert conv.event_key == ticket.event_key == "message:part:part-global-1"

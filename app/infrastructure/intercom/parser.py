@@ -244,23 +244,27 @@ def event_order_at(payload: dict) -> int | None:
                 candidates.append(value)
 
         # Real user message parts are authoritative for replied events. Prefer the
-        # newest user part at or before the notification creation timestamp.
+        # newest user part at or before the notification creation timestamp. For
+        # conversation.user.created, however, `source` is the actual triggering
+        # message; do NOT scan the whole snapshot because Intercom may include later
+        # user parts already present by the time this webhook is delivered.
         notification_created = _as_int(payload.get("created_at"))
         parts = (item.get("conversation_parts") or {}).get("conversation_parts", []) or []
         part_times: list[int] = []
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            if (part.get("author") or {}).get("type") != "user":
-                continue
-            if not (_strip(part.get("body", "")) or part.get("attachments")):
-                continue
-            value = _as_int(part.get("created_at"))
-            if value is None:
-                continue
-            if notification_created is not None and value > notification_created:
-                continue
-            part_times.append(value)
+        if topic == "conversation.user.replied":
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                if (part.get("author") or {}).get("type") != "user":
+                    continue
+                if not (_strip(part.get("body", "")) or part.get("attachments")):
+                    continue
+                value = _as_int(part.get("created_at"))
+                if value is None:
+                    continue
+                if notification_created is not None and value > notification_created:
+                    continue
+                part_times.append(value)
         if part_times:
             candidates.append(max(part_times))
         elif topic == "conversation.user.replied" and source_author_type not in {"admin", "bot", "teammate", "assistant"} and source_has_message:
@@ -299,8 +303,12 @@ def parse(payload: dict) -> InboundMessage | None:
         f"{entity_id}:{updated_at}:{text}".encode("utf-8")
     ).hexdigest()
     dedup_anchor = provider_part_id or fallback_key
+    # Provider part IDs are globally stable across Intercom's Conversation and
+    # Ticket webhook topics. Use them as the primary idempotency anchor without
+    # including entity_id, so the same customer comment cannot be processed twice
+    # when Intercom emits both topic variants for the same part.
     event_key = (
-        f"message:{entity_id}:{dedup_anchor}"
+        f"message:part:{dedup_anchor}"
         if provider_part_id
         else f"{topic}:{entity_id}:{event_id or fallback_key}"
     )

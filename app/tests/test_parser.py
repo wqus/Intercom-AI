@@ -189,8 +189,7 @@ def test_webhook_event_order_falls_back_to_notification_time():
 
 
 def test_ticket_created_remains_parseable_for_dedicated_ticket_workflow():
-    # The webhook layer gates ticket.created by PROCESS_TICKET_CREATED; parser itself
-    # remains backward-compatible for explicit ticket workflows.
+    # ticket.created carries the first customer request in this workflow.
     payload = {
         "id": "ticket-1",
         "topic": "ticket.created",
@@ -205,6 +204,29 @@ def test_ticket_created_remains_parseable_for_dedicated_ticket_workflow():
     assert msg.entity_id == "t-1"
     assert msg.text == "Описание заявки"
 
+
+
+def test_conversation_user_created_order_uses_source_not_later_snapshot_parts():
+    from app.infrastructure.intercom.parser import event_order_at
+    payload = {
+        "id": "created-with-later-history",
+        "topic": "conversation.user.created",
+        "created_at": 300,
+        "data": {"item": {
+            "id": "conv-created-later-history",
+            "source": {
+                "type": "conversation",
+                "body": "first",
+                "created_at": 100,
+                "author": {"type": "user", "id": "u1"},
+            },
+            "conversation_parts": {"conversation_parts": [
+                {"id": "p1", "body": "first", "created_at": 100, "author": {"type": "user", "id": "u1"}},
+                {"id": "p2", "body": "later", "created_at": 200, "author": {"type": "user", "id": "u1"}},
+            ]},
+        }},
+    }
+    assert event_order_at(payload) == 100
 
 def test_operator_reply_uses_current_user_part_when_source_is_stale_original_message():
     payload = {
@@ -230,7 +252,7 @@ def test_operator_reply_uses_current_user_part_when_source_is_stale_original_mes
     assert msg is not None
     assert msg.text == "Оператор"
     assert msg.raw["_provider_part_id"] == "op-1"
-    assert msg.event_key == "message:conv-operator:op-1"
+    assert msg.event_key == "message:part:op-1"
 
 
 def test_later_conversation_reply_does_not_reuse_original_source_id_as_dedup_key():
@@ -256,7 +278,7 @@ def test_later_conversation_reply_does_not_reuse_original_source_id_as_dedup_key
     assert msg is not None
     assert msg.text == "Аа, понял. А с онлайн школами чо"
     assert msg.raw["_provider_part_id"] == "part-2"
-    assert msg.event_key == "message:conv-1:part-2"
+    assert msg.event_key == "message:part:part-2"
     from app.infrastructure.intercom.parser import event_order_at
     assert event_order_at(payload) == 200
 
@@ -288,6 +310,7 @@ def test_conversation_and_ticket_events_share_part_idempotency_key():
     ticket = parse(ticket_payload)
     assert conv is not None and ticket is not None
     assert conv.event_key == ticket.event_key
+    assert conv.event_key == "message:part:shared-part"
 
 
 def test_event_order_uses_actual_user_part_when_conversation_source_is_admin_initiated():

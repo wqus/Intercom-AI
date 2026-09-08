@@ -364,7 +364,7 @@ def test_taxonomy_catalog_is_compact_without_losing_routing_contract():
     # Use the repository KB fixture directly without initializing embeddings.
     kb_data = json.loads(open("data/knowledge_base.json", encoding="utf-8").read())
     rendered = json.dumps({"intent_catalog": [_intent_catalog_entry(e) for e in kb_data]}, ensure_ascii=False, separators=(",", ":"))
-    assert len(kb_data) == 43
+    assert len(kb_data) == 45
     assert len(rendered) < 12500
     assert '"template_answer"' not in rendered
     assert '"when_to_use"' not in rendered
@@ -381,7 +381,7 @@ def test_taxonomy_prompt_wire_format_is_compact():
     kb_data = json.loads(open("data/knowledge_base.json", encoding="utf-8").read())
     payload = build_taxonomy_user_message("код", kb_data, [])
     catalog = json.loads(payload)["intent_catalog"]
-    assert len(catalog) == 43
+    assert len(catalog) == 45
     assert len(payload) < 13000
     assert "template_answer" not in payload
     assert "when_to_use" not in payload

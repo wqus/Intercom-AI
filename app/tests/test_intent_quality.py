@@ -774,3 +774,34 @@ def test_online_training_top3_context_rejects_unrelated_family():
     candidate = {"entry": {"id": "kb_012", "family": "payments"}, "ontology": {"object": "training", "action": "pay", "state": "information", "facet": "price"}}
     compatibility, _ = kb._choice_context_compatibility(question, top, candidate)
     assert compatibility < 0.45
+
+
+def test_launch_late_arrival_and_code_attendance_intents_are_distinct():
+    import json
+    from pathlib import Path
+    data = json.loads(Path("data/knowledge_base.json").read_text(encoding="utf-8"))
+    by_id = {x["id"]: x for x in data}
+    late = by_id["kb_048"]
+    attendance = by_id["kb_049"]
+
+    assert late["intent_type"] == "event_late_arrival"
+    assert attendance["intent_type"] == "event_attendance_for_code"
+    assert "можно ли не приходить" in attendance["intent_signals"]["positive"] or "можно ли не приходить на запуск" in attendance["match_phrases"]
+    assert "можно прийти позже" in late["match_phrases"]
+    assert "kb_016" in late["conflict_ids"]
+
+
+def test_launch_event_hard_rules_route_late_arrival_and_skip_to_distinct_kbs():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+
+    assert kb._hard_rule_match("Я опоздаю на Запуск, можно приехать позже?") == "kb_048"
+    assert kb._hard_rule_match("Можно ли прийти на Запуск после 15:00?") == "kb_048"
+    assert kb._hard_rule_match("Можно вообще не приходить на Запуск и получить код?") == "kb_049"
+    assert kb._hard_rule_match("Обязательно ли быть на Запуске, чтобы получить код?") == "kb_049"
+
+
+def test_launch_date_question_stays_on_existing_flow_date_intent():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    assert kb._hard_rule_match("Когда следующий запуск нового потока?") != "kb_048"

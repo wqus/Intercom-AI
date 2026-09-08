@@ -13,7 +13,9 @@ class Settings(BaseSettings):
     LOG_WEBHOOK_PAYLOAD: bool = False
     FETCH_FULL_CONTEXT: bool = True
     CONTEXT_FETCH_TIMEOUT: float = 5.0
-    PROCESS_TICKET_CREATED: bool = False
+    # Kept for backward-compatible configuration parsing. ticket.created with a
+    # customer description is always processed; empty/system-only events are skipped.
+    PROCESS_TICKET_CREATED: bool = True
     LOG_SENSITIVE_CONTENT: bool = False
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_GROUP_ID: str = ""

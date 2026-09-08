@@ -69,7 +69,7 @@ def test_real_intercom_replied_payload_does_not_use_stale_source_without_timesta
     assert message is not None
     assert message.text == "Аа, понял. А с онлайн школами чо"
     assert message.raw["_provider_part_id"] == "53444880790"
-    assert message.event_key == "message:215475844381260:53444880790"
+    assert message.event_key == "message:part:53444880790"
 
 def test_conversation_user_created_is_a_real_customer_turn():
     payload = {
@@ -230,4 +230,4 @@ def test_real_later_conversation_reply_uses_current_part_even_when_source_is_sta
     assert message is not None
     assert message.text == "Аа, понял. А с онлайн школами чо"
     assert message.raw["_provider_part_id"] == "53444880790"
-    assert message.event_key == "message:215475844381260:53444880790"
+    assert message.event_key == "message:part:53444880790"

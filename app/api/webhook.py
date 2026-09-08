@@ -53,15 +53,11 @@ async def intercom_webhook(request: Request):
     if topic not in CONVERSATION_TOPICS | TICKET_TOPICS:
         return {"status": "ignored", "topic": topic}
 
-    # `ticket.created` is an entity lifecycle event, not a customer reply.
-    # In a Messenger conversation workflow Intercom can create a linked ticket;
-    # treating its default description as a fresh customer turn causes the bot to
-    # answer the ticket instead of the actual conversation. Customer ticket input
-    # is handled by `ticket.contact.replied`. Keep ticket.created visible in logs/DB
-    # only when explicitly enabled for a dedicated ticket workflow.
-    if topic == "ticket.created" and not settings.PROCESS_TICKET_CREATED:
-        logger.info("Ignoring ticket.created lifecycle event entity=%s", ((payload.get("data") or {}).get("item") or {}).get("id"))
-        return {"status": "ignored", "reason": "ticket_created_lifecycle"}
+    # A customer-created ticket's `_default_description_` is the initial request.
+    # In this workflow Intercom does not emit a separate `ticket.contact.replied`
+    # for that first request; the latter is reserved for subsequent customer parts.
+    # Therefore ticket.created is a real inbound turn when the parser finds content.
+    # Empty/system-only ticket.created events are rejected by parse() and remain no-op.
 
     message = parse(payload)
     if message is None:
