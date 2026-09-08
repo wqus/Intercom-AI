@@ -177,3 +177,62 @@ def test_state_replace_preserves_ordering_watermark():
     asyncio.run(repo.replace("c1", ConversationStateKind.CHOOSING, {"candidate_ids": ["b"]}))
     assert state.data["candidate_ids"] == ["b"]
     assert state.data["_ordering"]["last_event_order_at"] == 123
+
+
+def test_business_answer_is_enqueued_to_outbox(monkeypatch):
+    import asyncio
+    import app.application.support_service as module
+    from app.application.support_service import SupportApplication
+    from app.domain.models import InboundMessage, ProcessingResult, DecisionTrace, OutboundAction
+    from app.domain.enums import Channel, Decision, ConversationStateKind
+
+    class FakePipeline:
+        async def decide(self, message, **kwargs):
+            return ProcessingResult(
+                traces=[DecisionTrace(
+                    decision=Decision.ANSWER_LLM,
+                    question=message.text,
+                    kb_id="kb_016",
+                    category="ЕСЛИ ВОПРОС О ДАТАХ ПОТОКОВ",
+                    llm_used=True,
+                )],
+                actions=[OutboundAction("business_answer", "Одобренный ответ из KB.", False)],
+            )
+
+    class FakeState:
+        state = ConversationStateKind.IDLE
+        data = {}
+
+    class FakeStates:
+        def __init__(self, session): self.state = FakeState()
+        async def get(self, entity_id, *, for_update=False): return self.state
+        async def replace(self, entity_id, state, data): self.state.state = state; self.state.data = data
+
+    class FakeEscalations:
+        async def is_escalated(self, entity_id): return False
+
+    class FakeInteraction:
+        async def add_many(self, *args, **kwargs): pass
+
+    class FakeOutbox:
+        def __init__(self): self.actions = []
+        async def enqueue(self, **kwargs): self.actions.append(kwargs); return True
+
+    class FakeSession:
+        async def flush(self): pass
+
+    originals = (module.StateRepository, module.InteractionRepository, module.EscalatedConversationRepository)
+    module.StateRepository = FakeStates
+    module.InteractionRepository = lambda session: FakeInteraction()
+    module.EscalatedConversationRepository = lambda session: FakeEscalations()
+    try:
+        outbox = FakeOutbox()
+        app = SupportApplication(FakePipeline(), object(), None, outbox)
+        msg = InboundMessage("evt", "key", "topic", "conv-answer", Channel.CONVERSATION, "какие даты потоков?")
+        event = type("Event", (), {"id": 999, "event_order_at": None})()
+        asyncio.run(app.handle(FakeSession(), event, msg))
+        assert len(outbox.actions) == 1
+        assert outbox.actions[0]["action_type"] == "intercom_reply"
+        assert outbox.actions[0]["payload"]["text"] == "Одобренный ответ из KB."
+    finally:
+        module.StateRepository, module.InteractionRepository, module.EscalatedConversationRepository = originals

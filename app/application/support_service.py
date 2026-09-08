@@ -669,7 +669,11 @@ class SupportApplication:
 
         reply_index = 0
         for action in result.actions:
-            if action.kind == "reply" and action.text:
+            # `business_answer` is the canonical customer-facing action produced
+            # by the LLM/KB path. It must enter the same transactional outbox as
+            # ordinary `reply` actions; otherwise the pipeline can report
+            # `actions=1` while nothing is ever sent to Intercom.
+            if action.kind in {"reply", "business_answer"} and action.text:
                 reply_index += 1
                 await self._enqueue_reply(
                     session,
