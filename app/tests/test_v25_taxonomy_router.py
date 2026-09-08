@@ -112,12 +112,15 @@ def test_taxonomy_prompt_contains_compact_directory_and_context():
         ],
         [{"role": "user", "text": "Не могу зарегистрироваться"}],
     )
+    import json
     assert '"intent_catalog"' in payload
     assert '"conversation_history"' in payload
-    assert '"when_to_use": "Проблема с регистрацией"' in payload
-    assert '"approved_answer_available": false' in payload.lower()
-    assert '"template_answer"' not in payload
-    assert '"positive_examples"' not in payload
+    parsed = json.loads(payload)
+    catalog = {item["id"]: item for item in parsed["intent_catalog"]}
+    assert catalog["kb_1"]["definition"] == "Проблема с регистрацией"
+    assert catalog["kb_1"]["answer"] is False
+    assert "template_answer" not in payload
+    assert "when_to_use" not in payload
 
 
 def test_taxonomy_router_low_certainty_answer_fails_closed(monkeypatch):
@@ -176,9 +179,8 @@ def test_taxonomy_catalog_exposes_answerability_metadata():
         "clarification_question": "Which?",
         "template_answer": "Approved answer",
     })
-    assert item["approved_answer_available"] is True
-    assert item["requires_clarification"] is True
-    assert item["clarification_available"] is True
+    assert item["answer"] is True
+    assert item["clarify"] is True
 
 
 def test_ignore_does_not_clear_pending_clarification_state():
@@ -352,3 +354,35 @@ def test_taxonomy_router_clarify_requires_kb_question(monkeypatch):
     result = asyncio.run(DecisionPipeline(CatalogKB(), llm).decide(_msg("стоимость"), is_first_message=False))
     assert result.traces[0].decision == Decision.ESCALATE
     assert result.actions and result.actions[0].escalate is True
+
+
+def test_taxonomy_catalog_is_compact_without_losing_routing_contract():
+    from app.infrastructure.ai.knowledge_base import KnowledgeBase
+    from app.infrastructure.ai.llm_client import _intent_catalog_entry
+    import json
+
+    # Use the repository KB fixture directly without initializing embeddings.
+    kb_data = json.loads(open("data/knowledge_base.json", encoding="utf-8").read())
+    rendered = json.dumps({"intent_catalog": [_intent_catalog_entry(e) for e in kb_data]}, ensure_ascii=False, separators=(",", ":"))
+    assert len(kb_data) == 43
+    assert len(rendered) < 12500
+    assert '"template_answer"' not in rendered
+    assert '"when_to_use"' not in rendered
+    assert '"when_not_to_use"' not in rendered
+    for item in kb_data:
+        compact = _intent_catalog_entry(item)
+        assert compact["id"] == item["id"]
+        assert compact["name"]
+        assert "answer" in compact and "clarify" in compact
+
+
+def test_taxonomy_prompt_wire_format_is_compact():
+    import json
+    kb_data = json.loads(open("data/knowledge_base.json", encoding="utf-8").read())
+    payload = build_taxonomy_user_message("код", kb_data, [])
+    catalog = json.loads(payload)["intent_catalog"]
+    assert len(catalog) == 43
+    assert len(payload) < 13000
+    assert "template_answer" not in payload
+    assert "when_to_use" not in payload
+    assert "when_not_to_use" not in payload

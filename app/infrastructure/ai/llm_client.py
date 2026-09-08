@@ -87,6 +87,8 @@ def build_system_prompt() -> str:
 - предыдущие сообщения диалога в хронологическом порядке;
 - при наличии — pending state, например ожидаемый ответ на clarification;
 - компактный полный каталог всех поддерживаемых intent'ов.
+Поля `definition`, `signals` и `exclude` — ориентиры для маршрутизации; `answer`/`clarify`
+показывают только наличие утверждённого backend-материала. Полного текста KB в prompt нет.
 
 ## ПРАВИЛО ИНТЕРПРЕТАЦИИ
 
@@ -163,37 +165,46 @@ ESCALATE:
 """
 
 
-def _intent_catalog_entry(entry: dict[str, Any]) -> dict[str, str]:
-    """Compact intent directory used by the AI-first router.
+def _intent_catalog_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Serialize only the routing facts needed by the classifier.
 
-    Keep this deliberately small: the router needs to understand the taxonomy,
-    not all KB retrieval/ranking internals or the approved answer text.
+    The approved answer text and retrieval internals stay server-side.  The
+    router gets one concise semantic definition plus answer/clarify capability
+    flags.  This preserves the full taxonomy while avoiding repeated prose from
+    when_to_use/when_not_to_use that was substantially increasing prompt size.
     """
     intent_id = str(entry.get("id") or "").strip()
     category = str(entry.get("category") or "").strip()
-    definition = str(entry.get("definition") or "").strip()
-    when_to_use = entry.get("when_to_use")
-    if isinstance(when_to_use, list):
-        usage = " ".join(str(x).strip() for x in when_to_use[:3] if str(x).strip())
-    else:
-        usage = str(when_to_use or "").strip()
-    when_not = entry.get("when_not_to_use")
-    if isinstance(when_not, list):
-        exclusions = " ".join(str(x).strip() for x in when_not[:2] if str(x).strip())
-    else:
-        exclusions = str(when_not or "").strip()
-    if not usage:
-        usage = definition
-    result = {
+    definition = str(
+        entry.get("definition")
+        or entry.get("description")
+        or entry.get("scope")
+        or entry.get("choice_label")
+        or ""
+    ).strip()
+    if not definition:
+        when_to_use = entry.get("when_to_use")
+        if isinstance(when_to_use, list):
+            definition = str(when_to_use[0] or "").strip() if when_to_use else ""
+        else:
+            definition = str(when_to_use or "").strip()
+    # A short, curated signal pair helps distinguish close intents without
+    # exposing the large match-phrase arrays. Prefer explicit intent_signals.
+    signals = entry.get("intent_signals") or {}
+    positive = signals.get("positive") if isinstance(signals, dict) else None
+    negative = signals.get("negative") if isinstance(signals, dict) else None
+    positive = positive if isinstance(positive, list) else entry.get("positive_examples")
+    negative = negative if isinstance(negative, list) else entry.get("negative_phrases")
+
+    result: dict[str, Any] = {
         "id": intent_id,
         "name": category or intent_id,
-        "when_to_use": usage[:600],
-        "approved_answer_available": bool(str(entry.get("template_answer") or "").strip()),
-        "requires_clarification": bool(entry.get("requires_clarification")),
-        "clarification_available": bool(str(entry.get("clarification_question") or "").strip()),
+        "definition": definition[:240],
+        "signals": [str(x).strip() for x in (positive or [])[:1] if str(x).strip()],
+        "exclude": [str(x).strip() for x in (negative or [])[:1] if str(x).strip()],
+        "answer": bool(str(entry.get("template_answer") or "").strip()),
+        "clarify": bool(str(entry.get("clarification_question") or "").strip()),
     }
-    if exclusions:
-        result["when_not_to_use"] = exclusions[:350]
     return result
 
 
@@ -222,7 +233,7 @@ def build_taxonomy_user_message(
         "current_question": question,
         "intent_catalog": [_intent_catalog_entry(entry) for entry in intent_catalog],
     }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_user_message(
