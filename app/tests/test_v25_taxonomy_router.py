@@ -163,7 +163,7 @@ def test_taxonomy_router_uses_previous_user_and_assistant_messages(monkeypatch):
 
 def test_taxonomy_router_accepts_multiple_answer_ids_after_coverage(monkeypatch):
     monkeypatch.setattr(config_module.settings, "LLM_ROUTER_MODE", "taxonomy")
-    llm = RecordingLLM(LLMResult(["kb_registration", "kb_price"], decision="answer", certainty="high"))
+    llm = RecordingLLM(LLMResult(["kb_registration", "kb_price"], decision="answer", certainty="high", is_compound=True))
     result = asyncio.run(DecisionPipeline(CatalogKB(), llm).decide(_msg("код"), is_first_message=False))
     assert result.traces[0].decision == Decision.ANSWER_LLM
     assert "Ответ про регистрацию." in result.actions[0].text or "Ответ про регистрацию." in result.actions[0].text
@@ -251,7 +251,7 @@ def test_taxonomy_schema_is_single_intent_contract(monkeypatch):
     class FakeCompletions:
         async def create(self, **kwargs):
             captured.update(kwargs)
-            return type("R", (), {"choices": [type("C", (), {"message": type("M", (), {"content": '{"decision":"answer","selected_kb_ids":["kb_1"],"certainty":"high"}'})()})()]})()
+            return type("R", (), {"choices": [type("C", (), {"message": type("M", (), {"content": '{"decision":"answer","selected_kb_ids":["kb_1"],"is_compound":false,"certainty":"high"}'})()})()]})()
 
     class FakeOpenAI:
         def __init__(self, **kwargs):
@@ -271,6 +271,8 @@ def test_taxonomy_schema_is_single_intent_contract(monkeypatch):
     selected = schema["properties"]["selected_kb_ids"]
     assert selected["maxItems"] == 4
     assert selected["minItems"] == 0
+    assert selected is schema["properties"]["selected_kb_ids"]
+    assert schema["properties"]["is_compound"]["type"] == "boolean"
 
 
 def test_taxonomy_router_low_certainty_ignore_fails_closed(monkeypatch):
@@ -411,3 +413,20 @@ def test_taxonomy_prompt_marks_user_and_assistant_turns_explicitly():
     assert payload["last_assistant_response"] == "Предыдущий ответ Terra"
     assert payload["current_question"] == "Не помогло"
     assert "current_question" in payload["dialogue_rule"]
+
+
+def test_taxonomy_router_rejects_multiple_answers_without_explicit_compound_intent(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "LLM_ROUTER_MODE", "taxonomy")
+    llm = RecordingLLM(LLMResult(
+        ["kb_registration", "kb_price"],
+        decision="answer",
+        certainty="high",
+        is_compound=False,
+    ))
+    result = asyncio.run(DecisionPipeline(CatalogKB(), llm).decide(
+        _msg("один вопрос"),
+        is_first_message=False,
+    ))
+    assert result.traces[0].decision == Decision.ESCALATE
+    assert result.traces[0].decision_reason == "llm_multiple_answers_without_compound_intent"
+    assert result.actions and result.actions[0].escalate is True

@@ -201,7 +201,7 @@ def test_luna_pro_uses_structured_router_schema_and_omits_temperature(monkeypatc
     class FakeCompletions:
         async def create(self, **kwargs):
             captured.update(kwargs)
-            payload = {"decision": "answer", "selected_kb_ids": ["kb_1"], "certainty": "high"}
+            payload = {"decision": "answer", "selected_kb_ids": ["kb_1"], "is_compound": False, "certainty": "high"}
             message = SimpleNamespace(content=json.dumps(payload))
             choice = SimpleNamespace(message=message)
             return SimpleNamespace(choices=[choice])
@@ -237,8 +237,8 @@ def test_taxonomy_two_pass_passes_approved_answers_and_caps_coverage_at_four(mon
     import sys, types
     calls = []
     responses = [
-        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_2", "kb_3", "kb_4"], "certainty": "high"},
-        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_3"], "certainty": "high"},
+        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_2", "kb_3", "kb_4"], "is_compound": True, "certainty": "high"},
+        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_3"], "is_compound": True, "certainty": "high"},
     ]
 
     class FakeCompletions:
@@ -281,8 +281,8 @@ def test_taxonomy_two_pass_passes_approved_answers_and_caps_coverage_at_four(mon
 def test_taxonomy_two_pass_fails_closed_when_coverage_is_partial(monkeypatch):
     import sys, types
     responses = [
-        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_2"], "certainty": "high"},
-        {"decision": "escalate", "selected_kb_ids": [], "certainty": "high"},
+        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_2"], "is_compound": True, "certainty": "high"},
+        {"decision": "escalate", "selected_kb_ids": [], "is_compound": False, "certainty": "high"},
     ]
     index = 0
 

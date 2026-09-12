@@ -50,22 +50,20 @@ class ResponseComposer:
     @staticmethod
     def choice(labels: list[str]) -> str:
         options = "\n".join(f"{index}. {label}" for index, label in enumerate(labels, 1))
-        return (
-            f"{GREETING}\n\n"
+        body = (
             "Похоже, ваш вопрос ближе к одному из вариантов:\n"
             f"{options}\n\n"
-            "Напишите номер варианта или кратко уточните свой вопрос. "
-            "Если ни один вариант не подходит, просто напишите «оператор» — "
-            "ваш запрос будет передан оператору."
+            "Напишите номер варианта или кратко уточните свой вопрос."
         )
+        return f"{GREETING}\n\n{body}\n\n{OPERATOR_FOOTER}"
 
     @staticmethod
     def rephrase(text: str) -> str:
-        return f"{GREETING}\n\n{text}"
+        return f"{GREETING}\n\n{text}\n\n{OPERATOR_FOOTER}"
 
     @staticmethod
     def oos(text: str) -> str:
-        return f"{GREETING}\n\n{text}"
+        return f"{GREETING}\n\n{text}\n\n{OPERATOR_FOOTER}"
 
     @staticmethod
     def escalation_ack(text: str) -> str:

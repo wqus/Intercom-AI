@@ -781,21 +781,40 @@ class SupportApplication:
             )
             return True
 
+        # `business_answer` contains only approved business content. It must pass
+        # through the response composer before delivery so the user-facing greeting
+        # and operator fallback footer are added exactly once. For genuinely
+        # compound LLM routes, multiple approved answers are therefore merged into
+        # one Intercom message instead of being sent as separate replies.
+        business_answers = list(dict.fromkeys(
+            action.text for action in result.actions
+            if action.kind == "business_answer" and action.text
+        ))
+        reply_texts = list(dict.fromkeys(
+            action.text for action in result.actions
+            if action.kind == "reply" and action.text
+        ))
+
         reply_index = 0
-        for action in result.actions:
-            # `business_answer` is the canonical customer-facing action produced
-            # by the LLM/KB path. It must enter the same transactional outbox as
-            # ordinary `reply` actions; otherwise the pipeline can report
-            # `actions=1` while nothing is ever sent to Intercom.
-            if action.kind in {"reply", "business_answer"} and action.text:
-                reply_index += 1
-                await self._enqueue_reply(
-                    session,
-                    message,
-                    event,
-                    action.text,
-                    suffix=f"reply:{reply_index}",
-                )
+        if business_answers:
+            reply_index += 1
+            await self._enqueue_reply(
+                session,
+                message,
+                event,
+                ResponseComposer.final_answer(business_answers),
+                suffix=f"reply:{reply_index}",
+            )
+
+        for text in reply_texts:
+            reply_index += 1
+            await self._enqueue_reply(
+                session,
+                message,
+                event,
+                text,
+                suffix=f"reply:{reply_index}",
+            )
 
         # A successful non-clarification support outcome ends the clarification
         # flow and resets the counter. IGNORE is different: an acknowledgement such

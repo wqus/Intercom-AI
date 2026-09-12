@@ -20,11 +20,19 @@ def test_final_answer_has_one_greeting_and_one_footer():
     assert "Ответ 1" in text and "Ответ 2" in text
 
 
-def test_choice_has_no_final_operator_footer():
+def test_choice_ends_with_operator_footer():
     text = ResponseComposer.choice(["Первый", "Второй", "Третий"])
     assert text.startswith("Добрый день!")
-    assert "Если этот ответ не помог" not in text
+    assert text.count("Если этот ответ не помог") == 1
+    assert text.endswith("ваш вопрос будет передан оператору.")
     assert "1. Первый" in text
+
+
+def test_rephrase_has_operator_footer():
+    text = ResponseComposer.rephrase("Пожалуйста, уточните этап.")
+    assert text.count("Добрый день!") == 1
+    assert text.count("Если этот ответ не помог") == 1
+    assert text.endswith("ваш вопрос будет передан оператору.")
 
 
 def test_current_kb_answers_are_business_content_only():
@@ -41,6 +49,5 @@ def test_current_kb_answers_are_business_content_only():
 
 def test_choice_offers_operator_fallback():
     text = ResponseComposer.choice(["Первый", "Второй", "Третий"])
-    assert "Если ни один вариант не подходит" in text
     assert "«оператор»" in text
     assert "передан оператору" in text

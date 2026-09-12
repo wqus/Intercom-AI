@@ -20,6 +20,9 @@ class LLMResult:
     unavailable: bool = False
     decision: str | None = None
     certainty: str | None = None
+    # True only for a genuinely compound customer turn with multiple
+    # independent support questions that require multiple approved answers.
+    is_compound: bool | None = None
 
     def __post_init__(self) -> None:
         if self.selected_kb_ids is None:
@@ -130,16 +133,17 @@ def build_system_prompt() -> str:
 
 Верни ровно JSON по схеме:
 - decision: answer | clarify | ignore | escalate
-- selected_kb_ids: один или несколько id только из переданных кандидатов; для answer выбери минимальный набор утверждённых ответов, который вместе полностью покрывает вопрос; для clarify — ровно один id; для ignore/escalate — пусто
+- selected_kb_ids: id только из переданного каталога. Для обычного одиночного запроса выбирай РОВНО ОДИН id. Несколько id допустимы только для нескольких самостоятельных вопросов, которые нельзя закрыть одним intent и которые вместе полностью покрываются утверждёнными ответами; для clarify — ровно один id; для ignore/escalate — пусто
+- is_compound: true только если текущая реплика действительно содержит несколько самостоятельных поддерживаемых вопросов; для обычного запроса — false
 - certainty: high | medium | low
 
-Для `answer` никогда не используй два ответа просто потому, что они тематически близки: каждый выбранный ответ должен покрывать самостоятельную часть текущего запроса. Но если пользователь действительно задал несколько самостоятельных поддерживаемых вопросов, допустимы несколько id — при условии, что ИХ СОВОКУПНОСТЬ полностью закрывает запрос.
+Для `answer` по умолчанию выбирай один intent. НИКОГДА не выбирай несколько ответов только потому, что они тематически близки, находятся в одном семействе или являются возможными альтернативами. Несколько id допустимы только при нескольких самостоятельных вопросах/просьбах в текущем сообщении и только при `is_compound=true`. Если один intent закрывает весь запрос — остальные id НЕ выбирай.
 
 Примеры:
-{"decision":"answer","selected_kb_ids":["kb_033"],"certainty":"high"}
-{"decision":"clarify","selected_kb_ids":["kb_033"],"certainty":"medium"}
-{"decision":"ignore","selected_kb_ids":[],"certainty":"high"}
-{"decision":"escalate","selected_kb_ids":[],"certainty":"high"}
+{"decision":"answer","selected_kb_ids":["kb_033"],"is_compound":false,"certainty":"high"}
+{"decision":"clarify","selected_kb_ids":["kb_033"],"is_compound":false,"certainty":"medium"}
+{"decision":"ignore","selected_kb_ids":[],"is_compound":false,"certainty":"high"}
+{"decision":"escalate","selected_kb_ids":[],"is_compound":false,"certainty":"high"}
 """
 
 
@@ -311,7 +315,7 @@ def build_candidate_selection_system_prompt() -> str:
 - `ignore` допускается только для чистого не-требующего-ответа сообщения;
 - `escalate` используй, если уже на этапе отбора видно, что поддерживаемого intent нет или вопрос явно требует человека;
 - `clarify` используй только если нужен один явно определённый intent, но пользователь не сообщил критический discriminator;
-- для обычного содержательного запроса с подходящими кандидатами используй `answer` и верни 1–4 id-кандидата; это ПРЕДВАРИТЕЛЬНЫЙ набор, а не окончательное решение.
+- для обычного содержательного запроса с подходящими кандидатами используй `answer`, но начинай с ОДНОГО кандидата; добавляй ещё кандидатов только если текущий запрос явно составной и содержит независимые части. Это ПРЕДВАРИТЕЛЬНЫЙ набор, а не окончательное решение.
 
 Нельзя придумывать id.
 """
@@ -424,7 +428,7 @@ class PolzaLLMClient:
         conversation_context: list[dict[str, str]] | None = None,
     ) -> LLMResult:
         """Two-pass taxonomy routing: <=4 candidate intents, then answer coverage check."""
-        catalog = [entry for entry in catalog if entry.get("id")][:len(catalog)]
+        catalog = [entry for entry in catalog if entry.get("id")]
         all_ids = [str(entry["id"]) for entry in catalog]
         selection_schema = {
             "type": "object",
@@ -432,9 +436,10 @@ class PolzaLLMClient:
             "properties": {
                 "decision": {"type": "string", "enum": ["answer", "clarify", "ignore", "escalate"]},
                 "selected_kb_ids": {"type": "array", "items": {"type": "string", "enum": all_ids}, "minItems": 0, "maxItems": 4},
+                "is_compound": {"type": "boolean"},
                 "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
             },
-            "required": ["decision", "selected_kb_ids", "certainty"],
+            "required": ["decision", "selected_kb_ids", "is_compound", "certainty"],
         }
         selection_kwargs = {
             "model": self.model,
@@ -454,6 +459,9 @@ class PolzaLLMClient:
             decision = str(data.get("decision", "")).strip().lower()
             selected = [str(x).strip() for x in data.get("selected_kb_ids", [])]
             certainty = str(data.get("certainty", "")).strip().lower()
+            is_compound = data.get("is_compound")
+            if not isinstance(is_compound, bool):
+                raise ValueError("invalid candidate-selection is_compound")
             if decision not in {"answer", "clarify", "ignore", "escalate"}:
                 raise ValueError("invalid candidate-selection decision")
             if certainty not in {"high", "medium", "low"}:
@@ -465,7 +473,7 @@ class PolzaLLMClient:
             if decision == "clarify" and len(selected) != 1:
                 raise ValueError("clarify requires exactly one candidate")
             if decision != "answer":
-                return LLMResult(selected, escalation=decision == "escalate", decision=decision, certainty=certainty, reason=f"candidate_selection_{decision}")
+                return LLMResult(selected, escalation=decision == "escalate", decision=decision, certainty=certainty, reason=f"candidate_selection_{decision}", is_compound=is_compound)
             if not selected:
                 return LLMResult([], escalation=True, decision="escalate", certainty="high", reason="candidate_selection_empty")
 
@@ -473,7 +481,7 @@ class PolzaLLMClient:
             coverage_candidates = [by_id[kb_id] for kb_id in selected if kb_id in by_id][:4]
             # A clarification candidate has no need for answer coverage; preserve the explicit clarify path.
             if len(coverage_candidates) == 1 and coverage_candidates[0].get("clarification_question") and not str(coverage_candidates[0].get("template_answer") or "").strip():
-                return LLMResult(selected, decision="clarify", certainty="medium", reason="candidate_selection_clarify")
+                return LLMResult(selected, decision="clarify", certainty="medium", reason="candidate_selection_clarify", is_compound=False)
 
             coverage_ids = [str(entry["id"]) for entry in coverage_candidates]
             coverage_schema = {
@@ -482,9 +490,10 @@ class PolzaLLMClient:
                 "properties": {
                     "decision": {"type": "string", "enum": ["answer", "clarify", "ignore", "escalate"]},
                     "selected_kb_ids": {"type": "array", "items": {"type": "string", "enum": coverage_ids}, "minItems": 0, "maxItems": 4},
+                    "is_compound": {"type": "boolean"},
                     "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
                 },
-                "required": ["decision", "selected_kb_ids", "certainty"],
+                "required": ["decision", "selected_kb_ids", "is_compound", "certainty"],
             }
             coverage_kwargs = {
                 "model": self.model,
@@ -502,6 +511,9 @@ class PolzaLLMClient:
             final_decision = str(coverage_data.get("decision", "")).strip().lower()
             final_selected = [str(x).strip() for x in coverage_data.get("selected_kb_ids", [])]
             final_certainty = str(coverage_data.get("certainty", "")).strip().lower()
+            final_is_compound = coverage_data.get("is_compound")
+            if not isinstance(final_is_compound, bool):
+                raise ValueError("invalid coverage is_compound")
             if final_decision not in {"answer", "clarify", "ignore", "escalate"}:
                 raise ValueError("invalid coverage decision")
             if final_certainty not in {"high", "medium", "low"}:
@@ -511,13 +523,18 @@ class PolzaLLMClient:
             if final_decision == "answer":
                 if not 1 <= len(final_selected) <= 4 or final_certainty != "high":
                     raise ValueError("answer coverage requires 1-4 candidates and high certainty")
+                if len(final_selected) > 1 and not final_is_compound:
+                    raise ValueError("multiple final intents require is_compound=true")
             elif final_decision == "clarify":
                 if len(final_selected) != 1:
                     raise ValueError("coverage clarify requires one candidate")
             elif final_selected:
                 raise ValueError("ignore/escalate coverage must not select ids")
-            logger.info("taxonomy_coverage | candidate_count=%d | selected_count=%d | decision=%s", len(coverage_candidates), len(final_selected), final_decision)
-            return LLMResult(final_selected, escalation=final_decision == "escalate", decision=final_decision, certainty=final_certainty, reason="coverage_checked")
+            logger.info(
+                "taxonomy_coverage | candidate_count=%d | selected_count=%d | decision=%s | compound=%s",
+                len(coverage_candidates), len(final_selected), final_decision, final_is_compound,
+            )
+            return LLMResult(final_selected, escalation=final_decision == "escalate", decision=final_decision, certainty=final_certainty, reason="coverage_checked", is_compound=final_is_compound)
         except Exception as exc:
             logger.exception("taxonomy two-pass routing failed: %s", exc)
             return LLMResult([], escalation=True, unavailable=True, decision="escalate", certainty="high", reason="llm_unavailable_or_invalid_output")

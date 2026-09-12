@@ -114,12 +114,13 @@ class DecisionPipeline:
         trace.automated = True
         logger.info(
             "llm_router_result | taxonomy=%s | elapsed_ms=%.1f | decision=%s | "
-            "selected_kb_ids=%s | certainty=%s | unavailable=%s | escalation=%s | reason=%s",
+            "selected_kb_ids=%s | certainty=%s | compound=%s | unavailable=%s | escalation=%s | reason=%s",
             taxonomy_mode,
             llm_elapsed_ms,
             getattr(result, "decision", None),
             list(getattr(result, "selected_kb_ids", []) or []),
             getattr(result, "certainty", None),
+            getattr(result, "is_compound", None),
             bool(getattr(result, "unavailable", False)),
             bool(getattr(result, "escalation", False)),
             getattr(result, "reason", None),
@@ -176,6 +177,11 @@ class DecisionPipeline:
         # JSON-schema constrains the provider, but application-level invariants
         # must still be enforced for mocks, legacy adapters and provider quirks.
         selected_ids = [str(x).strip() for x in (result.selected_kb_ids or []) if str(x).strip()]
+        if taxonomy_mode and result.decision == "answer" and len(selected_ids) > 1 and getattr(result, "is_compound", None) is not True:
+            trace.decision = Decision.ESCALATE
+            trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER
+            trace.decision_reason = "llm_multiple_answers_without_compound_intent"
+            return trace, [OutboundAction("reply", self._escalation_reply(), True)]
         if taxonomy_mode and result.decision == "answer" and str(getattr(result, "certainty", "")).lower() != "high":
             trace.decision = Decision.ESCALATE
             trace.escalation_reason = EscalationReason.LLM_CANNOT_ANSWER

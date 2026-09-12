@@ -233,6 +233,66 @@ def test_business_answer_is_enqueued_to_outbox(monkeypatch):
         asyncio.run(app.handle(FakeSession(), event, msg))
         assert len(outbox.actions) == 1
         assert outbox.actions[0]["action_type"] == "intercom_reply"
-        assert outbox.actions[0]["payload"]["text"] == "Одобренный ответ из KB."
+        text = outbox.actions[0]["payload"]["text"]
+        assert "Одобренный ответ из KB." in text
+        assert text.count("Добрый день!") == 1
+        assert text.count("Если этот ответ не помог") == 1
     finally:
         module.StateRepository, module.InteractionRepository, module.EscalatedConversationRepository = originals
+
+
+def test_multiple_business_answers_are_merged_into_one_customer_reply(monkeypatch):
+    import asyncio
+    from app.domain.enums import ConversationStateKind
+    import app.application.support_service as module
+
+    class FakePipeline:
+        async def decide(self, message, **kwargs):
+            return ProcessingResult(
+                traces=[DecisionTrace(decision=Decision.ANSWER_LLM, question=message.text, llm_used=True)],
+                actions=[
+                    OutboundAction("business_answer", "Ответ A.", False),
+                    OutboundAction("business_answer", "Ответ B.", False),
+                ],
+            )
+
+    class FakeState:
+        state = ConversationStateKind.IDLE
+        data = {}
+
+    class FakeStates:
+        def __init__(self, session): self.state = FakeState()
+        async def get(self, entity_id, *, for_update=False): return self.state
+        async def replace(self, entity_id, state, data): self.state.state = state; self.state.data = data
+
+    class FakeEscalations:
+        async def is_escalated(self, entity_id): return False
+
+    class FakeInteraction:
+        async def add_many(self, *args, **kwargs): pass
+
+    class FakeOutbox:
+        def __init__(self): self.actions = []
+        async def enqueue(self, **kwargs): self.actions.append(kwargs); return True
+
+    class FakeSession:
+        async def flush(self): pass
+
+    originals = (module.StateRepository, module.InteractionRepository, module.EscalatedConversationRepository)
+    module.StateRepository = FakeStates
+    module.InteractionRepository = lambda session: FakeInteraction()
+    module.EscalatedConversationRepository = lambda session: FakeEscalations()
+    try:
+        outbox = FakeOutbox()
+        app = SupportApplication(FakePipeline(), object(), None, outbox)
+        msg = InboundMessage("evt-m", "key", "topic", "conv-multi", Channel.CONVERSATION, "два вопроса")
+        event = type("Event", (), {"id": 1000, "event_order_at": None})()
+        asyncio.run(app.handle(FakeSession(), event, msg))
+        assert len(outbox.actions) == 1
+        text = outbox.actions[0]["payload"]["text"]
+        assert "Ответ A." in text and "Ответ B." in text
+        assert text.count("Добрый день!") == 1
+        assert text.count("Если этот ответ не помог") == 1
+    finally:
+        module.StateRepository, module.InteractionRepository, module.EscalatedConversationRepository = originals
+
