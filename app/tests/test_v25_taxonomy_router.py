@@ -161,12 +161,12 @@ def test_taxonomy_router_uses_previous_user_and_assistant_messages(monkeypatch):
     ]
 
 
-def test_taxonomy_router_rejects_multiple_answer_ids(monkeypatch):
+def test_taxonomy_router_accepts_multiple_answer_ids_after_coverage(monkeypatch):
     monkeypatch.setattr(config_module.settings, "LLM_ROUTER_MODE", "taxonomy")
     llm = RecordingLLM(LLMResult(["kb_registration", "kb_price"], decision="answer", certainty="high"))
     result = asyncio.run(DecisionPipeline(CatalogKB(), llm).decide(_msg("код"), is_first_message=False))
-    assert result.traces[0].decision == Decision.ESCALATE
-    assert result.actions and result.actions[0].escalate is True
+    assert result.traces[0].decision == Decision.ANSWER_LLM
+    assert "Ответ про регистрацию." in result.actions[0].text or "Ответ про регистрацию." in result.actions[0].text
 
 
 def test_taxonomy_catalog_exposes_answerability_metadata():
@@ -269,7 +269,7 @@ def test_taxonomy_schema_is_single_intent_contract(monkeypatch):
     assert result.decision == "answer"
     schema = captured["response_format"]["json_schema"]["schema"]
     selected = schema["properties"]["selected_kb_ids"]
-    assert selected["maxItems"] == 1
+    assert selected["maxItems"] == 4
     assert selected["minItems"] == 0
 
 
@@ -295,7 +295,7 @@ def test_pending_context_reaches_llm_instead_of_deterministic_ignore(monkeypatch
     assert len(llm.calls) == 1
 
 
-def test_taxonomy_answer_schema_is_single_intent_and_full_catalog_is_sent(monkeypatch):
+def test_taxonomy_answer_schema_allows_up_to_four_final_intents_and_full_catalog_is_sent(monkeypatch):
     monkeypatch.setattr(config_module.settings, "LLM_ROUTER_MODE", "taxonomy")
     class RecordingSchemaLLM(RecordingLLM):
         pass
@@ -364,25 +364,50 @@ def test_taxonomy_catalog_is_compact_without_losing_routing_contract():
     # Use the repository KB fixture directly without initializing embeddings.
     kb_data = json.loads(open("data/knowledge_base.json", encoding="utf-8").read())
     rendered = json.dumps({"intent_catalog": [_intent_catalog_entry(e) for e in kb_data]}, ensure_ascii=False, separators=(",", ":"))
-    assert len(kb_data) == 45
-    assert len(rendered) < 12500
+    assert len(kb_data) == 44  # raw fixture includes the server-side DEFAULT record
+    assert len(rendered) < 25000
     assert '"template_answer"' not in rendered
-    assert '"when_to_use"' not in rendered
-    assert '"when_not_to_use"' not in rendered
+    assert '"use_when"' in rendered
+    assert '"do_not_use_when"' in rendered
+    assert '"constraints"' in rendered
+    assert '"confused_with"' in rendered
     for item in kb_data:
         compact = _intent_catalog_entry(item)
         assert compact["id"] == item["id"]
         assert compact["name"]
+        assert "definition" in compact
         assert "answer" in compact and "clarify" in compact
 
 
 def test_taxonomy_prompt_wire_format_is_compact():
     import json
     kb_data = json.loads(open("data/knowledge_base.json", encoding="utf-8").read())
-    payload = build_taxonomy_user_message("код", kb_data, [])
+    kb = __import__("app.infrastructure.ai.knowledge_base", fromlist=["KnowledgeBase"]).KnowledgeBase(
+        path="data/knowledge_base.json", enable_retrieval=False
+    )
+    catalog_entries = kb.intent_catalog_for_llm()
+    payload = build_taxonomy_user_message("код", catalog_entries, [])
     catalog = json.loads(payload)["intent_catalog"]
-    assert len(catalog) == 45
-    assert len(payload) < 13000
+    assert len(catalog) == 43
+    assert len(payload) < 25500
     assert "template_answer" not in payload
-    assert "when_to_use" not in payload
-    assert "when_not_to_use" not in payload
+    assert "use_when" in payload
+    assert "do_not_use_when" in payload
+    assert "constraints" in payload
+
+
+def test_taxonomy_prompt_marks_user_and_assistant_turns_explicitly():
+    import json
+    payload = json.loads(build_taxonomy_user_message(
+        "Не помогло",
+        [{"id": "kb_1", "category": "Тест", "definition": "Тест", "template_answer": "Да"}],
+        [
+            {"role": "user", "text": "Мой первый вопрос"},
+            {"role": "assistant", "text": "Предыдущий ответ Terra"},
+        ],
+    ))
+    assert payload["dialogue"][0]["role"] == "USER"
+    assert payload["dialogue"][1]["role"] == "ASSISTANT"
+    assert payload["last_assistant_response"] == "Предыдущий ответ Terra"
+    assert payload["current_question"] == "Не помогло"
+    assert "current_question" in payload["dialogue_rule"]

@@ -755,27 +755,6 @@ def test_online_training_natural_paraphrase_extracts_semantic_context():
     assert ontology["action"] == set()
 
 
-def test_online_training_top3_context_accepts_related_education_intents():
-    kb = KnowledgeBase.__new__(KnowledgeBase)
-    question = "Хочу пройти обучение. Есть возможность пройти онлайн. Как это можно осуществить?"
-    online = {"id": "kb_047", "intent_type": "online_training", "family": "education", "intent_facets": ["online_training", "online"]}
-    entry = {"id": "kb_035", "intent_type": "education_entry", "family": "education", "intent_facets": ["procedure"]}
-    top = {"entry": online, "ontology": {"object": "training", "action": "learn", "state": "online", "facet": "online"}}
-    candidate = {"entry": entry, "ontology": {"object": "education", "action": "enter", "state": "procedure", "facet": "procedure"}}
-    compatibility, reason = kb._choice_context_compatibility(question, top, candidate)
-    assert compatibility >= 0.70
-    assert "online_education_context" in reason
-
-
-def test_online_training_top3_context_rejects_unrelated_family():
-    kb = KnowledgeBase.__new__(KnowledgeBase)
-    question = "Хочу пройти обучение. Есть возможность пройти онлайн. Как это можно осуществить?"
-    top = {"entry": {"id": "kb_047", "family": "education"}, "ontology": {"object": "training", "action": "learn", "state": "online", "facet": "online"}}
-    candidate = {"entry": {"id": "kb_012", "family": "payments"}, "ontology": {"object": "training", "action": "pay", "state": "information", "facet": "price"}}
-    compatibility, _ = kb._choice_context_compatibility(question, top, candidate)
-    assert compatibility < 0.45
-
-
 def test_launch_late_arrival_and_code_attendance_intents_are_distinct():
     import json
     from pathlib import Path

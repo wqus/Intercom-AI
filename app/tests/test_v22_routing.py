@@ -260,14 +260,10 @@ def test_online_training_natural_query_bypasses_generic_education_hard_rule():
     )
 
 
-def test_online_training_answer_is_exact_and_routable():
+def test_online_training_dedicated_category_removed():
     data = json.loads(Path("data/knowledge_base.json").read_text())
-    entry = next(item for item in data if item.get("id") == "kb_047")
-    assert entry["template_answer"] == (
-        "Список актуальных онлайн-школ опубликован в данном Telegram-канале. https://t.me/terraonlinescho\n\n"
-        "Пожалуйста, ознакомьтесь с доступными направлениями и выберите интересующую вас школу. "
-        "Все инструкции по записи также размещены в канале."
-    )
+    assert not any(item.get("id") == "kb_047" for item in data)
+
 
 
 def test_online_mentorship_stays_separate_from_online_training():

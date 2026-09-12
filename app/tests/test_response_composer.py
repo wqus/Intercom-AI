@@ -9,6 +9,8 @@ def test_clean_business_answer_removes_legacy_wrappers():
         "Мы повторно рассмотрим ваше обращение и ответим вам в этом чате."
     )
     assert clean_business_answer(text) == "Ответ на вопрос."
+    new_footer = ResponseComposer.final_answer(["Ответ на вопрос."])
+    assert new_footer.endswith("ваш вопрос будет передан оператору.")
 
 
 def test_final_answer_has_one_greeting_and_one_footer():

@@ -7,6 +7,7 @@ import time
 import httpx
 
 from app.core.config import settings
+from app.infrastructure.persistence.repository import ConversationTurnRepository
 from app.infrastructure.persistence.outbox import OutboundRepository
 from app.infrastructure.intercom.client import IntercomGateway
 from app.infrastructure.telegram.notifier import TelegramNotifier
@@ -31,6 +32,12 @@ class OutboxWorker:
         self._stop.set()
         if self._task:
             await self._task
+
+    async def _sync_turn(self, session, action, status: str) -> None:
+        if action.action_type != "intercom_reply" or not hasattr(session, "scalar"):
+            return
+        await ConversationTurnRepository(session).mark_action_status(str(action.action_key), status)
+        await session.commit()
 
     async def _deliver(self, action) -> tuple[str, str | None]:
         payload = action.payload or {}
@@ -102,7 +109,9 @@ class OutboxWorker:
                     confirmed = False
                 if confirmed:
                     await repo.mark_sent(action)
+                    await self._sync_turn(getattr(repo, "session", None), action, "sent")
                 else:
+                    await self._sync_turn(getattr(repo, "session", None), action, "unknown")
                     await repo.mark_unknown(
                         action,
                         f"Intercom {status_code} after reply POST; delivery requires reconciliation",
@@ -125,6 +134,8 @@ class OutboxWorker:
 
         if 400 <= status_code <= 499:
             await repo.mark_failed(action, f"Provider returned HTTP {status_code}: {exc}")
+            if action.action_type == "intercom_reply":
+                await self._sync_turn(getattr(repo, "session", None), action, "failed")
             logger.error(
                 "outbox_delivery_permanent_failure | action=%s | type=%s | channel=%s | status=%s",
                 action.id, action_type, channel, status_code,
@@ -151,8 +162,10 @@ class OutboxWorker:
                             status, error = await self._deliver(action)
                             if status == "sent":
                                 await repo.mark_sent(action)
+                                await self._sync_turn(session, action, "sent")
                             elif status == "skipped":
                                 await repo.mark_skipped(action, error or "skipped")
+                                await self._sync_turn(session, action, "skipped")
                             else:
                                 await repo.mark_retry(action, error or "delivery failed")
                         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
@@ -161,6 +174,7 @@ class OutboxWorker:
                             # the operator signal/metadata is worse than a duplicate.
                             if action.action_type == "intercom_reply":
                                 await repo.mark_unknown(action, str(exc))
+                                await self._sync_turn(session, action, "unknown")
                                 logger.error(
                                     "outbox_delivery_unknown | action=%s | type=%s | entity=%s | error=%s",
                                     action.id, action.action_type, action.entity_id, exc,
@@ -179,6 +193,7 @@ class OutboxWorker:
                             # reconciliation rather than marking it sent.
                             if action.action_type == "intercom_reply":
                                 await repo.mark_unknown(action, str(exc))
+                                await self._sync_turn(session, action, "unknown")
                             else:
                                 await repo.mark_retry(action, str(exc))
                             logger.exception("Outbox delivery failed action=%s", action.id)

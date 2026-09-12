@@ -95,6 +95,34 @@ class OutboundAction(Base):
     )
 
 
+
+
+class ConversationTurn(Base):
+    """Durable conversational transcript used to preserve the exact user/assistant turns.
+
+    Intercom remains the source of truth for delivery, while this table preserves the
+    bot's own answers and gives the LLM an explicit role-labelled transcript on every turn.
+    """
+
+    __tablename__ = "conversation_turns"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entity_id: Mapped[str] = mapped_column(String(128), index=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="sent", index=True)
+    event_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    provider_part_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    action_key: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    dedup_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    turn_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_conversation_turns_entity_turn", "entity_id", "turn_at", "id"),
+    )
+
 class SupportInteraction(Base):
     __tablename__ = "support_interactions"
     id: Mapped[int] = mapped_column(primary_key=True)

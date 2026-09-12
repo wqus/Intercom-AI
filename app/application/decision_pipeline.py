@@ -1,7 +1,6 @@
 import time
 import logging
 import hashlib
-import time
 from app.domain.enums import Decision, EscalationReason
 from app.domain.models import DecisionTrace, InboundMessage, OutboundAction, ProcessingResult
 from app.domain.policy import escalation_ack, rephrase_prompt, high_risk_reply
@@ -204,7 +203,7 @@ class DecisionPipeline:
             return trace, [OutboundAction("reply", self._escalation_reply(), True)]
         if result.decision == "answer":
             valid_answer_cardinality = (
-                len(selected_ids) == 1
+                1 <= len(selected_ids) <= 4
                 if taxonomy_mode
                 else 1 <= len(selected_ids) <= 3
             )

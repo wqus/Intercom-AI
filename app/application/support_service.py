@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 
 from app.domain.enums import Channel, ConversationStateKind, Decision, EscalationReason
 from app.core.config import settings
@@ -15,11 +16,12 @@ from app.infrastructure.persistence.repository import (
     EscalatedConversationRepository,
     StateRepository,
     InteractionRepository,
+    ConversationTurnRepository,
 )
 from app.infrastructure.persistence.models import InboundEvent
 from app.infrastructure.persistence.outbox import OutboundRepository
 from app.infrastructure.telegram.notifier import TelegramNotifier
-from app.infrastructure.ai.knowledge_base import contains_operator_request
+from app.infrastructure.ai.knowledge_base import contains_operator_request, is_non_query_message
 
 logger = logging.getLogger("support_service")
 
@@ -53,8 +55,20 @@ class SupportApplication:
     ) -> None:
         if not text:
             return
+        action_key = f"event:{event.id}:{suffix}"
+        turn_id = None
+        if hasattr(session, "scalar") and hasattr(session, "flush"):
+            turn = await ConversationTurnRepository(session).ensure_assistant_turn(
+                entity_id=message.entity_id,
+                channel=message.channel.value,
+                text=text,
+                event_id=event.id,
+                action_key=action_key,
+                status="pending",
+            )
+            turn_id = turn.id
         await self._outbox(session).enqueue(
-            action_key=f"event:{event.id}:{suffix}",
+            action_key=action_key,
             action_type="intercom_reply",
             entity_id=message.entity_id,
             channel=message.channel.value,
@@ -63,6 +77,8 @@ class SupportApplication:
                 "entity_id": message.entity_id,
                 "channel": message.channel.value,
                 "text": text,
+                "_conversation_turn_id": turn_id,
+                "_conversation_turn_action_key": action_key,
             },
         )
 
@@ -208,7 +224,6 @@ class SupportApplication:
             # Acknowledgements must never turn an exhausted clarification flow into
             # a pointless operator hand-off. They are not substantive turns; keep the
             # pending state intact and wait for the user's next real answer.
-            from app.infrastructure.ai.knowledge_base import is_non_query_message
             if is_non_query_message(message.text):
                 return True
             # The initial clarification/rephrase already counts as request #1.
@@ -266,7 +281,6 @@ class SupportApplication:
             # Acknowledgements such as "спасибо" are not a new support request.
             # CHOOSING is necessarily a later conversation turn, so the same
             # curated ignore policy applies here without consuming menu state.
-            from app.infrastructure.ai.knowledge_base import is_non_query_message
             if is_non_query_message(message.text):
                 return True
 
@@ -436,6 +450,28 @@ class SupportApplication:
             state.data = state_data
             await session.flush()
 
+        provider_part_id = None
+        if isinstance(message.raw, dict):
+            provider_part_id = message.raw.get("_provider_part_id")
+        try:
+            turn_at = datetime.fromtimestamp(int(message.updated_at), tz=timezone.utc) if str(message.updated_at or "").isdigit() else None
+        except (TypeError, ValueError, OverflowError):
+            turn_at = None
+        transcript_repo = None
+        # The production AsyncSession supports scalar/flush. Lightweight unit-test
+        # doubles from older releases do not; transcript persistence is additive and
+        # must never become a prerequisite for routing.
+        if hasattr(session, "scalar") and hasattr(session, "flush"):
+            transcript_repo = ConversationTurnRepository(session)
+            await transcript_repo.ensure_user_turn(
+                entity_id=message.entity_id,
+                channel=message.channel.value,
+                text=message.text,
+                event_id=event.id,
+                provider_part_id=str(provider_part_id) if provider_part_id else None,
+                turn_at=turn_at,
+            )
+
         if contains_operator_request(message.text):
             await self._escalate(
                 session,
@@ -500,7 +536,7 @@ class SupportApplication:
                     message.entity_id,
                     current_part_id=str(provider_part_id) if provider_part_id else None,
                     before_epoch=before_epoch,
-                    limit=12,
+                    limit=int(getattr(settings, "LLM_CONTEXT_TURNS", 50)),
                 )
                 if fetched:
                     context = fetched
@@ -514,7 +550,7 @@ class SupportApplication:
                     message.entity_id,
                     current_part_id=str(provider_part_id) if provider_part_id else None,
                     before_epoch=before_epoch,
-                    limit=12,
+                    limit=int(getattr(settings, "LLM_CONTEXT_TURNS", 50)),
                 )
                 if fetched:
                     context = fetched
@@ -532,10 +568,33 @@ class SupportApplication:
                 message.entity_id, event.id, message.channel.value, type(exc).__name__, exc,
             )
 
-        # Preserve chronological conversation context and add explicit pending
-        # state metadata for clarification/menu continuations. The metadata is
-        # never treated as customer-authored text by the prompt.
-        context = list(context)[-7:] + self._routing_context_for_state(state)
+        # Persist provider history locally once, then use one durable transcript as
+        # the canonical LLM context. This gives the model explicit USER/ASSISTANT
+        # turns and preserves the exact bot answers across subsequent requests.
+        durable_context: list[dict[str, str]] = []
+        if transcript_repo is not None:
+            current_context_count = await transcript_repo.count(message.entity_id)
+            if current_context_count <= 1 and context:
+                await transcript_repo.import_context(
+                    entity_id=message.entity_id,
+                    channel=message.channel.value,
+                    context=context,
+                    current_turn_at=turn_at,
+                )
+            durable_context = await transcript_repo.recent_context(
+                message.entity_id, limit=int(getattr(settings, "LLM_CONTEXT_TURNS", 50))
+            )
+            # Exclude the current user turn; it is supplied separately as
+            # `current_question`, so the prompt has an unambiguous boundary.
+            if durable_context:
+                last = durable_context[-1]
+                if last.get("role") == "user" and last.get("text") == message.text:
+                    durable_context = durable_context[:-1]
+
+        # If transcript persistence is unavailable (test adapter or a legacy DB),
+        # retain the provider/webhook context rather than making it mandatory.
+        context = (durable_context if transcript_repo is not None else list(context))
+        context = context[-int(getattr(settings, "LLM_CONTEXT_TURNS", 50)):] + self._routing_context_for_state(state)
         try:
             result = await self.pipeline.decide(
                 message,

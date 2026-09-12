@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     STRICT_TEMPLATE: bool = True
     WORKER_POLL_SECONDS: float = 0.5
     MAX_CLARIFICATION_ATTEMPTS: int = 2
+    LLM_CONTEXT_TURNS: int = 50
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
 
 settings = Settings()

@@ -89,10 +89,38 @@ async def ensure_outbound_actions(conn) -> None:
     ))
 
 
+async def ensure_conversation_turns(conn) -> None:
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS conversation_turns (
+            id SERIAL PRIMARY KEY,
+            entity_id VARCHAR(128) NOT NULL,
+            channel VARCHAR(32) NOT NULL,
+            role VARCHAR(16) NOT NULL,
+            text TEXT NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'sent',
+            event_id INTEGER NULL,
+            provider_part_id VARCHAR(128) NULL,
+            action_key VARCHAR(255) UNIQUE NULL,
+            dedup_key VARCHAR(255) NOT NULL UNIQUE,
+            turn_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    await conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_conversation_turns_entity_turn "
+        "ON conversation_turns (entity_id, turn_at, id)"
+    ))
+    await conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_conversation_turns_entity_status "
+        "ON conversation_turns (entity_id, status)"
+    ))
+
+
 async def ensure_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await ensure_escalation_blocklist(conn)
         await ensure_outbound_actions(conn)
+        await ensure_conversation_turns(conn)
         await conn.execute(text(
             "ALTER TABLE inbound_events ADD COLUMN IF NOT EXISTS event_order_at INTEGER NULL"
         ))

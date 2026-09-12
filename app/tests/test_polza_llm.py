@@ -31,7 +31,7 @@ def test_polza_client_schema_is_dynamic(monkeypatch):
     assert result.selected_kb_ids == ["kb_2"]
     assert result.certainty == "high"
     schema = captured["response_format"]["json_schema"]["schema"]
-    assert schema["properties"]["decision"]["enum"] == ["answer", "clarify", "escalate"]
+    assert schema["properties"]["decision"]["enum"] == ["answer", "clarify", "ignore", "escalate"]
     assert schema["properties"]["certainty"]["enum"] == ["high", "medium", "low"]
     assert schema["properties"]["selected_kb_ids"]["items"]["enum"] == ["kb_1", "kb_2"]
     assert "answer" not in schema["properties"]
@@ -223,6 +223,91 @@ def test_luna_pro_uses_structured_router_schema_and_omits_temperature(monkeypatc
     assert result.certainty == "high"
     assert captured["response_format"]["json_schema"]["schema"]["properties"]["certainty"]
     assert "temperature" not in captured
+    # Taxonomy mode is intentionally two-pass: the first call receives the full
+    # taxonomy/history, the second receives only the selected candidates and answers.
     payload = json.loads(captured["messages"][1]["content"])
-    assert payload["conversation_history"][0]["text"] == "Не могу зарегистрироваться"
+    assert payload["current_question"] == "код"
+    assert payload["candidates"][0]["id"] == "kb_1"
+    assert payload["candidates"][0]["approved_answer"] == ""
+    assert captured["response_format"]["json_schema"]["name"] == "terra_answer_coverage"
 
+
+
+def test_taxonomy_two_pass_passes_approved_answers_and_caps_coverage_at_four(monkeypatch):
+    import sys, types
+    calls = []
+    responses = [
+        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_2", "kb_3", "kb_4"], "certainty": "high"},
+        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_3"], "certainty": "high"},
+    ]
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            payload = responses[len(calls) - 1]
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    client = PolzaLLMClient("key", "openai/gpt-5.6-luna-pro")
+    catalog = [
+        {"id": f"kb_{i}", "category": f"Категория {i}", "definition": "D", "template_answer": f"Ответ {i}", "when_to_use": ["X"]}
+        for i in range(1, 7)
+    ]
+    result = asyncio.run(client.classify("compound", catalog, taxonomy_mode=True))
+
+    assert result.decision == "answer"
+    assert result.selected_kb_ids == ["kb_1", "kb_3"]
+    assert len(calls) == 2
+
+    first_payload = json.loads(calls[0]["messages"][1]["content"])
+    assert len(first_payload["intent_catalog"]) == 6
+    first_schema = calls[0]["response_format"]["json_schema"]["schema"]
+    assert first_schema["properties"]["selected_kb_ids"]["maxItems"] == 4
+
+    coverage_payload = json.loads(calls[1]["messages"][1]["content"])
+    assert len(coverage_payload["candidates"]) == 4
+    assert {item["id"] for item in coverage_payload["candidates"]} == {"kb_1", "kb_2", "kb_3", "kb_4"}
+    assert coverage_payload["candidates"][0]["approved_answer"] == "Ответ 1"
+    coverage_schema = calls[1]["response_format"]["json_schema"]["schema"]
+    assert coverage_schema["properties"]["selected_kb_ids"]["maxItems"] == 4
+
+
+def test_taxonomy_two_pass_fails_closed_when_coverage_is_partial(monkeypatch):
+    import sys, types
+    responses = [
+        {"decision": "answer", "selected_kb_ids": ["kb_1", "kb_2"], "certainty": "high"},
+        {"decision": "escalate", "selected_kb_ids": [], "certainty": "high"},
+    ]
+    index = 0
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            nonlocal index
+            payload = responses[index]
+            index += 1
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    client = PolzaLLMClient("key", "openai/gpt-5.6-luna-pro")
+    result = asyncio.run(client.classify(
+        "compound",
+        [
+            {"id": "kb_1", "category": "A", "template_answer": "Ответ A"},
+            {"id": "kb_2", "category": "B", "template_answer": "Ответ B"},
+        ],
+        taxonomy_mode=True,
+    ))
+    assert result.decision == "escalate"
+    assert result.selected_kb_ids == []

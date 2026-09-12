@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select, update, func
+from sqlalchemy import select, update, func, desc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.infrastructure.persistence.models import (
@@ -7,6 +7,7 @@ from app.infrastructure.persistence.models import (
     ConversationState,
     EscalatedConversation,
     SupportInteraction,
+    ConversationTurn,
 )
 from app.domain.enums import EventStatus, ConversationStateKind
 
@@ -288,4 +289,128 @@ class InteractionRepository:
                 escalation_reason=trace.escalation_reason.value if trace.escalation_reason else None,
                 decision_reason=trace.decision_reason,
             ))
+        await self.session.flush()
+
+
+class ConversationTurnRepository:
+    """Persist and retrieve a role-labelled transcript for LLM routing."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def ensure_user_turn(
+        self,
+        *,
+        entity_id: str,
+        channel: str,
+        text: str,
+        event_id: int | None,
+        provider_part_id: str | None,
+        turn_at: datetime | None = None,
+        dedup_key: str | None = None,
+    ) -> ConversationTurn:
+        key = dedup_key or (
+            f"provider:{provider_part_id}" if provider_part_id
+            else f"event:{event_id}:user"
+        )
+        existing = await self.session.scalar(select(ConversationTurn).where(ConversationTurn.dedup_key == key))
+        if existing:
+            return existing
+        row = ConversationTurn(
+            entity_id=entity_id, channel=channel, role="user", text=str(text or "").strip(),
+            status="sent", event_id=event_id, provider_part_id=provider_part_id,
+            dedup_key=key, turn_at=turn_at or datetime.now(timezone.utc),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def ensure_assistant_turn(
+        self,
+        *,
+        entity_id: str,
+        channel: str,
+        text: str,
+        event_id: int | None,
+        action_key: str,
+        status: str = "pending",
+    ) -> ConversationTurn:
+        key = f"assistant:{action_key}"
+        existing = await self.session.scalar(select(ConversationTurn).where(ConversationTurn.dedup_key == key))
+        if existing:
+            return existing
+        row = ConversationTurn(
+            entity_id=entity_id, channel=channel, role="assistant", text=str(text or "").strip(),
+            status=status, event_id=event_id, action_key=action_key, dedup_key=key,
+            turn_at=datetime.now(timezone.utc),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def import_context(
+        self,
+        *,
+        entity_id: str,
+        channel: str,
+        context: list[dict[str, str]],
+        current_turn_at: datetime | None = None,
+    ) -> None:
+        """Seed the local transcript from provider history on first use.
+
+        Provider context is already chronological. Synthetic timestamps keep that
+        ordering while marking records as imported so they never masquerade as
+        fresh webhook events.
+        """
+        base = current_turn_at or datetime.now(timezone.utc)
+        total = len(context or [])
+        previous_signature = None
+        for idx, item in enumerate(context or []):
+            role = str(item.get("role") or "").strip().lower()
+            text = str(item.get("text") or "").strip()
+            if role not in {"user", "assistant"} or not text:
+                continue
+            signature = (role, text)
+            if signature == previous_signature:
+                continue
+            previous_signature = signature
+            synthetic_at = base - timedelta(seconds=max(1, total - idx))
+            import_hash = __import__("hashlib").sha256(
+                f"{entity_id}|{channel}|{role}|{idx}|{text}".encode("utf-8")
+            ).hexdigest()
+            key = f"import:{import_hash}"
+            existing = await self.session.scalar(select(ConversationTurn).where(ConversationTurn.dedup_key == key))
+            if existing:
+                continue
+            self.session.add(ConversationTurn(
+                entity_id=entity_id, channel=channel, role=role, text=text,
+                status="sent", dedup_key=key, turn_at=synthetic_at,
+            ))
+        await self.session.flush()
+
+    async def count(self, entity_id: str) -> int:
+        result = await self.session.scalar(
+            select(func.count(ConversationTurn.id)).where(ConversationTurn.entity_id == entity_id)
+        )
+        return int(result or 0)
+
+    async def recent_context(self, entity_id: str, *, limit: int = 24) -> list[dict[str, str]]:
+        rows = (await self.session.execute(
+            select(ConversationTurn)
+            .where(
+                (ConversationTurn.entity_id == entity_id)
+                & (ConversationTurn.status == "sent")
+            )
+            .order_by(desc(ConversationTurn.turn_at), desc(ConversationTurn.id))
+            .limit(max(1, int(limit)))
+        )).scalars().all()
+        rows.reverse()
+        return [{"role": row.role, "text": row.text} for row in rows]
+
+    async def mark_action_status(self, action_key: str, status: str) -> None:
+        await self.session.execute(
+            update(ConversationTurn)
+            .where(ConversationTurn.action_key == action_key)
+            .values(status=status)
+        )
         await self.session.flush()
