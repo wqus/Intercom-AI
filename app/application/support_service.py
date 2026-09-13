@@ -341,19 +341,48 @@ class SupportApplication:
 
     @staticmethod
     def _routing_context_for_state(state) -> list[dict[str, str]]:
-        """Expose pending state to the semantic router without changing domain APIs.
+        """Expose pending state and compact answered-intent memory to the router.
 
-        State is routing metadata, not customer-authored conversation text. It is
-        therefore represented explicitly and kept compact so the LLM can use the
-        pending question/menu without confusing it with a user message.
+        State metadata is explicitly separated from customer-authored USER/ASSISTANT
+        turns. The memory helps the router avoid repeating already answered content,
+        while still allowing a new question within the same intent.
         """
         try:
             kind = ConversationStateKind(state.state)
         except (TypeError, ValueError):
             return []
         data = state.data if isinstance(state.data, dict) else {}
+        result: list[dict[str, str]] = []
+
+        memory = data.get("_routing_memory")
+        if isinstance(memory, list):
+            compact: list[dict[str, str]] = []
+            for item in memory[-8:]:
+                if not isinstance(item, dict):
+                    continue
+                kb_id = str(item.get("kb_id") or "").strip()
+                question = str(item.get("question") or "").strip()
+                answer = str(item.get("answer") or "").strip()
+                if kb_id and answer:
+                    compact.append({
+                        "kb_id": kb_id,
+                        "question": question[-240:],
+                        "answer": answer[-500:],
+                    })
+            if compact:
+                import json
+                result.append({
+                    "role": "system",
+                    "text": (
+                        "ROUTING_MEMORY: previously sent or queued Terra answers. "
+                        "Use this only to avoid repeating already closed content; a new "
+                        "aspect of the same intent may still be answered. "
+                        + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+                    ),
+                })
+
         if kind == ConversationStateKind.CLARIFYING:
-            return [{
+            result.append({
                 "role": "system",
                 "text": (
                     "PENDING_CLARIFICATION: kb_id={kb}; attempts={attempts}; original_question={question}"
@@ -363,18 +392,77 @@ class SupportApplication:
                         question=str(data.get("original_question") or ""),
                     )
                 ),
-            }]
-        if kind == ConversationStateKind.CHOOSING:
+            })
+        elif kind == ConversationStateKind.CHOOSING:
             ids = [str(x).strip() for x in (data.get("candidate_ids") or []) if str(x).strip()]
             original = str(data.get("original_question") or "")
-            return [{
+            result.append({
                 "role": "system",
                 "text": (
                     "PENDING_CHOICE: candidate_ids={ids}; original_question={question}"
                     .format(ids=", ".join(ids), question=original)
                 ),
-            }]
-        return []
+            })
+        elif kind == ConversationStateKind.REPHRASING:
+            result.append({
+                "role": "system",
+                "text": (
+                    "PENDING_REPHRASE: attempts={attempts}; original_question={question}. "
+                    "The previous Terra route did not safely close the request. "
+                    "Treat the current user turn as a rephrased attempt to resolve that "
+                    "same unresolved request, using the original question and prior "
+                    "assistant answer context before choosing a new intent."
+                ).format(
+                    attempts=str(data.get("attempts", data.get("clarification_attempts", 0)) or 0),
+                    question=str(data.get("original_question") or ""),
+                ),
+            })
+        return result
+
+    @staticmethod
+    def _remember_business_answers(state, traces, business_answers: list[str]) -> None:
+        """Persist compact intent→answer memory for later routing decisions.
+
+        One composed customer-facing answer may close several intents in a compound
+        turn. The exact sent answer is therefore associated with every selected intent.
+        """
+        if not business_answers:
+            return
+        data = dict(state.data) if isinstance(state.data, dict) else {}
+        memory = list(data.get("_routing_memory") or []) if isinstance(data.get("_routing_memory"), list) else []
+
+        intent_questions: dict[str, str] = {}
+        ordered_ids: list[str] = []
+        for trace in traces:
+            ids = [str(x).strip() for x in (getattr(trace, "selected_kb_ids", None) or []) if str(x).strip()]
+            if not ids and getattr(trace, "kb_id", None):
+                ids = [str(trace.kb_id).strip()]
+            question = str(getattr(trace, "question", "") or "")[-500:]
+            for kb_id in ids:
+                if not kb_id:
+                    continue
+                if kb_id not in intent_questions:
+                    ordered_ids.append(kb_id)
+                    intent_questions[kb_id] = question
+
+        if not ordered_ids:
+            return
+
+        answers = [str(answer or "").strip() for answer in business_answers if str(answer or "").strip()]
+        if not answers:
+            return
+        # The application normally passes the single composed message. Keep a safe
+        # fallback for older callers that still pass multiple fragments.
+        answer = answers[0] if len(answers) == 1 else "\n\n".join(answers)
+        for kb_id in ordered_ids:
+            memory.append({
+                "kb_id": kb_id,
+                "question": intent_questions[kb_id],
+                "answer": answer[-1500:],
+            })
+
+        data["_routing_memory"] = memory[-20:]
+        state.data = data
 
 
     @staticmethod
@@ -530,6 +618,8 @@ class SupportApplication:
             before_epoch = None
 
         context_fetch_started = time.perf_counter()
+        provider_context_fetch_succeeded = False
+        provider_context: list[dict[str, str]] = []
         try:
             if settings.FETCH_FULL_CONTEXT and message.channel == Channel.CONVERSATION and hasattr(self.intercom, "get_conversation_context"):
                 fetched = await self.intercom.get_conversation_context(
@@ -538,6 +628,8 @@ class SupportApplication:
                     before_epoch=before_epoch,
                     limit=int(getattr(settings, "LLM_CONTEXT_TURNS", 50)),
                 )
+                provider_context_fetch_succeeded = True
+                provider_context = list(fetched or [])
                 if fetched:
                     context = fetched
                 logger.info(
@@ -552,6 +644,8 @@ class SupportApplication:
                     before_epoch=before_epoch,
                     limit=int(getattr(settings, "LLM_CONTEXT_TURNS", 50)),
                 )
+                provider_context_fetch_succeeded = True
+                provider_context = list(fetched or [])
                 if fetched:
                     context = fetched
                 logger.info(
@@ -568,17 +662,17 @@ class SupportApplication:
                 message.entity_id, event.id, message.channel.value, type(exc).__name__, exc,
             )
 
-        # Persist provider history locally once, then use one durable transcript as
-        # the canonical LLM context. This gives the model explicit USER/ASSISTANT
-        # turns and preserves the exact bot answers across subsequent requests.
+        # Persist successful provider history into the local transcript on every
+        # successful fetch, not just on first use. A transient Intercom read failure
+        # can therefore be healed by the next successful fetch instead of permanently
+        # leaving a gap in the local context. Stable import keys make this idempotent.
         durable_context: list[dict[str, str]] = []
         if transcript_repo is not None:
-            current_context_count = await transcript_repo.count(message.entity_id)
-            if current_context_count <= 1 and context:
+            if provider_context_fetch_succeeded and provider_context:
                 await transcript_repo.import_context(
                     entity_id=message.entity_id,
                     channel=message.channel.value,
-                    context=context,
+                    context=provider_context,
                     current_turn_at=turn_at,
                 )
             durable_context = await transcript_repo.recent_context(
@@ -795,14 +889,24 @@ class SupportApplication:
             if action.kind == "reply" and action.text
         ))
 
+        # Keep the exact customer-facing answer in conversation memory before
+        # transient state is reset. For a compound turn this is the single composed
+        # message actually sent, so every selected intent is associated with the same
+        # complete closure of that turn.
+        composed_business_answer = ResponseComposer.final_answer(business_answers) if business_answers else ""
+        if composed_business_answer:
+            self._remember_business_answers(state, result.traces, [composed_business_answer])
+        if composed_business_answer and hasattr(session, "flush"):
+            await session.flush()
+
         reply_index = 0
-        if business_answers:
+        if composed_business_answer:
             reply_index += 1
             await self._enqueue_reply(
                 session,
                 message,
                 event,
-                ResponseComposer.final_answer(business_answers),
+                composed_business_answer,
                 suffix=f"reply:{reply_index}",
             )
 

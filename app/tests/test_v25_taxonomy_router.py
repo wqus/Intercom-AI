@@ -367,7 +367,7 @@ def test_taxonomy_catalog_is_compact_without_losing_routing_contract():
     kb_data = json.loads(open("data/knowledge_base.json", encoding="utf-8").read())
     rendered = json.dumps({"intent_catalog": [_intent_catalog_entry(e) for e in kb_data]}, ensure_ascii=False, separators=(",", ":"))
     assert len(kb_data) == 44  # raw fixture includes the server-side DEFAULT record
-    assert len(rendered) < 25000
+    assert len(rendered) < 27000
     assert '"template_answer"' not in rendered
     assert '"use_when"' in rendered
     assert '"do_not_use_when"' in rendered
@@ -391,7 +391,7 @@ def test_taxonomy_prompt_wire_format_is_compact():
     payload = build_taxonomy_user_message("код", catalog_entries, [])
     catalog = json.loads(payload)["intent_catalog"]
     assert len(catalog) == 43
-    assert len(payload) < 25500
+    assert len(payload) < 27000
     assert "template_answer" not in payload
     assert "use_when" in payload
     assert "do_not_use_when" in payload

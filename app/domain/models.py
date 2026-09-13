@@ -43,6 +43,9 @@ class DecisionTrace:
     contrastive_margin: float = 0.0
     contrastive_competitor_id: str | None = None
     contrastive_reason: str = ""
+    # Final intent ids accepted by the router/coverage pass. `kb_id` remains the
+    # primary trace field for compatibility; this list preserves compound routes.
+    selected_kb_ids: list[str] | None = None
     choice_candidate_ids: list[str] | None = None
     choice_candidates: list[dict[str, Any]] | None = None
 

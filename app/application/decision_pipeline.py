@@ -225,6 +225,7 @@ class DecisionPipeline:
             return trace, [OutboundAction("reply", self._escalation_reply(), True)]
         # Keep downstream loops tied to the normalized contract.
         result.selected_kb_ids = selected_ids
+        trace.selected_kb_ids = list(selected_ids)
 
         business_answers: list[str] = []
         selected_ids: list[str] = []
@@ -278,6 +279,7 @@ class DecisionPipeline:
             selected_ids.append(kb_id)
             business_answers.append(template)
 
+        trace.selected_kb_ids = list(selected_ids)
         trace.decision = Decision.ANSWER_LLM
         trace.kb_id = selected_ids[0]
         first_entry = self.kb.entries_by_id.get(selected_ids[0]) or {}
@@ -316,6 +318,7 @@ class DecisionPipeline:
         if match.mode == MatchMode.TEMPLATE:
             trace.decision = Decision.ANSWER_TEMPLATE
             trace.automated = True
+            trace.selected_kb_ids = [str(match.kb_id)] if match.kb_id else None
             return trace, [OutboundAction("business_answer", match.template_answer or "")]
 
         if match.mode == MatchMode.CLARIFICATION:

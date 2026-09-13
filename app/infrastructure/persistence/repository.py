@@ -193,9 +193,15 @@ class StateRepository:
         # state transitions (IDLE/CLARIFYING/CHOOSING/ESCALATED). Callers should not
         # have to know about the watermark when replacing their business state.
         ordering = existing_data.get("_ordering") if isinstance(existing_data.get("_ordering"), dict) else None
+        routing_memory = existing_data.get("_routing_memory") if isinstance(existing_data.get("_routing_memory"), list) else None
         new_data = dict(data) if isinstance(data, dict) else {}
+        # Routing memory is conversation-scoped memory, not state-machine data.
+        # Preserve it when moving IDLE/CLARIFYING/CHOOSING/REPHRASING states so a
+        # later turn still knows what Terra has already answered.
         if ordering and "_ordering" not in new_data:
             new_data["_ordering"] = ordering
+        if routing_memory and "_routing_memory" not in new_data:
+            new_data["_routing_memory"] = routing_memory[-20:]
         current.state = state
         current.data = new_data
         await self.session.flush()
@@ -375,8 +381,15 @@ class ConversationTurnRepository:
                 continue
             previous_signature = signature
             synthetic_at = base - timedelta(seconds=max(1, total - idx))
+            # Keep the import key stable across repeated provider fetches. The old
+            # key included the list index, which meant a later fetch containing
+            # one additional older message could generate a different key for every
+            # previously imported turn. That made retries capable of duplicating the
+            # local transcript. Exact duplicate role+text turns are intentionally
+            # collapsed here; provider history remains an enrichment source, while
+            # webhook-authored current turns are persisted separately with event IDs.
             import_hash = __import__("hashlib").sha256(
-                f"{entity_id}|{channel}|{role}|{idx}|{text}".encode("utf-8")
+                f"{entity_id}|{channel}|{role}|{text}".encode("utf-8")
             ).hexdigest()
             key = f"import:{import_hash}"
             existing = await self.session.scalar(select(ConversationTurn).where(ConversationTurn.dedup_key == key))
