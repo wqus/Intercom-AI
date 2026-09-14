@@ -138,7 +138,7 @@ def test_real_world_app_login_has_deterministic_hard_rule():
     assert kb._hard_rule_match(question) == "kb_001"
 
 
-def test_attachment_acknowledgement_is_ignored_before_attachment_escalation():
+def test_attachment_acknowledgement_still_escalates_for_attachment():
     import asyncio
     from app.application.decision_pipeline import DecisionPipeline
     from app.domain.models import InboundMessage
@@ -154,8 +154,9 @@ def test_attachment_acknowledgement_is_ignored_before_attachment_escalation():
     pipeline = DecisionPipeline(NeverKB(), object())
     msg = InboundMessage("e","k","t","c",Channel.TICKET,"Спасибо",has_attachments=True)
     result = asyncio.run(pipeline.decide(msg, is_first_message=False))
-    assert result.traces[0].decision.value == "ignore"
-    assert result.actions == []
+    assert result.traces[0].decision.value == "escalate"
+    assert result.traces[0].escalation_reason.value == "attachments"
+    assert result.actions and result.actions[0].escalate is True
 
 
 def test_oos_is_first_class_and_does_not_force_nearest_category():

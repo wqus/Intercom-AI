@@ -347,11 +347,11 @@ def test_llm_prompt_keeps_all_passed_context_without_hidden_8_12_message_cutoffs
     assert len(second["conversation_context"]) == 20
 
 
-def test_first_acknowledgement_still_fails_closed_while_greeting_is_accepted():
+def test_first_closing_ack_is_silent_while_greeting_is_accepted():
     from app.infrastructure.ai.knowledge_base import MatchResult, MatchMode
     class KB:
         def match_many(self, text):
-            return [MatchResult(MatchMode.NO_MATCH, 0.0, None, None, None, [], subquestion=text)]
+            raise AssertionError("non-query first turns must be handled before KB")
     pipeline = DecisionPipeline(KB(), None)
     first_thanks = asyncio.run(pipeline.decide(
         InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "спасибо"), is_first_message=True
@@ -359,7 +359,8 @@ def test_first_acknowledgement_still_fails_closed_while_greeting_is_accepted():
     first_hello = asyncio.run(pipeline.decide(
         InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "здравствуйте"), is_first_message=True
     ))
-    assert first_thanks.actions[0].escalate is True
+    assert first_thanks.actions == []
+    assert first_thanks.traces[0].decision == Decision.IGNORE
     assert first_hello.actions[0].escalate is False
     assert first_hello.traces[0].decision == Decision.IGNORE
 
@@ -389,3 +390,29 @@ def test_llm_client_disables_hidden_sdk_retries(monkeypatch):
     monkeypatch.setitem(__import__('sys').modules, 'openai', type('M', (), {'AsyncOpenAI': FakeOpenAI})())
     PolzaLLMClient("key", "test-model")
     assert seen["max_retries"] == 0
+
+
+def test_router_prompt_has_strict_role_and_conflict_rules():
+    from app.infrastructure.ai.llm_client import build_system_prompt, build_coverage_system_prompt
+    prompt = build_system_prompt().lower()
+    coverage = build_coverage_system_prompt().lower()
+    assert "строго разделяй роли" in prompt
+    assert "не приписывай пользователю" in prompt
+    assert "материально противоречащие" in prompt
+    assert "conflict" in coverage or "конфликт" in coverage
+
+
+def test_taxonomy_user_payload_marks_current_question_as_separate_authoritative_turn():
+    from app.infrastructure.ai.llm_client import build_taxonomy_user_message
+    import json
+    payload = json.loads(build_taxonomy_user_message(
+        "а почему тогда не получилось?",
+        [{"id": "kb_1", "category": "test", "definition": "test"}],
+        [
+            {"role": "user", "text": "я не могу войти"},
+            {"role": "assistant", "text": "Попробуйте войти заново."},
+        ],
+    ))
+    assert payload["current_question_is_authoritative_turn"] is True
+    assert payload["history_usage"]
+    assert payload["dialogue_rule"].startswith("USER = customer message")

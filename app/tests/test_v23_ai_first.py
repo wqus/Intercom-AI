@@ -1,7 +1,7 @@
 import asyncio
 
 from app.application.decision_pipeline import DecisionPipeline
-from app.domain.enums import Channel, Decision
+from app.domain.enums import Channel, Decision, EscalationReason
 from app.domain.models import InboundMessage, ProcessingResult, DecisionTrace, OutboundAction
 from app.infrastructure.ai.knowledge_base import MatchMode, MatchResult, is_non_query_message
 from app.infrastructure.ai.llm_client import LLMResult
@@ -15,6 +15,14 @@ def _match(entries):
     )
 
 
+def test_closing_acknowledgements_cover_real_user_phrases():
+    from app.infrastructure.ai.knowledge_base import is_closing_acknowledgement
+    for text in ["спасибо", "благодарю", "большое спасибо", "спасибо вам", "до свидания", "ща попробую", "щас попробую", "сейчас попробую", "буду ждать"]:
+        assert is_closing_acknowledgement(text), text
+    for text in ["попробовал, не помогло", "ок, но ошибка осталась", "как это сделать?"]:
+        assert not is_closing_acknowledgement(text), text
+
+
 def test_short_domain_words_are_not_noise():
     assert not is_non_query_message("Оплата")
     assert not is_non_query_message("Регистрация")
@@ -22,15 +30,29 @@ def test_short_domain_words_are_not_noise():
     assert is_non_query_message("Спасибо")
 
 
-def test_first_acknowledgement_is_not_ignored():
+def test_closing_text_with_attachment_is_not_silently_ignored():
     class KB:
         def match_many(self, text):
-            return [MatchResult(MatchMode.NO_MATCH, 0.0, None, None, None, [], subquestion=text, decision_reason="no_defensible_retrieval_neighborhood")]
+            raise AssertionError("attachments should short-circuit before closing acknowledgement")
+    result = asyncio.run(DecisionPipeline(KB(), None).decide(
+        InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "спасибо", has_attachments=True),
+        is_first_message=True,
+    ))
+    assert result.traces[0].decision == Decision.ESCALATE
+    assert result.traces[0].escalation_reason == EscalationReason.ATTACHMENTS
+    assert result.actions and result.actions[0].escalate is True
+
+
+def test_first_acknowledgement_is_silently_ignored():
+    class KB:
+        def match_many(self, text):
+            raise AssertionError("closing acknowledgement must be handled before KB")
     result = asyncio.run(DecisionPipeline(KB(), None).decide(
         InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "спасибо"),
         is_first_message=True,
     ))
-    assert result.traces[0].decision == Decision.ESCALATE
+    assert result.traces[0].decision == Decision.IGNORE
+    assert result.actions == []
 
 
 def test_llm_choice_response_is_invalid_and_uses_top3_only_as_error_fallback():
@@ -117,7 +139,7 @@ def test_non_noise_no_match_always_gets_user_visible_fallback():
     assert result.traces[0].decision == Decision.ESCALATE
 
 
-def test_acknowledgement_is_silent_only_on_later_turn():
+def test_acknowledgement_is_silent_on_later_turn():
     class KB:
         def match_many(self, text):
             raise AssertionError("acknowledgement should be filtered before classification")
@@ -128,23 +150,6 @@ def test_acknowledgement_is_silent_only_on_later_turn():
     ))
     assert result.traces[0].decision == Decision.IGNORE
     assert result.actions == []
-
-
-def test_first_acknowledgement_is_not_silent():
-    class KB:
-        def match_many(self, text):
-            return [MatchResult(
-                MatchMode.NO_MATCH, 0.0, None, None, None, [],
-                subquestion=text, decision_reason="noise:meta_noise",
-            )]
-    result = asyncio.run(DecisionPipeline(KB(), None).decide(
-        InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "спасибо"),
-        is_first_message=True,
-    ))
-    assert result.actions
-    assert result.traces[0].decision == Decision.ESCALATE
-    # The first-turn policy must not silently drop the event.
-    assert any(action.text for action in result.actions)
 
 
 def test_llm_choice_requires_two_or_three_unique_ids():

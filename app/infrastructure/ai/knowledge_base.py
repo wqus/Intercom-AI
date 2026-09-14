@@ -548,17 +548,33 @@ def detect_high_risk(text: str) -> str | None:
     return None
 
 
-def is_non_query_message(text: str) -> bool:
-    """Return True only for explicitly curated acknowledgement/noise phrases.
+_CLOSING_ACK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?:(?:большое|огромное)\s+)?(?:спасибо|благодарю|спс|thx|thanks)(?:[ !,.]+(?:вам|тебе|ещ[её]))?$", re.I),
+    re.compile(r"^(?:спасибо|благодарю)(?:[ !,.]+(?:большое|огромное|вам|тебе|ещ[её]))+$", re.I),
+    re.compile(r"^(?:до\s+свидания|всего\s+доброго|хорошего\s+дня|хорошего\s+вечера|доброй\s+ночи|до\s+встречи|пока)$", re.I),
+    re.compile(r"^(?:сейчас|щас|ща|тогда|теперь)?\s*(?:попробую|попробуем|проверю|проверим|разберусь|посмотрю|посмотрим)$", re.I),
+    re.compile(r"^(?:я\s+)?(?:буду\s+ждать|будем\s+ждать|подожду|подождем|подождём)$", re.I),
+)
 
-    Length is intentionally NOT a criterion. A one-word support request such as
-    ``оплата`` or ``регистрация`` must remain routable. The caller is responsible
-    for enforcing the conversation-position rule (IGNORE only after turn one).
-    """
+
+def is_closing_acknowledgement(text: str) -> bool:
+    """Return True for short, non-actionable conversation-closing acknowledgements."""
+    q = normalize_light(text)
+    if not q or len(q) > 80:
+        return False
+    if any(ch in q for ch in "?？"):
+        return False
+    if any(word in q.split() for word in QUESTION_WORDS):
+        return False
+    return any(pattern.fullmatch(q) for pattern in _CLOSING_ACK_PATTERNS)
+
+
+def is_non_query_message(text: str) -> bool:
+    """Return True only for explicitly curated acknowledgement/noise phrases."""
     q = normalize_light(text)
     if not q:
         return True
-    return q in _NON_QUERY_EXACT or q in META_NOISE_PATTERNS
+    return q in _NON_QUERY_EXACT or q in META_NOISE_PATTERNS or is_closing_acknowledgement(text)
 
 
 def _quality_gate(text: str) -> tuple[bool, str]:

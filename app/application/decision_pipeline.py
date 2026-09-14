@@ -8,7 +8,7 @@ from app.domain.policy import escalation_ack, rephrase_prompt, high_risk_reply
 from app.domain.response_composer import ResponseComposer
 from app.infrastructure.ai.knowledge_base import (
     KnowledgeBase, MatchMode, MatchResult, contains_operator_request, detect_high_risk,
-    is_non_query_message,
+    is_non_query_message, is_closing_acknowledgement,
 )
 from app.infrastructure.ai.llm_client import LLMResult, PolzaLLMClient
 from app.core.config import settings
@@ -444,10 +444,37 @@ class DecisionPipeline:
             result.latency_ms = (time.perf_counter() - started) * 1000
             return result
 
-        # Ignore is deliberately tiny: only a curated acknowledgement/noise
-        # phrase, only after the conversation already contains a user turn.
-        # Never short-circuit a pending clarification/menu context: a word such as
-        # "ок" or "да" may be the user's substantive response to the last bot turn.
+        if message.has_attachments:
+            trace = DecisionTrace(
+                decision=Decision.ESCALATE,
+                question=message.text,
+                decision_reason="attachments",
+                escalation_reason=EscalationReason.ATTACHMENTS,
+            )
+            result = ProcessingResult(
+                traces=[trace],
+                actions=[OutboundAction("reply", self._escalation_reply(), True)],
+            )
+            result.latency_ms = (time.perf_counter() - started) * 1000
+            return result
+
+        # Pure closing/acknowledgement turns are never support requests. This is
+        # intentionally deterministic so provider history gaps cannot turn a simple
+        # "спасибо"/"до свидания" into an operator escalation. Pending state is kept
+        # intact for the next substantive turn.
+        if is_closing_acknowledgement(message.text):
+            trace = DecisionTrace(
+                decision=Decision.IGNORE,
+                question=message.text,
+                decision_reason="noise:conversation_closing_ack",
+                automated=True,
+            )
+            result = ProcessingResult(traces=[trace], actions=[])
+            result.latency_ms = (time.perf_counter() - started) * 1000
+            return result
+
+        # Generic curated non-query phrases remain context-sensitive because a short
+        # reply such as "да"/"ок" can be the actual answer to a pending clarification.
         has_pending_context = any(
             isinstance(item, dict)
             and str(item.get("role") or "").strip().lower() == "system"
@@ -455,21 +482,7 @@ class DecisionPipeline:
             for item in (conversation_context or [])
         )
         if is_non_query_message(message.text) and not has_pending_context:
-            if not is_first_message:
-                trace = DecisionTrace(
-                    decision=Decision.IGNORE,
-                    question=message.text,
-                    decision_reason="noise:contextual_non_query",
-                    automated=True,
-                )
-                result = ProcessingResult(traces=[trace], actions=[])
-                result.latency_ms = (time.perf_counter() - started) * 1000
-                return result
-
-            if _is_standalone_greeting(message.text):
-                # A standalone first-turn greeting is a normal conversation opener,
-                # not an escalation. Keep the thread in IDLE and invite the customer
-                # to state the actual request.
+            if _is_standalone_greeting(message.text) and is_first_message:
                 trace = DecisionTrace(
                     decision=Decision.IGNORE,
                     question=message.text,
@@ -483,33 +496,13 @@ class DecisionPipeline:
                 result.latency_ms = (time.perf_counter() - started) * 1000
                 return result
 
-            # A first-turn acknowledgement such as "спасибо" has no preceding
-            # answer in this thread, so it cannot safely be treated as completion.
             trace = DecisionTrace(
-                decision=Decision.ESCALATE,
+                decision=Decision.IGNORE,
                 question=message.text,
-                decision_reason="first_turn_non_query_escalate",
-                escalation_reason=EscalationReason.NO_CATEGORY,
+                decision_reason="noise:contextual_non_query" if not is_first_message else "noise:first_turn_non_query",
                 automated=True,
             )
-            result = ProcessingResult(
-                traces=[trace],
-                actions=[OutboundAction("reply", self._escalation_reply(), True)],
-            )
-            result.latency_ms = (time.perf_counter() - started) * 1000
-            return result
-
-        if message.has_attachments:
-            trace = DecisionTrace(
-                decision=Decision.ESCALATE,
-                question=message.text,
-                decision_reason="attachments",
-                escalation_reason=EscalationReason.ATTACHMENTS,
-            )
-            result = ProcessingResult(
-                traces=[trace],
-                actions=[OutboundAction("reply", self._escalation_reply(), True)],
-            )
+            result = ProcessingResult(traces=[trace], actions=[])
             result.latency_ms = (time.perf_counter() - started) * 1000
             return result
 
@@ -635,18 +628,6 @@ class DecisionPipeline:
             actions.append(OutboundAction("reply", "\n\n".join(replies), needs_escalation))
         elif needs_escalation:
             actions.append(OutboundAction("reply", self._escalation_reply(), True))
-
-        # First-turn invariant: the curated ignore list is contextual only.
-        # If an internal matcher accidentally labels the very first message as
-        # noise, never silently consume it; convert it to a human fallback.
-        if is_first_message and any(t.decision == Decision.IGNORE for t in traces):
-            for t in traces:
-                if t.decision == Decision.IGNORE:
-                    t.decision = Decision.ESCALATE
-                    t.escalation_reason = EscalationReason.NO_CATEGORY
-                    t.decision_reason = "first_turn_noise_escalate"
-                    t.automated = True
-            actions = [OutboundAction("reply", self._escalation_reply(), True)]
 
         # Hard application invariant: every non-ignored inbound turn must have
         # at least one user-visible action. This is a final safety net against
