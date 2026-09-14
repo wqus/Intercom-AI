@@ -699,7 +699,16 @@ class SupportApplication:
 
         # If transcript persistence is unavailable (test adapter or a legacy DB),
         # retain the provider/webhook context rather than making it mandatory.
-        context = (durable_context if transcript_repo is not None else list(context))
+        # A successful Intercom read can legitimately be empty during replication
+        # or when the resource omits older parts. Do not let that empty result
+        # erase the bounded history that arrived in the webhook: short follow-ups
+        # such as "не пришёл" need that immediately available context. Durable
+        # local history remains preferred whenever it actually contains turns.
+        context = (
+            durable_context or list(context)
+            if transcript_repo is not None
+            else list(context)
+        )
         context = context[-int(getattr(settings, "LLM_CONTEXT_TURNS", 50)):] + self._routing_context_for_state(state)
         try:
             result = await self.pipeline.decide(

@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     WORKER_POLL_SECONDS: float = 0.5
     MAX_CLARIFICATION_ATTEMPTS: int = 2
     LLM_CONTEXT_TURNS: int = 50
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
+    # The same .env is shared with docker-compose, which also needs POSTGRES_*
+    # variables. They are not application settings and must not prevent the API
+    # from starting (or tests from importing the application).
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
 settings = Settings()
