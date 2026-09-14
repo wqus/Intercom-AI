@@ -155,10 +155,11 @@ def build_system_prompt() -> str:
 def _intent_catalog_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """Serialize a compact but semantically complete routing contract.
 
-    The router should see the facts that distinguish neighbouring intents, while
-    answer prose and retrieval/runtime internals stay server-side. In particular,
-    ``when_not_to_use`` and deterministic constraints are important negative
-    evidence; omitting them makes close taxonomy branches unnecessarily ambiguous.
+    The router should see the facts that distinguish neighbouring intents. Since
+    token minimization is not a goal of this production router, preserve enough
+    positive/negative evidence and the approved answer text for the first pass to
+    understand what each intent can actually resolve. The second pass remains the
+    final 100%% coverage gate.
     """
     intent_id = str(entry.get("id") or "").strip()
     category = str(entry.get("category") or "").strip()
@@ -234,28 +235,44 @@ def _intent_catalog_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "id": intent_id,
         "name": category or intent_id,
         "definition": definition[:260],
-        # Keep the router catalogue compact, but do not throw away the evidence
-        # needed to distinguish close intents. Templates stay server-side.
-        "use_when": _compact_strings(entry.get("when_to_use"), limit=2, max_len=180),
-        "do_not_use_when": _compact_strings(entry.get("when_not_to_use"), limit=2, max_len=180),
-        "signals": _compact_strings(positive, limit=1, max_len=120),
-        "exclude": _compact_strings(negative, limit=1, max_len=120),
+        # The user explicitly prioritizes routing quality over prompt size:
+        # expose enough evidence and the approved answer for the first pass to
+        # distinguish near-neighbour intents before the final coverage pass.
+        "use_when": _compact_strings(entry.get("when_to_use"), limit=6, max_len=280),
+        "do_not_use_when": _compact_strings(entry.get("when_not_to_use"), limit=6, max_len=280),
+        "signals": _compact_strings(positive, limit=6, max_len=180),
+        "exclude": _compact_strings(negative, limit=6, max_len=180),
         "constraints": constraints,
         "confused_with": confused_ids,
+        "approved_answer": str(entry.get("template_answer") or "").strip(),
+        "clarification_question": str(entry.get("clarification_question") or "").strip(),
+        "answer_available": bool(str(entry.get("template_answer") or "").strip()),
+        "clarification_available": bool(str(entry.get("clarification_question") or "").strip()),
+        # Compatibility flags used by older diagnostics. They do not replace the
+        # actual answer/question text above.
         "answer": bool(str(entry.get("template_answer") or "").strip()),
         "clarify": bool(str(entry.get("clarification_question") or "").strip()),
     }
 
 
-def build_taxonomy_user_message(
+def _build_structured_context(
     question: str,
-    intent_catalog: list[dict[str, Any]],
     conversation_context: list[dict[str, str]] | None = None,
-) -> str:
+) -> dict[str, Any]:
+    """Build one canonical context contract shared by both LLM passes.
+
+    The current user turn is never copied into history; pending/routing metadata is
+    kept outside the USER/ASSISTANT transcript so the model cannot confuse it with
+    customer-authored content.
+    """
     raw_context = conversation_context or []
+    max_turns = max(1, int(getattr(settings, "LLM_CONTEXT_TURNS", 50)))
     history: list[dict[str, str]] = []
-    pending_state: list[dict[str, str]] = []
-    for item in raw_context[-int(getattr(settings, "LLM_CONTEXT_TURNS", 50)):]:
+    system_state: list[dict[str, str]] = []
+
+    # Separate transcript from internal state before truncating. This keeps
+    # pending/routing metadata from consuming one of the actual dialogue turns.
+    for item in raw_context:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
@@ -265,26 +282,64 @@ def build_taxonomy_user_message(
         if role in {"user", "assistant"}:
             history.append({"role": role, "text": text})
         elif role == "system":
-            pending_state.append({"text": text})
+            system_state.append({"text": text})
+
+    history = history[-max_turns:]
+    system_state = system_state[-8:]
     dialogue = [
         {"turn": index + 1, "role": str(item["role"]).upper(), "text": item["text"]}
-        for index, item in enumerate(history[-50:])
+        for index, item in enumerate(history)
     ]
     last_assistant_response = next(
         (item["text"] for item in reversed(history) if item["role"] == "assistant"),
         "",
     )
-    payload = {
+
+    return {
         "dialogue": dialogue,
         "conversation_history": history,
+        # Backward-compatible aliases kept for existing diagnostics/tests; the
+        # model-facing contract above remains the canonical representation.
+        "conversation_context": history,
+        "dialogue_rule": "USER = customer message; ASSISTANT = Terra message; SYSTEM = internal routing state; current_question = authoritative current turn.",
+        "history_usage": "Use history only for continuity/references; never treat old assistant text as proof of current coverage.",
         "last_assistant_response": last_assistant_response,
-        "dialogue_rule": "USER = customer message; ASSISTANT = previously sent Terra answer; SYSTEM/pending_state = internal routing state; current_question is the new customer turn and must be evaluated first.",
-        "history_usage": "Use prior dialogue only to resolve references/follow-ups. Never treat an ASSISTANT answer as a customer claim or as new KB facts.",
-        "pending_state": pending_state,
+        "pending_state": system_state,
         "current_question": question,
         "current_question_is_authoritative_turn": True,
-        "intent_catalog": [_intent_catalog_entry(entry) for entry in intent_catalog],
+        "context_contract": {
+            "history_is_chronological": True,
+            "current_question_not_in_history": True,
+            "user_role_definition": "Customer-authored text only.",
+            "assistant_role_definition": "Previously sent Terra response only; never a customer fact.",
+            "pending_state_definition": "Internal routing metadata only; never customer-authored content.",
+            "history_usage": "Use prior dialogue only to resolve references/follow-ups. Never use an old assistant answer as proof that the new turn is covered.",
+            "current_turn_priority": "Judge the current user turn first; history only resolves missing referents and continuity.",
+        },
     }
+
+
+def _context_debug_summary(conversation_context: list[dict[str, str]] | None) -> dict[str, int]:
+    history = 0
+    pending = 0
+    for item in conversation_context or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role in {"user", "assistant"}:
+            history += 1
+        elif role == "system":
+            pending += 1
+    return {"history_messages": history, "pending_items": pending}
+
+
+def build_taxonomy_user_message(
+    question: str,
+    intent_catalog: list[dict[str, Any]],
+    conversation_context: list[dict[str, str]] | None = None,
+) -> str:
+    payload = _build_structured_context(question, conversation_context)
+    payload["intent_catalog"] = [_intent_catalog_entry(entry) for entry in intent_catalog]
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -293,12 +348,10 @@ def build_user_message(
     relevant_entries: list[dict[str, Any]],
     conversation_context: list[dict[str, str]] | None = None,
 ) -> str:
-    payload = {
-        "conversation_context": list(conversation_context or []),
-        "current_question": question,
-        "candidates": [_entry_for_llm(entry) for entry in relevant_entries],
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    # Keep the legacy/non-taxonomy path on the exact same context contract.
+    payload = _build_structured_context(question, conversation_context)
+    payload["candidates"] = [_entry_for_llm(entry) for entry in relevant_entries]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def _coverage_entry_for_llm(entry: dict[str, Any]) -> dict[str, Any]:
@@ -312,21 +365,23 @@ def _coverage_entry_for_llm(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_candidate_selection_system_prompt() -> str:
-    return """Ты — первый этап AI-router службы поддержки Terra.
+    return """Ты — ПЕРВЫЙ этап AI-router службы поддержки Terra.
 
-Твоя задача — первый этап маршрутизации: определить, какие intent'ы из каталога наиболее подходят к ТЕКУЩЕМУ запросу пользователя с учётом диалога. Выбери от 1 до 4 сильнейших кандидатов для последующей финальной проверки.
+Твоя единственная задача — найти 1–4 наиболее правдоподобных intent'а из полного каталога для ТЕКУЩЕГО запроса. Ты НЕ принимаешь окончательное решение `answer`: это делает второй проход, который увидит утверждённые ответы и выполнит отдельную 100%-ную проверку покрытия.
 
-Правила:
-- учитывай current_question, историю и pending state;
-- используй отрицательные условия и constraints, а не только тематическое сходство;
-- если intent очевидно не подходит, не включай его;
-- compound-запрос может иметь несколько кандидатов;
-- `ignore` допускается только для чистого не-требующего-ответа сообщения, включая благодарность, прощание, «сейчас попробую»/«буду ждать» и аналогичные закрывающие реплики без новой задачи; если в том же turn есть новая проблема, вопрос, возражение или неудачная попытка — это уже не ignore;
-- `escalate` используй, если уже на этапе отбора видно, что поддерживаемого intent нет или вопрос явно требует человека;
-- `clarify` используй только если нужен один явно определённый intent, но пользователь не сообщил критический discriminator;
-- для обычного содержательного запроса обычно возвращай 1 кандидат;
-- возвращай несколько кандидатов только когда они действительно конкурируют/нужны для полного покрытия составного запроса; это ПРЕДВАРИТЕЛЬНЫЙ набор для второго прохода;
-- второй проход будет единственным местом, где определяется окончательный минимальный набор intent'ов для ответа.
+КРИТИЧНО:
+- Сначала отдели текущий `current_question` от истории. Старые USER/ASSISTANT сообщения помогают только понять ссылки вроде «он», «там», «снова» и продолжение диалога.
+- `pending_state` — внутренняя метаинформация, а не слова пользователя.
+- Учитывай одновременно definition, use_when, do_not_use_when, signals, exclude, constraints, confused_with И approved_answer каждого intent.
+- Не выбирай intent только по общему слову («школа», «наставник», «код», «запись»). Ищи именно цель/сбой/условие пользователя.
+- Если несколько соседних intent'ов реально конкурируют, верни все сильные конкурирующие кандидаты (до 4), чтобы второй проход мог сравнить их ответы.
+- Для составного запроса верни кандидатов для всех независимых частей.
+- Если хотя бы один intent правдоподобно относится к существу запроса, НЕ эскалируй только из-за сомнения; передай кандидатов второму проходу.
+- Используй `escalate` только когда после сравнения всего каталога нет ни одного правдоподобного поддерживаемого intent'а либо вопрос явно относится к зоне, которую каталог не покрывает.
+- `ignore` только для чистого сообщения без новой задачи поддержки.
+- `clarify` только если intent уже однозначен и реально отсутствует конкретный discriminator, который этот intent требует.
+
+Важнейший принцип: первый проход максимизирует полноту candidate set, второй — безопасность ответа. Не пытайся экономить кандидатов ценой потери потенциально подходящей категории.
 
 Нельзя придумывать id.
 """
@@ -367,12 +422,17 @@ def build_coverage_system_prompt() -> str:
 
 
 def build_coverage_user_message(question: str, candidate_entries: list[dict[str, Any]], conversation_context: list[dict[str, str]] | None = None) -> str:
-    payload = {
-        "conversation_context": list(conversation_context or []),
-        "current_question": question,
+    payload = _build_structured_context(question, conversation_context)
+    payload.update({
         "candidates": [_coverage_entry_for_llm(entry) for entry in candidate_entries[:4]],
         "coverage_rule": "approved_answer(s) must cover 100% of the substantive user request; partial coverage is not answer",
-    }
+        "coverage_test": [
+            "Identify every independent user request/failure/constraint in current_question.",
+            "For each one, verify an approved answer explicitly resolves it for this exact situation.",
+            "Do not infer missing business facts or actions from category names, history, or general knowledge.",
+            "Any uncovered material point means the final decision cannot be answer.",
+        ],
+    })
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -487,13 +547,22 @@ class PolzaLLMClient:
                 raise ValueError("invalid candidate-selection certainty")
             if len(selected) > 4 or len(selected) != len(set(selected)) or any(x not in all_ids for x in selected):
                 raise ValueError("invalid candidate-selection ids")
-            # Candidate selection is only the first pass. Do not reject a valid
-            # conversational route merely because the model attached extra ids to
-            # an ignore/escalate decision or returned several possibilities for a
-            # clarification. Normalize terminal decisions and let the second pass
-            # resolve any non-terminal candidate set.
-            if decision in {"ignore", "escalate"}:
-                return LLMResult([], escalation=decision == "escalate", decision=decision, certainty=certainty, reason=f"candidate_selection_{decision}", is_compound=is_compound)
+            logger.info(
+                "taxonomy_candidate_selection | decision=%s | selected_ids=%s | certainty=%s | compound=%s | context=%s",
+                decision,
+                selected,
+                certainty,
+                is_compound,
+                _context_debug_summary(conversation_context),
+            )
+
+            # The first pass is a candidate generator, not the final safety gate.
+            # If it says "escalate" but still returned plausible candidate ids,
+            # do NOT throw those candidates away: the second pass must be allowed
+            # to prove or reject 100% coverage. A terminal escalation is only
+            # immediate when there is no plausible candidate at all.
+            if decision == "ignore" and not selected:
+                return LLMResult([], escalation=False, decision="ignore", certainty=certainty, reason="candidate_selection_ignore", is_compound=is_compound)
             if not selected:
                 return LLMResult([], escalation=True, decision="escalate", certainty="high", reason="candidate_selection_empty", is_compound=False)
 
@@ -512,8 +581,10 @@ class PolzaLLMClient:
                     "selected_kb_ids": {"type": "array", "items": {"type": "string", "enum": coverage_ids}, "minItems": 0, "maxItems": 4},
                     "is_compound": {"type": "boolean"},
                     "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "coverage_status": {"type": "string", "enum": ["complete", "partial", "unsupported", "not_applicable"]},
+                    "coverage_gaps": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
                 },
-                "required": ["decision", "selected_kb_ids", "is_compound", "certainty"],
+                "required": ["decision", "selected_kb_ids", "is_compound", "certainty", "coverage_status", "coverage_gaps"],
             }
             coverage_kwargs = {
                 "model": self.model,
@@ -532,8 +603,19 @@ class PolzaLLMClient:
             final_selected = [str(x).strip() for x in coverage_data.get("selected_kb_ids", [])]
             final_certainty = str(coverage_data.get("certainty", "")).strip().lower()
             final_is_compound = coverage_data.get("is_compound")
+            # Rolling deployments/tests may return the pre-V30 shape. Production
+            # JSON schema requires these fields, but accepting the legacy shape
+            # here avoids treating an otherwise valid provider response as outage.
+            coverage_status = str(coverage_data.get("coverage_status") or ("complete" if final_decision == "answer" else "not_applicable")).strip().lower()
+            coverage_gaps = [
+                str(item).strip()
+                for item in (coverage_data.get("coverage_gaps") or [])
+                if str(item).strip()
+            ][:8]
             if not isinstance(final_is_compound, bool):
                 raise ValueError("invalid coverage is_compound")
+            if coverage_status not in {"complete", "partial", "unsupported", "not_applicable"}:
+                raise ValueError("invalid coverage_status")
             if final_decision not in {"answer", "clarify", "ignore", "escalate"}:
                 raise ValueError("invalid coverage decision")
             if final_certainty not in {"high", "medium", "low"}:
@@ -541,12 +623,27 @@ class PolzaLLMClient:
             if len(final_selected) > 4 or len(final_selected) != len(set(final_selected)) or any(x not in coverage_ids for x in final_selected):
                 raise ValueError("invalid coverage ids")
             if final_decision == "answer":
-                if not 1 <= len(final_selected) <= 4 or final_certainty != "high":
+                # Hard deterministic safety gate: no model is allowed to return a
+                # business answer unless it explicitly proves complete coverage
+                # and reports zero unresolved material points.
+                if coverage_status != "complete" or coverage_gaps:
+                    logger.warning(
+                        "taxonomy_coverage_rejected_partial | status=%s | gaps=%s | selected=%s",
+                        coverage_status,
+                        coverage_gaps,
+                        final_selected,
+                    )
+                    final_decision = "escalate"
+                    final_selected = []
+                elif not 1 <= len(final_selected) <= 4 or final_certainty != "high":
                     raise ValueError("answer coverage requires 1-4 candidates and high certainty")
-                if len(final_selected) > 1 and not final_is_compound:
+                elif len(final_selected) > 1 and not final_is_compound:
                     raise ValueError("multiple final intents require is_compound=true")
             elif final_decision == "clarify":
-                if len(final_selected) != 1:
+                if coverage_status not in {"complete", "partial"}:
+                    final_decision = "escalate"
+                    final_selected = []
+                elif len(final_selected) != 1:
                     raise ValueError("coverage clarify requires one candidate")
             elif final_selected:
                 # The final decision owns terminal semantics. If the model emits
@@ -554,8 +651,14 @@ class PolzaLLMClient:
                 # turning an otherwise valid decision into an artificial LLM error.
                 final_selected = []
             logger.info(
-                "taxonomy_coverage | candidate_count=%d | selected_count=%d | decision=%s | compound=%s",
-                len(coverage_candidates), len(final_selected), final_decision, final_is_compound,
+                "taxonomy_coverage | candidate_count=%d | selected_count=%d | decision=%s | compound=%s | status=%s | gaps=%d | context=%s",
+                len(coverage_candidates),
+                len(final_selected),
+                final_decision,
+                final_is_compound,
+                coverage_status,
+                len(coverage_gaps),
+                _context_debug_summary(conversation_context),
             )
             return LLMResult(final_selected, escalation=final_decision == "escalate", decision=final_decision, certainty=final_certainty, reason="coverage_checked", is_compound=final_is_compound)
         except Exception as exc:

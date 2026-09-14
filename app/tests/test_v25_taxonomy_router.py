@@ -119,6 +119,7 @@ def test_taxonomy_prompt_contains_compact_directory_and_context():
     catalog = {item["id"]: item for item in parsed["intent_catalog"]}
     assert catalog["kb_1"]["definition"] == "Проблема с регистрацией"
     assert catalog["kb_1"]["answer"] is False
+    assert catalog["kb_1"]["approved_answer"] == ""
     assert "template_answer" not in payload
     assert "when_to_use" not in payload
 
@@ -181,6 +182,8 @@ def test_taxonomy_catalog_exposes_answerability_metadata():
     })
     assert item["answer"] is True
     assert item["clarify"] is True
+    assert item["approved_answer"] == "Approved answer"
+    assert item["clarification_question"] == "Which?"
 
 
 def test_ignore_does_not_clear_pending_clarification_state():
@@ -367,7 +370,8 @@ def test_taxonomy_catalog_is_compact_without_losing_routing_contract():
     kb_data = json.loads(open("data/knowledge_base.json", encoding="utf-8").read())
     rendered = json.dumps({"intent_catalog": [_intent_catalog_entry(e) for e in kb_data]}, ensure_ascii=False, separators=(",", ":"))
     assert len(kb_data) == 44  # raw fixture includes the server-side DEFAULT record
-    assert len(rendered) < 27000
+    assert len(rendered) > 35000
+    assert '"approved_answer"' in rendered
     assert '"template_answer"' not in rendered
     assert '"use_when"' in rendered
     assert '"do_not_use_when"' in rendered
@@ -391,7 +395,7 @@ def test_taxonomy_prompt_wire_format_is_compact():
     payload = build_taxonomy_user_message("код", catalog_entries, [])
     catalog = json.loads(payload)["intent_catalog"]
     assert len(catalog) == 43
-    assert len(payload) < 27000
+    assert len(payload) > 35000
     assert "template_answer" not in payload
     assert "use_when" in payload
     assert "do_not_use_when" in payload

@@ -13,7 +13,7 @@ from app.domain.enums import Channel, ConversationStateKind, Decision
 from app.domain.models import InboundMessage, ProcessingResult, DecisionTrace, OutboundAction
 
 
-def test_router_catalog_preserves_disambiguating_evidence_but_never_template():
+def test_router_catalog_preserves_disambiguating_evidence_and_approved_answer():
     from app.infrastructure.ai.llm_client import _intent_catalog_entry
     payload = _intent_catalog_entry({
         "id": "kb_1",
@@ -25,20 +25,20 @@ def test_router_catalog_preserves_disambiguating_evidence_but_never_template():
         "negative_phrases": ["x1", "x2", "x3", "x4", "x5", "x6", "x7"],
         "template_answer": "SECRET ANSWER",
     })
-    assert payload["use_when"] == ["u1", "u2"]
-    assert payload["do_not_use_when"] == ["n1", "n2"]
-    assert len(payload["signals"]) == 1
-    assert len(payload["exclude"]) == 1
-    assert "SECRET ANSWER" not in json.dumps(payload, ensure_ascii=False)
+    assert payload["use_when"] == ["u1", "u2", "u3", "u4", "u5"]
+    assert payload["do_not_use_when"] == ["n1", "n2", "n3", "n4", "n5"]
+    assert len(payload["signals"]) == 6
+    assert len(payload["exclude"]) == 6
+    assert payload["approved_answer"] == "SECRET ANSWER"
 
 
-def test_two_pass_prompts_have_clear_roles_and_no_template_in_first():
+def test_two_pass_prompts_have_clear_roles_and_answer_contract_in_first():
     first = build_candidate_selection_system_prompt()
     second = build_coverage_system_prompt()
     assert "первый этап" in first.lower()
     assert "второй и финальный этап" in second.lower()
     assert "approved_answer" in second
-    assert "template_answer" not in first
+    assert "approved_answer" in first
 
 
 def test_taxonomy_context_contains_user_and_assistant_history_and_current_turn_boundary():
@@ -84,7 +84,11 @@ class _FakeCompletions:
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
-        return _FakeResponse(self.responses.pop(0))
+        payload = dict(self.responses.pop(0))
+        if len(self.calls) >= 2:
+            payload.setdefault("coverage_status", "complete" if payload.get("decision") == "answer" else "partial")
+            payload.setdefault("coverage_gaps", [])
+        return _FakeResponse(payload)
 
 
 class _FakeAsyncClient:
@@ -314,7 +318,7 @@ def test_candidate_clarify_with_multiple_candidates_is_deferred_to_coverage():
 
 def test_terminal_candidate_decision_with_stale_ids_is_normalized_not_failed():
     client, completions = _client_for_test(None, [
-        {"decision": "escalate", "selected_kb_ids": ["kb_1"], "is_compound": False, "certainty": "high"},
+        {"decision": "escalate", "selected_kb_ids": [], "is_compound": False, "certainty": "high"},
     ])
     result = asyncio.run(client._classify_taxonomy_with_coverage(
         "вопрос", [{"id": "kb_1", "template_answer": "A"}]
