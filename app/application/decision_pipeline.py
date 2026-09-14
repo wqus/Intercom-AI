@@ -1,6 +1,7 @@
 import time
 import logging
 import hashlib
+import re
 from app.domain.enums import Decision, EscalationReason
 from app.domain.models import DecisionTrace, InboundMessage, OutboundAction, ProcessingResult
 from app.domain.policy import escalation_ack, rephrase_prompt, high_risk_reply
@@ -13,6 +14,16 @@ from app.infrastructure.ai.llm_client import LLMResult, PolzaLLMClient
 from app.core.config import settings
 
 logger = logging.getLogger("decision_pipeline")
+
+_GREETING_ONLY_RE = re.compile(
+    r"^\s*(?:добрый\s+(?:день|вечер|утро)|доброго\s+дня|здравствуйте|"
+    r"здравствуй|привет(?:ик)?|хай|hello|hi|good\s+(?:morning|afternoon|evening))[\s,!?.-]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_standalone_greeting(text: str) -> bool:
+    return bool(_GREETING_ONLY_RE.match(str(text or "").strip()))
 
 class DecisionPipeline:
     """Application-level policy. Retrieval and generation remain infrastructure concerns."""
@@ -455,9 +466,25 @@ class DecisionPipeline:
                 result.latency_ms = (time.perf_counter() - started) * 1000
                 return result
 
-            # The first turn is never silently ignored. A greeting/acknowledgement
-            # without an actual support request cannot be answered from KB, so the
-            # safe policy is a human hand-off rather than a generic clarification.
+            if _is_standalone_greeting(message.text):
+                # A standalone first-turn greeting is a normal conversation opener,
+                # not an escalation. Keep the thread in IDLE and invite the customer
+                # to state the actual request.
+                trace = DecisionTrace(
+                    decision=Decision.IGNORE,
+                    question=message.text,
+                    decision_reason="first_turn_greeting_ack",
+                    automated=True,
+                )
+                result = ProcessingResult(
+                    traces=[trace],
+                    actions=[OutboundAction("reply", "Добрый день! Расскажите, пожалуйста, с каким вопросом помочь?")],
+                )
+                result.latency_ms = (time.perf_counter() - started) * 1000
+                return result
+
+            # A first-turn acknowledgement such as "спасибо" has no preceding
+            # answer in this thread, so it cannot safely be treated as completion.
             trace = DecisionTrace(
                 decision=Decision.ESCALATE,
                 question=message.text,

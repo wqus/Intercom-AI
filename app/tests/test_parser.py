@@ -361,3 +361,17 @@ def test_realistic_admin_initiated_source_uses_current_user_part_for_ordering_an
     assert msg.text == "Оператор"
     assert msg.raw["_provider_part_id"] == "current"
     assert event_order_at(payload) == 1788877043
+
+
+def test_conversation_context_uses_configured_context_window(monkeypatch):
+    from app.infrastructure.intercom import parser
+    monkeypatch.setattr(parser.settings, "LLM_CONTEXT_TURNS", 20)
+    parts = [
+        {"id": str(i), "created_at": i, "body": f"message {i}", "author": {"type": "user"}}
+        for i in range(1, 31)
+    ]
+    item = {"conversation_parts": {"conversation_parts": parts}}
+    result = parser._conversation_context(item, "current", {"id": "current", "created_at": 31})
+    assert len(result) == 20
+    assert result[0]["text"] == "message 11"
+    assert result[-1]["text"] == "message 30"

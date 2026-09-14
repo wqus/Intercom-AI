@@ -52,6 +52,7 @@ class SupportApplication:
         text: str,
         *,
         suffix: str = "reply",
+        memory_items: list[dict[str, str]] | None = None,
     ) -> None:
         if not text:
             return
@@ -79,6 +80,7 @@ class SupportApplication:
                 "text": text,
                 "_conversation_turn_id": turn_id,
                 "_conversation_turn_action_key": action_key,
+                "_routing_memory": list(memory_items or []),
             },
         )
 
@@ -374,7 +376,7 @@ class SupportApplication:
                 result.append({
                     "role": "system",
                     "text": (
-                        "ROUTING_MEMORY: previously sent or queued Terra answers. "
+                        "ROUTING_MEMORY: previously sent Terra answers. "
                         "Use this only to avoid repeating already closed content; a new "
                         "aspect of the same intent may still be answered. "
                         + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
@@ -593,13 +595,23 @@ class SupportApplication:
         # Ignore is allowed only on later turns; short domain words must still
         # reach the AI-first pipeline.
         try:
-            inbound_count = await EventRepository(session).count_customer_events_for_entity(message.entity_id)
-            is_first_message = inbound_count <= 1
+            # Count already-persisted user turns, excluding this event. Looking at
+            # inbound_events is incorrect when several customer webhooks are queued
+            # before the first one is processed: the first turn could then be treated
+            # as a later turn merely because a newer event already exists in the DB.
+            previous_user_turns = await transcript_repo.count_user_webhook_turns(
+                message.entity_id, exclude_event_id=event.id
+            ) if transcript_repo is not None else 0
+            is_first_message = previous_user_turns == 0
         except AttributeError:
-            # Lightweight test doubles / non-SQL sessions may not expose scalar().
-            # In production the database count above is authoritative.
-            data = state.data if isinstance(getattr(state, "data", None), dict) else {}
-            is_first_message = not bool(data.get("seen_user_message"))
+            # Lightweight test doubles / non-SQL sessions may not expose transcript
+            # counting. Fall back to the durable inbound-event count in tests/legacy.
+            try:
+                inbound_count = await EventRepository(session).count_customer_events_for_entity(message.entity_id)
+                is_first_message = inbound_count <= 1
+            except AttributeError:
+                data = state.data if isinstance(getattr(state, "data", None), dict) else {}
+                is_first_message = not bool(data.get("seen_user_message"))
         context = message.raw.get("_conversation_context", []) if isinstance(message.raw, dict) else []
         if not isinstance(context, list):
             context = []
@@ -894,10 +906,21 @@ class SupportApplication:
         # message actually sent, so every selected intent is associated with the same
         # complete closure of that turn.
         composed_business_answer = ResponseComposer.final_answer(business_answers) if business_answers else ""
+        memory_items: list[dict[str, str]] = []
         if composed_business_answer:
-            self._remember_business_answers(state, result.traces, [composed_business_answer])
-        if composed_business_answer and hasattr(session, "flush"):
-            await session.flush()
+            intent_questions: dict[str, str] = {}
+            for trace in result.traces:
+                ids = [str(x).strip() for x in (getattr(trace, "selected_kb_ids", None) or []) if str(x).strip()]
+                if not ids and getattr(trace, "kb_id", None):
+                    ids = [str(trace.kb_id).strip()]
+                question_text = str(getattr(trace, "question", "") or "")[-500:]
+                for kb_id in ids:
+                    if kb_id and kb_id not in intent_questions:
+                        intent_questions[kb_id] = question_text
+            memory_items = [
+                {"kb_id": kb_id, "question": question_text, "answer": composed_business_answer[-1500:]}
+                for kb_id, question_text in intent_questions.items()
+            ]
 
         reply_index = 0
         if composed_business_answer:
@@ -908,6 +931,7 @@ class SupportApplication:
                 event,
                 composed_business_answer,
                 suffix=f"reply:{reply_index}",
+                memory_items=memory_items,
             )
 
         for text in reply_texts:

@@ -8,6 +8,7 @@ from app.infrastructure.ai.llm_client import (
     build_taxonomy_user_message,
 )
 from app.application.support_service import SupportApplication
+from app.application.decision_pipeline import DecisionPipeline
 from app.domain.enums import Channel, ConversationStateKind, Decision
 from app.domain.models import InboundMessage, ProcessingResult, DecisionTrace, OutboundAction
 
@@ -292,3 +293,99 @@ def test_compound_routing_memory_associates_composed_answer_with_every_intent():
     memory = state.data["_routing_memory"]
     assert {item["kb_id"] for item in memory} == {"kb_1", "kb_2"}
     assert all(item["answer"] == "Общий составной ответ" for item in memory)
+
+
+def test_candidate_clarify_with_multiple_candidates_is_deferred_to_coverage():
+    client, completions = _client_for_test(None, [
+        {"decision": "clarify", "selected_kb_ids": ["kb_1", "kb_2"], "is_compound": False, "certainty": "medium"},
+        {"decision": "clarify", "selected_kb_ids": ["kb_1"], "is_compound": False, "certainty": "medium"},
+    ])
+    result = asyncio.run(client._classify_taxonomy_with_coverage(
+        "уточняющий вопрос",
+        [
+            {"id": "kb_1", "category": "A", "template_answer": "A", "clarification_question": "какой вариант?"},
+            {"id": "kb_2", "category": "B", "template_answer": "B"},
+        ],
+    ))
+    assert result.decision == "clarify"
+    assert result.selected_kb_ids == ["kb_1"]
+    assert len(completions.calls) == 2
+
+
+def test_terminal_candidate_decision_with_stale_ids_is_normalized_not_failed():
+    client, completions = _client_for_test(None, [
+        {"decision": "escalate", "selected_kb_ids": ["kb_1"], "is_compound": False, "certainty": "high"},
+    ])
+    result = asyncio.run(client._classify_taxonomy_with_coverage(
+        "вопрос", [{"id": "kb_1", "template_answer": "A"}]
+    ))
+    assert result.decision == "escalate"
+    assert result.selected_kb_ids == []
+    assert result.unavailable is False
+    assert len(completions.calls) == 1
+
+
+def test_coverage_terminal_decision_with_stale_ids_is_normalized_not_failed():
+    client, completions = _client_for_test(None, [
+        {"decision": "answer", "selected_kb_ids": ["kb_1"], "is_compound": False, "certainty": "high"},
+        {"decision": "escalate", "selected_kb_ids": ["kb_1"], "is_compound": False, "certainty": "high"},
+    ])
+    result = asyncio.run(client._classify_taxonomy_with_coverage(
+        "вопрос", [{"id": "kb_1", "template_answer": "A"}]
+    ))
+    assert result.decision == "escalate"
+    assert result.selected_kb_ids == []
+    assert result.unavailable is False
+
+
+def test_llm_prompt_keeps_all_passed_context_without_hidden_8_12_message_cutoffs():
+    from app.infrastructure.ai.llm_client import build_coverage_user_message, build_user_message
+    context = [{"role": "user", "text": str(i)} for i in range(20)]
+    first = json.loads(build_user_message("current", [{"id": "kb_1"}], context))
+    second = json.loads(build_coverage_user_message("current", [{"id": "kb_1", "template_answer": "A"}], context))
+    assert len(first["conversation_context"]) == 20
+    assert len(second["conversation_context"]) == 20
+
+
+def test_first_acknowledgement_still_fails_closed_while_greeting_is_accepted():
+    from app.infrastructure.ai.knowledge_base import MatchResult, MatchMode
+    class KB:
+        def match_many(self, text):
+            return [MatchResult(MatchMode.NO_MATCH, 0.0, None, None, None, [], subquestion=text)]
+    pipeline = DecisionPipeline(KB(), None)
+    first_thanks = asyncio.run(pipeline.decide(
+        InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "спасибо"), is_first_message=True
+    ))
+    first_hello = asyncio.run(pipeline.decide(
+        InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "здравствуйте"), is_first_message=True
+    ))
+    assert first_thanks.actions[0].escalate is True
+    assert first_hello.actions[0].escalate is False
+    assert first_hello.traces[0].decision == Decision.IGNORE
+
+
+def test_llm_prompt_keeps_all_passed_context_without_hidden_8_12_message_cutoffs():
+    from app.infrastructure.ai.llm_client import build_coverage_user_message, build_user_message
+    context = [{"role": "user", "text": str(i)} for i in range(20)]
+    first = json.loads(build_user_message("current", [{"id": "kb_1"}], context))
+    second = json.loads(build_coverage_user_message("current", [{"id": "kb_1", "template_answer": "A"}], context))
+    assert len(first["conversation_context"]) == 20
+    assert len(second["conversation_context"]) == 20
+
+
+def test_taxonomy_builder_does_not_apply_second_hidden_12_turn_cap():
+    from app.infrastructure.ai.llm_client import build_taxonomy_user_message
+    context = [{"role": "user", "text": str(i)} for i in range(20)]
+    payload = json.loads(build_taxonomy_user_message("current", [{"id": "kb_1"}], context))
+    assert len(payload["dialogue"]) == 20
+    assert len(payload["conversation_history"]) == 20
+
+
+def test_llm_client_disables_hidden_sdk_retries(monkeypatch):
+    seen = {}
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+    monkeypatch.setitem(__import__('sys').modules, 'openai', type('M', (), {'AsyncOpenAI': FakeOpenAI})())
+    PolzaLLMClient("key", "test-model")
+    assert seen["max_retries"] == 0

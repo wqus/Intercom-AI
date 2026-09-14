@@ -33,10 +33,53 @@ class OutboxWorker:
         if self._task:
             await self._task
 
-    async def _sync_turn(self, session, action, status: str) -> None:
+    async def _sync_turn(self, session, action, status: str, *, commit: bool = True) -> None:
         if action.action_type != "intercom_reply" or not hasattr(session, "scalar"):
             return
         await ConversationTurnRepository(session).mark_action_status(str(action.action_key), status)
+        if status == "sent":
+            memory_items = (action.payload or {}).get("_routing_memory") or []
+            if memory_items:
+                from app.infrastructure.persistence.repository import StateRepository
+                await StateRepository(session).append_routing_memory(str(action.entity_id), memory_items)
+        if commit:
+            await session.commit()
+
+    async def _mark_reply_status(self, session, repo, action, status: str, *, error: str | None = None) -> None:
+        """Commit outbox status, transcript status and sent-answer memory atomically.
+
+        The provider write has already happened when this helper is called. Keeping
+        the durable post-delivery metadata in the same DB transaction prevents a
+        crash between two commits from leaving the reply marked sent but absent from
+        routing memory (or vice versa).
+        """
+        # Lightweight test adapters/legacy repositories may not expose the real
+        # SQLAlchemy session. Preserve their old behavior instead of making the
+        # atomic production path a prerequisite for delivery semantics.
+        if session is None or not hasattr(session, "commit") or not hasattr(session, "scalar"):
+            if status == "sent":
+                await repo.mark_sent(action)
+            elif status == "failed":
+                await repo.mark_failed(action, error or "delivery failed")
+            elif status == "unknown":
+                await repo.mark_unknown(action, error or "delivery ambiguous")
+            elif status == "skipped":
+                await repo.mark_skipped(action, error or "skipped")
+            else:
+                raise ValueError(f"unsupported reply status: {status}")
+            return
+
+        if status == "sent":
+            await repo.mark_sent(action, commit=False)
+        elif status == "failed":
+            await repo.mark_failed(action, error or "delivery failed", commit=False)
+        elif status == "unknown":
+            await repo.mark_unknown(action, error or "delivery ambiguous", commit=False)
+        elif status == "skipped":
+            await repo.mark_skipped(action, error or "skipped", commit=False)
+        else:
+            raise ValueError(f"unsupported reply status: {status}")
+        await self._sync_turn(session, action, status, commit=False)
         await session.commit()
 
     async def _deliver(self, action) -> tuple[str, str | None]:
@@ -108,13 +151,14 @@ class OutboxWorker:
                     )
                     confirmed = False
                 if confirmed:
-                    await repo.mark_sent(action)
-                    await self._sync_turn(getattr(repo, "session", None), action, "sent")
+                    await self._mark_reply_status(getattr(repo, "session", None), repo, action, "sent")
                 else:
-                    await self._sync_turn(getattr(repo, "session", None), action, "unknown")
-                    await repo.mark_unknown(
+                    await self._mark_reply_status(
+                        getattr(repo, "session", None),
+                        repo,
                         action,
-                        f"Intercom {status_code} after reply POST; delivery requires reconciliation",
+                        "unknown",
+                        error=f"Intercom {status_code} after reply POST; delivery requires reconciliation",
                     )
                 return
 
@@ -133,9 +177,11 @@ class OutboxWorker:
             return
 
         if 400 <= status_code <= 499:
-            await repo.mark_failed(action, f"Provider returned HTTP {status_code}: {exc}")
+            error = f"Provider returned HTTP {status_code}: {exc}"
             if action.action_type == "intercom_reply":
-                await self._sync_turn(getattr(repo, "session", None), action, "failed")
+                await self._mark_reply_status(getattr(repo, "session", None), repo, action, "failed", error=error)
+            else:
+                await repo.mark_failed(action, error)
             logger.error(
                 "outbox_delivery_permanent_failure | action=%s | type=%s | channel=%s | status=%s",
                 action.id, action_type, channel, status_code,
@@ -161,11 +207,15 @@ class OutboxWorker:
                         try:
                             status, error = await self._deliver(action)
                             if status == "sent":
-                                await repo.mark_sent(action)
-                                await self._sync_turn(session, action, "sent")
+                                if action.action_type == "intercom_reply":
+                                    await self._mark_reply_status(session, repo, action, "sent")
+                                else:
+                                    await repo.mark_sent(action)
                             elif status == "skipped":
-                                await repo.mark_skipped(action, error or "skipped")
-                                await self._sync_turn(session, action, "skipped")
+                                if action.action_type == "intercom_reply":
+                                    await self._mark_reply_status(session, repo, action, "skipped", error=error or "skipped")
+                                else:
+                                    await repo.mark_skipped(action, error or "skipped")
                             else:
                                 await repo.mark_retry(action, error or "delivery failed")
                         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
@@ -173,8 +223,7 @@ class OutboxWorker:
                             # failure. Telegram/tag writes are retryable because losing
                             # the operator signal/metadata is worse than a duplicate.
                             if action.action_type == "intercom_reply":
-                                await repo.mark_unknown(action, str(exc))
-                                await self._sync_turn(session, action, "unknown")
+                                await self._mark_reply_status(session, repo, action, "unknown", error=str(exc))
                                 logger.error(
                                     "outbox_delivery_unknown | action=%s | type=%s | entity=%s | error=%s",
                                     action.id, action.action_type, action.entity_id, exc,
@@ -192,8 +241,7 @@ class OutboxWorker:
                             # external writes; keep the durable action for manual
                             # reconciliation rather than marking it sent.
                             if action.action_type == "intercom_reply":
-                                await repo.mark_unknown(action, str(exc))
-                                await self._sync_turn(session, action, "unknown")
+                                await self._mark_reply_status(session, repo, action, "unknown", error=str(exc))
                             else:
                                 await repo.mark_retry(action, str(exc))
                             logger.exception("Outbox delivery failed action=%s", action.id)

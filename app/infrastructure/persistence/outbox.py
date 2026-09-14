@@ -94,19 +94,21 @@ class OutboundRepository:
         await self.session.commit()
         return int(result.rowcount or 0)
 
-    async def mark_sent(self, action: OutboundAction) -> None:
+    async def mark_sent(self, action: OutboundAction, *, commit: bool = True) -> None:
         action.status = "sent"
         action.sent_at = datetime.now(timezone.utc)
         action.locked_at = None
         action.last_error = None
-        await self.session.commit()
+        if commit:
+            await self.session.commit()
 
-    async def mark_skipped(self, action: OutboundAction, reason: str) -> None:
+    async def mark_skipped(self, action: OutboundAction, reason: str, *, commit: bool = True) -> None:
         action.status = "skipped"
         action.locked_at = None
         action.last_error = reason[:4000]
         action.sent_at = datetime.now(timezone.utc)
-        await self.session.commit()
+        if commit:
+            await self.session.commit()
 
     async def mark_retry(self, action: OutboundAction, error: str) -> None:
         action.status = "pending" if action.attempts < 5 else "failed"
@@ -117,18 +119,20 @@ class OutboundRepository:
             action.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         await self.session.commit()
 
-    async def mark_failed(self, action: OutboundAction, error: str) -> None:
+    async def mark_failed(self, action: OutboundAction, error: str, *, commit: bool = True) -> None:
         """Persist a terminal delivery failure without pretending it was skipped."""
         action.status = "failed"
         action.locked_at = None
         action.last_error = error[:4000]
-        await self.session.commit()
+        if commit:
+            await self.session.commit()
 
-    async def mark_unknown(self, action: OutboundAction, error: str) -> None:
+    async def mark_unknown(self, action: OutboundAction, error: str, *, commit: bool = True) -> None:
         # For timeout/network ambiguity we deliberately do NOT auto-retry an external
         # write: the provider may already have accepted it. Manual reconciliation is
         # safer than creating a duplicate customer-facing reply.
         action.status = "unknown"
         action.locked_at = None
         action.last_error = error[:4000]
-        await self.session.commit()
+        if commit:
+            await self.session.commit()

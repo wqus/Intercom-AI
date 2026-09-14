@@ -222,7 +222,7 @@ def test_contradictory_llm_escalation_flag_wins():
     assert result.escalation is True
 
 
-def test_first_greeting_is_escalated_not_clarified_or_ignored():
+def test_first_greeting_gets_ack_without_escalation():
     class KB:
         def match_many(self, text):
             raise AssertionError("first-turn greeting must be handled before KB")
@@ -230,8 +230,9 @@ def test_first_greeting_is_escalated_not_clarified_or_ignored():
         InboundMessage("e", "k", "t", "c", Channel.CONVERSATION, "привет"),
         is_first_message=True,
     ))
-    assert result.traces[0].decision == Decision.ESCALATE
-    assert result.actions and result.actions[0].escalate
+    assert result.traces[0].decision == Decision.IGNORE
+    assert result.actions and result.actions[0].text.startswith("Добрый день!")
+    assert result.actions[0].escalate is False
 
 
 def test_later_greeting_is_silent_contextual_noise():

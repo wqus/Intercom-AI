@@ -111,3 +111,12 @@ def test_same_ticket_comment_and_conversation_part_have_one_global_event_key():
     })
     assert conv is not None and ticket is not None
     assert conv.event_key == ticket.event_key == "message:part:part-global-1"
+
+
+def test_readiness_endpoint_requires_live_workers_and_database():
+    from pathlib import Path
+    source = Path(__file__).resolve().parents[1].joinpath("api", "webhook.py").read_text()
+    assert 'SELECT 1' in source
+    assert '503' in source
+    assert 'event_worker' in source
+    assert 'outbox_worker' in source

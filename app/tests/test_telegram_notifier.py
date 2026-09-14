@@ -40,3 +40,26 @@ def test_escalation_notification_uses_html_blockquote(monkeypatch):
     assert "<blockquote>Спасибо &lt;тест&gt; &amp; ещё</blockquote>" in body["text"]
     assert "<b>Запрос пользователя был передан оператору</b>" in body["text"]
     assert "<b>Имя:</b> Ефремкина Анастасия" in body["text"]
+
+
+def test_telegram_http_error_does_not_log_bot_token(monkeypatch, caplog):
+    import asyncio
+    import httpx
+    import logging
+    import app.infrastructure.telegram.notifier as module
+
+    token = "123456:SECRET_BOT_TOKEN"
+    monkeypatch.setattr(module.settings, "DRY_RUN", False)
+    monkeypatch.setattr(module.settings, "TELEGRAM_BOT_TOKEN", token)
+    monkeypatch.setattr(module.settings, "TELEGRAM_GROUP_ID", "123")
+
+    class FailingClient:
+        async def post(self, url, **kwargs):
+            request = httpx.Request("POST", url)
+            raise httpx.ConnectError(f"connect failed for {url}", request=request)
+
+    notifier = TelegramNotifier(FailingClient())
+    with caplog.at_level(logging.WARNING, logger="telegram"):
+        result = asyncio.run(notifier.notify_escalation(entity_id="c1", channel="conversation", reason="x", text="hello"))
+    assert result is False
+    assert token not in caplog.text

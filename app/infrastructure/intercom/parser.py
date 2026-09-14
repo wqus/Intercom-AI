@@ -66,7 +66,7 @@ def _conversation_context(item: dict, current_text: str, current_part: dict | No
 
     rows.sort(key=lambda x: (x[0], x[1]))
     context.extend(row[2] for row in rows)
-    return context[-12:]
+    return context[-int(getattr(settings, "LLM_CONTEXT_TURNS", 50)):]
 
 def _conversation(payload: dict) -> tuple[str,str,bool,str,str,str,list[dict[str,str]],str|None] | None:
     item = payload.get("data", {}).get("item", {}) or {}

@@ -206,6 +206,27 @@ class StateRepository:
         current.data = new_data
         await self.session.flush()
 
+    async def append_routing_memory(self, conversation_id: str, items: list[dict[str, str]]) -> None:
+        """Append memory only after the corresponding customer reply was delivered."""
+        if not items:
+            return
+        current = await self.get(conversation_id, for_update=True)
+        data = dict(current.data) if isinstance(current.data, dict) else {}
+        existing = data.get("_routing_memory") if isinstance(data.get("_routing_memory"), list) else []
+        clean: list[dict[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kb_id = str(item.get("kb_id") or "").strip()
+            answer = str(item.get("answer") or "").strip()
+            question = str(item.get("question") or "").strip()
+            if kb_id and answer:
+                clean.append({"kb_id": kb_id, "question": question[-500:], "answer": answer[-1500:]})
+        if clean:
+            data["_routing_memory"] = (existing + clean)[-20:]
+            current.data = data
+            await self.session.flush()
+
 
 class EscalatedConversationRepository:
     """Read/write access to the persistent post-escalation blocklist."""
@@ -400,6 +421,25 @@ class ConversationTurnRepository:
                 status="sent", dedup_key=key, turn_at=synthetic_at,
             ))
         await self.session.flush()
+
+    async def count_user_webhook_turns(self, entity_id: str, *, exclude_event_id: int | None = None) -> int:
+        """Count persisted customer webhook turns, excluding the current event.
+
+        This is the authoritative first-turn signal for the worker. Counting inbound
+        events is race-prone because several webhooks can already be queued before the
+        first one is processed. Imported provider history is deliberately excluded.
+        """
+        conditions = [
+            ConversationTurn.entity_id == entity_id,
+            ConversationTurn.role == "user",
+            ConversationTurn.event_id.is_not(None),
+        ]
+        if exclude_event_id is not None:
+            conditions.append(ConversationTurn.event_id != int(exclude_event_id))
+        result = await self.session.scalar(
+            select(func.count(ConversationTurn.id)).where(*conditions)
+        )
+        return int(result or 0)
 
     async def count(self, entity_id: str) -> int:
         result = await self.session.scalar(

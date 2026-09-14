@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("llm_client")
+from app.core.config import settings
 
 
 @dataclass(slots=True)
@@ -250,7 +251,7 @@ def build_taxonomy_user_message(
     raw_context = conversation_context or []
     history: list[dict[str, str]] = []
     pending_state: list[dict[str, str]] = []
-    for item in raw_context[-12:]:
+    for item in raw_context[-int(getattr(settings, "LLM_CONTEXT_TURNS", 50)):]:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
@@ -271,10 +272,10 @@ def build_taxonomy_user_message(
     )
     payload = {
         "dialogue": dialogue,
-        "conversation_history": history[-12:],
+        "conversation_history": history,
         "last_assistant_response": last_assistant_response,
         "dialogue_rule": "USER = customer message; ASSISTANT = previously sent Terra answer; current_question is the new customer turn.",
-        "pending_state": pending_state[-3:],
+        "pending_state": pending_state,
         "current_question": question,
         "intent_catalog": [_intent_catalog_entry(entry) for entry in intent_catalog],
     }
@@ -287,7 +288,7 @@ def build_user_message(
     conversation_context: list[dict[str, str]] | None = None,
 ) -> str:
     payload = {
-        "conversation_context": (conversation_context or [])[-8:],
+        "conversation_context": list(conversation_context or []),
         "current_question": question,
         "candidates": [_entry_for_llm(entry) for entry in relevant_entries],
     }
@@ -361,7 +362,7 @@ def build_coverage_system_prompt() -> str:
 
 def build_coverage_user_message(question: str, candidate_entries: list[dict[str, Any]], conversation_context: list[dict[str, str]] | None = None) -> str:
     payload = {
-        "conversation_context": (conversation_context or [])[-12:],
+        "conversation_context": list(conversation_context or []),
         "current_question": question,
         "candidates": [_coverage_entry_for_llm(entry) for entry in candidate_entries[:4]],
         "coverage_rule": "approved_answer(s) must cover 100% of the substantive user request; partial coverage is not answer",
@@ -384,7 +385,7 @@ class PolzaLLMClient:
         # Reasoning-family models can reject legacy sampling knobs through some
         # OpenAI-compatible gateways. Omit temperature for GPT-5.6 reasoning models.
         self._supports_temperature = not ("gpt-5.6" in model_l or "claude-sonnet-5" in model_l)
-        self._client = AsyncOpenAI(api_key=api_key, base_url="https://polza.ai/api/v1", timeout=timeout)
+        self._client = AsyncOpenAI(api_key=api_key, base_url="https://polza.ai/api/v1", timeout=timeout, max_retries=0)
 
     @staticmethod
     def _extract_content(response: Any) -> str:
@@ -480,14 +481,15 @@ class PolzaLLMClient:
                 raise ValueError("invalid candidate-selection certainty")
             if len(selected) > 4 or len(selected) != len(set(selected)) or any(x not in all_ids for x in selected):
                 raise ValueError("invalid candidate-selection ids")
-            if decision in {"ignore", "escalate"} and selected:
-                raise ValueError("ignore/escalate must not carry candidates")
-            if decision == "clarify" and len(selected) != 1:
-                raise ValueError("clarify requires exactly one candidate")
-            if decision != "answer":
-                return LLMResult(selected, escalation=decision == "escalate", decision=decision, certainty=certainty, reason=f"candidate_selection_{decision}", is_compound=is_compound)
+            # Candidate selection is only the first pass. Do not reject a valid
+            # conversational route merely because the model attached extra ids to
+            # an ignore/escalate decision or returned several possibilities for a
+            # clarification. Normalize terminal decisions and let the second pass
+            # resolve any non-terminal candidate set.
+            if decision in {"ignore", "escalate"}:
+                return LLMResult([], escalation=decision == "escalate", decision=decision, certainty=certainty, reason=f"candidate_selection_{decision}", is_compound=is_compound)
             if not selected:
-                return LLMResult([], escalation=True, decision="escalate", certainty="high", reason="candidate_selection_empty")
+                return LLMResult([], escalation=True, decision="escalate", certainty="high", reason="candidate_selection_empty", is_compound=False)
 
             by_id = {str(entry.get("id")): entry for entry in catalog}
             coverage_candidates = [by_id[kb_id] for kb_id in selected if kb_id in by_id][:4]
@@ -541,7 +543,10 @@ class PolzaLLMClient:
                 if len(final_selected) != 1:
                     raise ValueError("coverage clarify requires one candidate")
             elif final_selected:
-                raise ValueError("ignore/escalate coverage must not select ids")
+                # The final decision owns terminal semantics. If the model emits
+                # stale/extra ids with ignore/escalate, discard them rather than
+                # turning an otherwise valid decision into an artificial LLM error.
+                final_selected = []
             logger.info(
                 "taxonomy_coverage | candidate_count=%d | selected_count=%d | decision=%s | compound=%s",
                 len(coverage_candidates), len(final_selected), final_decision, final_is_compound,

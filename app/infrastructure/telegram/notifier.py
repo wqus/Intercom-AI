@@ -104,6 +104,12 @@ class TelegramNotifier:
             response.raise_for_status()
             logger.info("Operator notification sent entity=%s reason=%s", entity_id, reason)
             return True
-        except httpx.HTTPError as exc:
-            logger.warning("Operator notification failed entity=%s: %s", entity_id, exc)
+        except httpx.HTTPError:
+            # Do not log the exception text: HTTP client errors can contain the
+            # full Telegram Bot API URL, which includes the bot token.
+            logger.warning(
+                "Operator notification failed entity=%s error_type=%s",
+                entity_id,
+                "http_error",
+            )
             return False

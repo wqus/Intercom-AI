@@ -21,6 +21,10 @@ logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# httpx emits full request URLs by default; suppress those debug lines so
+# Telegram bot tokens and signed provider URLs cannot leak into production logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -76,6 +80,7 @@ async def lifespan(app: FastAPI):
     worker=EventWorker(application)
     outbox_worker=OutboxWorker(intercom, telegram)
     app.state.application=application
+    app.state.event_worker=worker
     app.state.outbox_worker=outbox_worker
     await worker.start()
     await outbox_worker.start()
@@ -88,6 +93,6 @@ async def lifespan(app: FastAPI):
     await telegram_client.aclose()
     await engine.dispose()
 
-app=FastAPI(title="Terra Intercom AI Support v25 Production", lifespan=lifespan)
+app=FastAPI(title="Terra Intercom AI Support V28 Production", lifespan=lifespan)
 app.include_router(webhook_router)
 

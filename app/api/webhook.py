@@ -1,6 +1,7 @@
 import json
 import logging
 from fastapi import APIRouter, HTTPException, Request, Response
+from sqlalchemy import text
 from app.core.config import settings
 from app.database.session import SessionLocal
 from app.infrastructure.intercom.parser import verify_signature, parse, event_order_at as _event_order_at, CONVERSATION_TOPICS, TICKET_TOPICS
@@ -90,4 +91,33 @@ async def intercom_webhook(request: Request):
 
 @router.get("/health")
 async def health():
+    """Liveness probe: the process is alive even if dependencies are degraded."""
     return {"status": "ok"}
+
+
+@router.get("/ready")
+async def ready(request: Request):
+    """Readiness probe for load balancers/orchestrators.
+
+    A process is ready only while both background workers are alive and the DB
+    connection can execute a trivial query. This avoids routing traffic to a
+    process that can accept webhooks but cannot drain the durable queues.
+    """
+    outbox_worker = getattr(request.app.state, "outbox_worker", None)
+    event_worker = getattr(request.app.state, "event_worker", None)
+    workers_ok = bool(
+        event_worker is not None
+        and outbox_worker is not None
+        and getattr(getattr(event_worker, "_task", None), "done", lambda: True)() is False
+        and getattr(getattr(outbox_worker, "_task", None), "done", lambda: True)() is False
+    )
+    db_ok = False
+    try:
+        async with SessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+            db_ok = True
+    except Exception:
+        db_ok = False
+    if not (workers_ok and db_ok):
+        raise HTTPException(503, {"status": "not_ready", "workers": workers_ok, "db": db_ok})
+    return {"status": "ready", "workers": True, "db": True}

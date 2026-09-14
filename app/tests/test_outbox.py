@@ -222,3 +222,27 @@ def test_intercom_reply_uses_correct_endpoint_and_admin_payload(monkeypatch):
         assert payload["type"] == "admin"
         assert payload["admin_id"] == "admin-1"
         assert payload["body"] == "hello"
+
+
+def test_intercom_4xx_reply_uses_terminal_failure_and_transcript_sync(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    class Repo:
+        def __init__(self):
+            self.calls = []
+        async def mark_failed(self, action, error): self.calls.append(("failed", error))
+        async def mark_sent(self, action): self.calls.append(("sent", action))
+        async def mark_unknown(self, action, error): self.calls.append(("unknown", error))
+        async def mark_retry(self, action, error): self.calls.append(("retry", error))
+        async def mark_skipped(self, action, error): self.calls.append(("skipped", error))
+
+    action_obj = SimpleNamespace(
+        id=11,
+        action_type="intercom_reply",
+        payload={"entity_id": "c1", "channel": "conversation", "text": "hello"},
+    )
+    worker = OutboxWorker(FakeIntercom(), FakeTelegram())
+    repo = Repo()
+    asyncio.run(worker._handle_http_status_error(action_obj, repo, _http_error(400)))
+    assert [c[0] for c in repo.calls] == ["failed"]
